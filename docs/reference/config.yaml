@@ -1,0 +1,170 @@
+api_version: v1
+
+app:
+  min_ready_routes: all
+  readiness_cache: 250ms
+
+connectors:
+
+  - name: sample_kafka_cluster
+    type: kafka
+    options:
+      brokers: kafka-1:9092
+
+  - name: sample_state_store
+    type: mariadb
+    options:
+      url: mysql://chronicle:chronicle@localhost:3306/sample
+      schema: records
+
+  - name: sample_ingest_service
+    type: http
+    options:
+      role: server
+      listen_addr: 0.0.0.0:8443
+      tls:
+        key: key.pem
+        cert: cert.pem
+        ca: ca.pem
+      health:
+        method: GET
+        path: /health
+
+  - name: sample_processing_api
+    type: http
+    options:
+      role: client
+      base_url: https://localhost:8443
+      tls:
+        ca: ca.pem
+
+chronicles:
+
+  - name: collect_record
+    trigger:
+      connector: sample_ingest_service
+      options:
+        method: POST
+        path: /api/v1/records
+        content_type: application/json
+    phases:
+      - name: summarize_record
+        type: transform
+        options:
+          summary:
+            record_id: .[0].body.record.id
+            category: .[0].body.record.attributes.category
+            tier: .[0].body.record.attributes.tier
+            latency_ms: .[0].body.record.metrics.latency_ms
+          trace:
+            trace_id: .[0].headers.trace_id
+            observed_at: .[0].body.record.observed_at
+      - name: offload_record
+        type: kafka
+        timeout_ms: 1500
+        options:
+          connector: sample_kafka_cluster
+          topic: records.samples
+          acks: all
+          key: .[1].summary.record_id
+          body: .[1]
+      - name: fanout
+        type: parallel
+        timeout_ms: 2500
+        options:
+          phases:
+            - name: forward_summary
+              type: http
+              timeout_ms: 1200
+              options:
+                connector: sample_processing_api
+                method: POST
+                path: /api/v1/fanout/summary
+                content_type: application/json
+                headers:
+                  trace_id: .[1].trace.trace_id
+                body:
+                  record: .[0].body.record
+                  summary: .[1].summary
+                  trace: .[1].trace
+            - name: audit_record
+              type: kafka
+              timeout_ms: 1200
+              options:
+                connector: sample_kafka_cluster
+                topic: records.audit
+                acks: leader
+                key: .[1].summary.record_id
+                body: .[1]
+      - name: response
+        type: transform
+        options:
+          status: 200
+          content_type: application/json
+          body:
+            trace_id: .[1].trace.trace_id
+            forward_status: .[3].children.forward_summary.status
+            audit_partition: .[3].children.audit_record.output.partition
+
+
+  - name: relay_record
+    trigger:
+      connector: sample_kafka_cluster
+      options:
+        topic: records.samples
+        group_id: relay-service
+        auto_offset_reset: earliest
+    phases:
+      - name: forward_record
+        type: http
+        timeout_ms: 2000
+        options:
+          connector: sample_processing_api
+          method: POST
+          path: /api/v1/records/relay
+          content_type: application/json
+          headers:
+            trace_id: .[0].body.trace.trace_id
+          body:
+            summary: .[0].body.summary
+            trace: .[0].body.trace
+            metrics:
+              latency_ms: .[0].body.summary.latency_ms
+
+  - name: persist_record
+    trigger:
+      connector: sample_ingest_service
+      options:
+        method: POST
+        path: /api/v1/records
+        content_type: application/json
+    phases:
+      - name: store_record
+        type: mariadb
+        timeout_ms: 2500
+        options:
+          connector: sample_state_store
+          sql: |
+            INSERT INTO records (record_id, category, observed_at, latency_ms)
+            VALUES (:record_id, :category, :observed_at, :latency_ms)
+          values:
+            record_id: .[0].body.record.id
+            category: .[0].body.record.attributes.category
+            observed_at: .[0].body.record.observed_at
+            latency_ms: .[0].body.record.metrics.latency_ms
+      - name: acknowledge
+        type: transform
+        options:
+          status: 200
+          content_type: application/json
+          body:
+            record_id: .[0].body.record.id
+            inserted_rows: .[1].rows
+
+management:
+
+  port: 9090
+  health:
+    path: /health
+  metrics:
+    path: /metrics

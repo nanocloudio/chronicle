@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package com.nanocloud.chronicle.alerts;
+
+message AlertEvent {
+  string routing_key = 1;
+  string exchange = 2;
+  bool redelivered = 3;
+  string received_at = 4;
+  string body_json = 5;
+}

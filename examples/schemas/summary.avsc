@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "SummaryRecord",
+  "namespace": "com.nanocloud.chronicle",
+  "fields": [
+    { "name": "record_id", "type": "string" },
+    { "name": "category", "type": "string" },
+    { "name": "tier", "type": [ "null", "string" ], "default": null },
+    { "name": "latency_ms", "type": "int" }
+  ]
+}

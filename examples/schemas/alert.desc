@@ -1,0 +1,12 @@
+
+ò
+examples/schemas/alert.protocom.nanocloud.chronicle.alerts"©
+
+AlertEvent
+routing_key (	R
+routingKey
+exchange (	Rexchange 
+redelivered (Rredelivered
+received_at (	R
+receivedAt
+	body_json (	RbodyJsonbproto3

@@ -1,0 +1,234 @@
+api_version: v1
+
+app:
+  min_ready_routes: all
+  readiness_cache: 250ms
+
+connectors:
+
+  - name: http_ingest
+    type: http
+    options:
+      role: server
+      host: 0.0.0.0
+      port: 8443
+      tls:
+        cert: tls/server.crt
+        key: tls/server.key
+        ca: tls/ca.pem
+      health:
+        method: GET
+        path: /healthz
+
+  - name: http_backend
+    type: http
+    options:
+      role: client
+      base_url: https://api.internal.local
+      tls:
+        ca: tls/backend-ca.pem
+      auth:
+        username: service-account
+        password: ${HTTP_BACKEND_PASSWORD}
+      default_headers:
+        X-Client: chronicle
+
+  - name: kafka_analytics
+    type: kafka
+    options:
+      brokers:
+        - kafka-1:9092
+        - kafka-2:9092
+      security:
+        tls:
+          ca: tls/kafka-ca.pem
+        sasl:
+          mechanism: SCRAM-SHA-512
+          username: kafka-user
+          password: ${KAFKA_PASSWORD}
+
+  - name: rabbitmq_core
+    type: rabbitmq
+    options:
+      url: amqps://alerts:secret@rabbitmq.internal:5671/events
+      prefetch: 20
+      tls:
+        ca: tls/rabbitmq-ca.pem
+        cert: tls/rabbitmq-client.crt
+        key: tls/rabbitmq-client.key
+
+  - name: mqtt_iot
+    type: mqtt
+    options:
+      url: mqtts://mqtt.internal:8883
+      client_id: chronicle-gateway
+      username: mqtt-user
+      password: ${MQTT_PASSWORD}
+      keep_alive: 30
+      tls:
+        ca: tls/mqtt-ca.pem
+        cert: tls/mqtt-client.crt
+        key: tls/mqtt-client.key
+
+  - name: mariadb_orders
+    type: mariadb
+    options:
+      url: mysql://chronicle:secret@mariadb.internal:3306/orders
+      schema: order_flow
+
+  - name: postgres_ledger
+    type: postgres
+    options:
+      url: postgres://ledger:ledger-pass@postgres.internal:5432/ledger
+      schema: accounting
+      tls:
+        ca: tls/db-ca.pem
+        cert: tls/postgres-client.crt
+        key: tls/postgres-client.key
+
+chronicles:
+
+  # HTTP ingest -> transform -> Avro serialize -> Kafka publish -> MariaDB upsert
+  - name: http_ingest_to_kafka
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /api/v1/records
+        content_type: application/json
+    phases:
+      - name: summarise_payload
+        type: transform
+        options:
+          summary:
+            record_id: .[0].body.record.id
+            category: .[0].body.record.attributes.category
+            tier: .[0].body.record.attributes.tier
+            latency_ms: .[0].body.record.metrics.latency_ms
+          metadata:
+            trace_id: .[0].header.trace_id
+            received_at: .[0].metadata.received_at
+      - name: encode_summary_avro
+        type: serialize
+        options:
+          codec: avro
+          input: .[1].summary
+          schema:
+            type: file
+            path: schemas/summary.avsc
+      - name: publish_summary
+        type: kafka_producer
+        options:
+          connector: kafka_analytics
+          topic: records.summary
+          key: .[1].summary.record_id
+          payload: .[2]
+          header.content-type: .[2].content_type
+          header.wire-format: .[2].wire_format
+      - name: record_summary_mariadb
+        type: mariadb_idempotent_insert
+        options:
+          connector: mariadb_orders
+          key:
+            record_id: .[1].summary.record_id
+          value:
+            summary: .[1].summary
+            trace_id: .[1].metadata.trace_id
+            ingested_at: .[1].metadata.received_at
+
+  # RabbitMQ trigger -> HTTP callback -> RabbitMQ publish
+  - name: rabbitmq_alert_pipeline
+    trigger:
+      connector: rabbitmq_core
+      options:
+        queue: alerts.primary
+        ack_mode: manual
+        prefetch: 10
+    phases:
+      - name: shape_alert
+        type: transform
+        options:
+          alert:
+            routing_key: .[0].routing_key
+            exchange: .[0].exchange
+            body: .[0].body
+            redelivered: .[0].redelivered
+            received_at: .[0].metadata.timestamp
+      - name: forward_alert_http
+        type: http_client
+        timeout_ms: 1500
+        options:
+          connector: http_backend
+          method: POST
+          path: /alerts/handle
+          headers:
+            x-alert-routing: .[1].alert.routing_key
+            x-alert-exchange: .[1].alert.exchange
+          body:
+            alert: .[1].alert
+          content_type: application/json
+      - name: publish_ack_event
+        type: rabbitmq
+        options:
+          connector: rabbitmq_core
+          exchange: alerts.audit
+          routing_key: processed.alerts
+          properties:
+            content_type: application/json
+          body:
+            alert: .[1].alert
+
+  # MQTT trigger -> transform -> MQTT fan-out -> Postgres upsert
+  - name: mqtt_sensor_ingest
+    trigger:
+      connector: mqtt_iot
+      options:
+        topic: sensors/telemetry/+
+        qos: 1
+        retain_handling: include
+    phases:
+      - name: normalise_sensor_reading
+        type: transform
+        options:
+          reading: .[0]
+      - name: publish_sensor_update
+        type: mqtt
+        timeout_ms: 1000
+        options:
+          connector: mqtt_iot
+          topic: sensors/processed
+          qos: 1
+          retain: false
+          payload: .[1].reading
+          payload_encoding: json
+      - name: upsert_reading_postgres
+        type: postgres_idempotent_insert
+        timeout_ms: 3000
+        options:
+          connector: postgres_ledger
+          sql: |
+            INSERT INTO sensor_readings
+              (topic, qos, retain, payload_base64)
+            VALUES
+              (:topic, :qos, :retain, :payload_base64)
+            ON CONFLICT (topic) DO UPDATE SET
+              qos = EXCLUDED.qos,
+              retain = EXCLUDED.retain,
+              payload_base64 = EXCLUDED.payload_base64;
+          values:
+            topic: .[1].reading.topic
+            qos: .[1].reading.qos
+            retain: .[1].reading.retain
+            payload_base64: .[1].reading.payload.base64
+
+management:
+  host: 0.0.0.0
+  port: 9100
+  live:
+    path: /live
+  ready:
+    path: /ready
+  status:
+    path: /status
+  metrics:
+    path: /metrics

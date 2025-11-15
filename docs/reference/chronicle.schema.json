@@ -1,0 +1,426 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nanocloud.dev/schemas/chronicle.schema.json",
+  "title": "Chronicle Configuration",
+  "type": "object",
+  "required": ["api_version", "app", "connectors", "chronicles"],
+  "additionalProperties": false,
+  "properties": {
+    "api_version": {
+      "const": "v1",
+      "description": "Schema version identifier."
+    },
+    "app": {
+      "$ref": "#/$defs/app"
+    },
+    "connectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/connector"
+      }
+    },
+    "chronicles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/chronicle"
+      }
+    },
+    "management": {
+      "$ref": "#/$defs/management"
+    }
+  },
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^(?=.*[1-9])[0-9]+(ns|us|µs|ms|s|m|h|d)([0-9]+(ns|us|µs|ms|s|m|h|d))*$",
+      "description": "Positive Go-style duration (e.g., 250ms, 2s, 1m30s)."
+    },
+    "overflow_policy": {
+      "enum": ["reject", "queue", "shed"]
+    },
+    "half_open_counts_as_ready": {
+      "enum": ["never", "endpoint", "route"]
+    },
+    "app": {
+      "type": "object",
+      "required": ["min_ready_routes", "half_open_counts_as_ready", "warmup_timeout", "readiness_cache", "limits", "retry_budget"],
+      "additionalProperties": true,
+      "properties": {
+        "min_ready_routes": {
+          "anyOf": [
+            {"type": "integer", "minimum": 1},
+            {"const": "all"}
+          ]
+        },
+        "half_open_counts_as_ready": {
+          "$ref": "#/$defs/half_open_counts_as_ready"
+        },
+        "warmup_timeout": {"$ref": "#/$defs/duration"},
+        "readiness_cache": {"$ref": "#/$defs/duration"},
+        "limits": {
+          "type": "object",
+          "required": ["routes"],
+          "properties": {
+            "routes": {
+              "type": "object",
+              "required": ["max_inflight", "overflow_policy"],
+              "properties": {
+                "max_inflight": {"type": "integer", "minimum": 1},
+                "overflow_policy": {"$ref": "#/$defs/overflow_policy"},
+                "max_queue_depth": {"type": "integer", "minimum": 1}
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {"overflow_policy": {"const": "queue"}}
+                  },
+                  "then": {
+                    "required": ["max_queue_depth"]
+                  }
+                }
+              ],
+              "additionalProperties": false
+            },
+            "http": {
+              "type": "object",
+              "properties": {
+                "max_concurrency": {"type": "integer", "minimum": 1},
+                "max_payload_bytes": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            },
+            "kafka": {
+              "type": "object",
+              "properties": {
+                "max_inflight_per_partition": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "retry_budget": {
+          "$ref": "#/$defs/retry_budget"
+        }
+      }
+    },
+    "retry_budget": {
+      "type": "object",
+      "required": ["max_attempts", "max_elapsed", "base_backoff", "max_backoff", "jitter"],
+      "properties": {
+        "max_attempts": {"type": "integer", "minimum": 1},
+        "max_elapsed": {"$ref": "#/$defs/duration"},
+        "base_backoff": {"$ref": "#/$defs/duration"},
+        "max_backoff": {"$ref": "#/$defs/duration"},
+        "jitter": {"enum": ["none", "equal", "full"]}
+      },
+      "additionalProperties": false
+    },
+    "management": {
+      "type": "object",
+      "required": ["port"],
+      "properties": {
+        "port": {"type": "integer", "minimum": 1},
+        "live": {"$ref": "#/$defs/path"},
+        "ready": {"$ref": "#/$defs/path"},
+        "metrics": {"$ref": "#/$defs/path"},
+        "status": {"$ref": "#/$defs/path"}
+      },
+      "additionalProperties": false
+    },
+    "path": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "pattern": "^/[^\\s]*$"}
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    },
+    "connector": {
+      "type": "object",
+      "required": ["name", "type", "options"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "type": {"enum": ["http", "kafka", "mariadb", "postgres", "rabbitmq", "mqtt", "smtp", "mongodb", "redis", "grpc"]},
+        "warmup": {"type": "boolean"},
+        "warmup_timeout": {"$ref": "#/$defs/duration"},
+        "cb": {"$ref": "#/$defs/circuit_breaker"},
+        "timeouts": {
+          "type": "object",
+          "properties": {
+            "connect": {"$ref": "#/$defs/duration"},
+            "request": {"$ref": "#/$defs/duration"},
+            "read": {"$ref": "#/$defs/duration"},
+            "write": {"$ref": "#/$defs/duration"},
+            "query": {"$ref": "#/$defs/duration"}
+          },
+          "additionalProperties": false
+        },
+        "max_payload_bytes": {"type": "integer", "minimum": 1},
+        "requires": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "options": {"type": "object"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "http"}}},
+          "then": {"$ref": "#/$defs/httpConnector"}
+        },
+        {
+          "if": {"properties": {"type": {"const": "kafka"}}},
+          "then": {"$ref": "#/$defs/kafkaConnector"}
+        },
+        {
+          "if": {"properties": {"type": {"const": "postgres"}}},
+          "then": {"$ref": "#/$defs/postgresConnector"}
+        },
+        {
+          "if": {"properties": {"type": {"const": "mariadb"}}},
+          "then": {"$ref": "#/$defs/mariadbConnector"}
+        }
+      ]
+    },
+    "circuit_breaker": {
+      "type": "object",
+      "required": ["failure_rate", "window", "open_base", "open_max"],
+      "properties": {
+        "failure_rate": {"type": "number", "exclusiveMaximum": 1, "exclusiveMinimum": 0},
+        "window": {"$ref": "#/$defs/duration"},
+        "open_base": {"$ref": "#/$defs/duration"},
+        "open_max": {"$ref": "#/$defs/duration"}
+      },
+      "additionalProperties": false
+    },
+    "httpConnector": {
+      "properties": {
+        "options": {
+          "type": "object",
+          "required": ["role"],
+          "properties": {
+            "role": {"enum": ["server", "client"]},
+            "listen_addr": {"type": "string"},
+            "base_url": {"type": "string", "format": "uri"},
+            "tls": {"$ref": "#/$defs/tls"},
+            "default_headers": {
+              "type": "object",
+              "additionalProperties": {"type": "string"}
+            }
+          },
+          "additionalProperties": true,
+          "allOf": [
+            {
+              "if": {"properties": {"role": {"const": "server"}}},
+              "then": {"required": ["listen_addr"]}
+            },
+            {
+              "if": {"properties": {"role": {"const": "client"}}},
+              "then": {"required": ["base_url"]}
+            }
+          ]
+        }
+      }
+    },
+    "postgresConnector": {
+      "properties": {
+        "options": {
+          "type": "object",
+          "required": ["url"],
+          "properties": {
+            "url": {"type": "string", "format": "uri"},
+            "schema": {"type": "string"},
+            "tls": {"$ref": "#/$defs/tls"},
+            "pool": {"$ref": "#/$defs/pool"}
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "mariadbConnector": {
+      "properties": {
+        "options": {
+          "type": "object",
+          "required": ["url"],
+          "properties": {
+            "url": {"type": "string", "format": "uri"},
+            "schema": {"type": "string"},
+            "tls": {"$ref": "#/$defs/tls"},
+            "pool": {"$ref": "#/$defs/pool"}
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "kafkaConnector": {
+      "properties": {
+        "options": {
+          "type": "object",
+          "required": ["brokers"],
+          "properties": {
+            "brokers": {
+              "type": "array",
+              "items": {"type": "string"},
+              "minItems": 1
+            },
+            "security": {"type": "object"},
+            "create_topics_if_missing": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "ca": {"type": "string"},
+        "cert": {"type": "string"},
+        "key": {"type": "string"},
+        "mode": {"enum": ["disable", "prefer", "require", "verify_ca", "verify_full"]},
+        "domain": {"type": "string"}
+      },
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "required": ["cert"]
+          },
+          "then": {
+            "required": ["key"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {"const": "verify_full"}
+            }
+          },
+          "then": {
+            "required": ["domain"]
+          }
+        }
+      ]
+    },
+    "pool": {
+      "type": "object",
+      "properties": {
+        "min_connections": {"type": "integer", "minimum": 1},
+        "max_connections": {"type": "integer", "minimum": 1},
+        "connect_timeout": {"$ref": "#/$defs/duration"}
+      },
+      "additionalProperties": true
+    },
+    "chronicle": {
+      "type": "object",
+      "required": ["name", "trigger", "phases"],
+      "properties": {
+        "name": {"type": "string"},
+        "trigger": {"$ref": "#/$defs/trigger"},
+        "phases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/phase"}
+        },
+        "policy": {"$ref": "#/$defs/policy"}
+      },
+      "additionalProperties": false
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["connector", "options"],
+      "properties": {
+        "connector": {"type": "string"},
+        "options": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "properties": {
+        "requires": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "allow_partial_delivery": {"type": "boolean"},
+        "readiness_priority": {"type": "integer"},
+        "limits": {"$ref": "#/$defs/routesLimits"},
+        "retry_budget": {"$ref": "#/$defs/retry_budget"},
+        "half_open_counts_as_ready": {"$ref": "#/$defs/half_open_counts_as_ready"},
+        "delivery": {"$ref": "#/$defs/delivery"}
+      },
+      "additionalProperties": false
+    },
+    "routesLimits": {
+      "type": "object",
+      "properties": {
+        "max_inflight": {"type": "integer", "minimum": 1},
+        "overflow_policy": {"$ref": "#/$defs/overflow_policy"},
+        "max_queue_depth": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "properties": {
+        "retries": {"type": "integer", "minimum": 0},
+        "backoff": {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|µs|ms|s|m|h|d))(\\.\\.[0-9]+(ns|us|µs|ms|s|m|h|d))?$"
+        },
+        "idempotent": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "phase": {
+      "type": "object",
+      "required": ["name", "type", "options"],
+      "properties": {
+        "name": {"type": "string"},
+        "type": {"type": "string"},
+        "options": {"type": "object"},
+        "timeout": {"$ref": "#/$defs/duration"}
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"type": {"const": "parallel"}}},
+          "then": {"$ref": "#/$defs/parallelPhase"}
+        }
+      ]
+    },
+    "parallelPhase": {
+      "properties": {
+        "options": {
+          "type": "object",
+          "required": ["phases"],
+          "properties": {
+            "aggregation": {"enum": ["all", "any", "quorum"]},
+            "quorum": {"type": "integer", "minimum": 1},
+            "phases": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"$ref": "#/$defs/phase"}
+            }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "aggregation": {"const": "quorum"}
+                }
+              },
+              "then": {
+                "required": ["quorum"]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

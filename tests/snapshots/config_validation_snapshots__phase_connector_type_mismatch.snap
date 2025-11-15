@@ -1,0 +1,9 @@
+---
+source: tests/config_validation_snapshots.rs
+assertion_line: 82
+expression: error
+---
+integration config validation failed:
+schema_version: "v1"
+- chronicle `invalid_publish` phase `publish_invalid` expects connector `http_client` to be `rabbitmq` but found `http_client`
+- connector `http_client` uses https:// but is missing required `tls` section

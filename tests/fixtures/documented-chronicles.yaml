@@ -1,0 +1,238 @@
+api_version: v1
+
+app:
+  min_ready_routes: all
+  half_open_counts_as_ready: endpoint
+  warmup_timeout: 20s
+  readiness_cache: 250ms
+  feature_flags:
+    - rabbitmq
+    - mqtt
+    - mongodb
+    - redis
+  limits:
+    routes:
+      max_inflight: 64
+      overflow_policy: queue
+      max_queue_depth: 256
+  retry_budget:
+    max_attempts: 4
+    max_elapsed: 10s
+    base_backoff: 100ms
+    max_backoff: 3s
+    jitter: full
+
+connectors:
+  - name: http_ingest
+    type: http
+    options:
+      role: server
+      host: 0.0.0.0
+      port: 8080
+      health:
+        method: GET
+        path: /healthz
+
+  - name: rabbitmq_events
+    type: rabbitmq
+    warmup: true
+    warmup_timeout: 15s
+    options:
+      url: amqp://guest:guest@localhost:5672/%2f
+      prefetch: 32
+
+  - name: mqtt_updates
+    type: mqtt
+    options:
+      url: mqtt://localhost:1883
+      client_id: chronicle-fixture
+
+  - name: postgres_records
+    type: postgres
+    warmup: true
+    warmup_timeout: 20s
+    options:
+      url: postgres://chronicle:chronicle@localhost:5432/chronicle
+      schema: public
+
+  - name: redis_state
+    type: redis
+    options:
+      url: redis://localhost:6379/0
+      pool:
+        max_connections: 16
+        idle_timeout_secs: 30
+
+  - name: mongodb_audit
+    type: mongodb
+    options:
+      uri: mongodb://localhost:27017
+      database: chronicle
+
+chronicles:
+  - name: collect_record
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /api/v1/records
+        contentType: application/json
+    phases:
+      - name: prepare_summary
+        type: transform
+        options:
+          summary:
+            record_id: .[0].body.record.id
+            category: .[0].body.record.attributes.category
+            tier: .[0].body.record.attributes.tier
+            observed_at: .[0].body.record.observed_at
+          trace:
+            trace_id: .[0].headers.trace_id
+      - name: publish_ingest_event
+        type: rabbitmq
+        options:
+          connector: rabbitmq_events
+          routing_key: chronicle.records
+          body:
+            summary: .[1].summary
+            trace: .[1].trace
+          confirm: true
+      - name: cache_acceptance
+        type: redis
+        options:
+          connector: redis_state
+          command: set
+          key: .[1].summary.record_id
+          value: accepted
+          ex: 600
+      - name: respond_to_client
+        type: transform
+        options:
+          status: 200
+          contentType: application/json
+          body:
+            record_id: .[1].summary.record_id
+            status: accepted
+            trace_id: .[1].trace.trace_id
+    policy:
+      requires:
+        - rabbitmq_events
+        - redis_state
+      delivery:
+        retries: 3
+        backoff: 100ms..1500ms
+        idempotent: true
+
+  - name: relay_record
+    trigger:
+      connector: rabbitmq_events
+      options:
+        queue: chronicle.records
+        ack_mode: manual
+        prefetch: 16
+    phases:
+      - name: normalise_payload
+        type: transform
+        options:
+          record_id: .[0].body.summary.record_id
+          summary: .[0].body.summary
+          trace: .[0].body.trace
+      - name: update_status_cache
+        type: redis
+        options:
+          connector: redis_state
+          command: hset
+          key: chronicle:record_status
+          field: .[1].record_id
+          value: processing
+      - name: publish_outbound_mqtt
+        type: mqtt
+        options:
+          connector: mqtt_updates
+          topic: records/summary
+          qos: 1
+          retain: false
+          payload: .[1]
+          payload_encoding: json
+    policy:
+      requires:
+        - mqtt_updates
+        - redis_state
+      readiness_priority: 10
+      limits:
+        max_inflight: 32
+
+  - name: persist_record
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /api/v1/records/persist
+        contentType: application/json
+    phases:
+      - name: shape_insert
+        type: transform
+        options:
+          record:
+            record_id: .[0].body.record.id
+            attributes: .[0].body.record.attributes
+            metrics: .[0].body.record.metrics
+            observed_at: .[0].body.record.observed_at
+          trace_id: .[0].headers.trace_id
+      - name: upsert_postgres
+        type: postgres_idempotent_insert
+        options:
+          connector: postgres_records
+          sql: |
+            INSERT INTO records (record_id, attributes, metrics, observed_at)
+            VALUES (:record_id, :attributes::jsonb, :metrics::jsonb, :observed_at::timestamptz)
+            ON CONFLICT (record_id) DO UPDATE SET
+              attributes = EXCLUDED.attributes,
+              metrics = EXCLUDED.metrics,
+              observed_at = EXCLUDED.observed_at;
+          values:
+            record_id: .[1].record.record_id
+            attributes: .[1].record.attributes
+            metrics: .[1].record.metrics
+            observed_at: .[1].record.observed_at
+      - name: audit_mongodb
+        type: mongodb
+        options:
+          connector: mongodb_audit
+          collection: record_audit
+          operation: insert_one
+          document:
+            record_id: .[1].record.record_id
+            trace_id: .[1].trace_id
+            persisted_at: .[1].record.observed_at
+            attributes: .[1].record.attributes
+      - name: acknowledge_persist
+        type: transform
+        options:
+          status: 200
+          contentType: application/json
+          body:
+            record_id: .[1].record.record_id
+            trace_id: .[1].trace_id
+            persisted: true
+    policy:
+      requires:
+        - postgres_records
+        - mongodb_audit
+      limits:
+        max_inflight: 16
+      retry_budget:
+        max_attempts: 3
+        base_backoff: 200ms
+        max_backoff: 2s
+
+management:
+  port: 9090
+  ready:
+    path: /ready
+  live:
+    path: /live
+  status:
+    path: /status
+  metrics:
+    path: /metrics

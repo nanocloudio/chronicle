@@ -1,0 +1,9 @@
+---
+source: tests/config_validation_snapshots.rs
+assertion_line: 25
+expression: error
+--- 
+integration config validation failed:
+schema_version: "v2"
+- api_version `v2` is not supported (supported versions: v1)
+- connector `ingress` uses type `http` but is missing required option `role`

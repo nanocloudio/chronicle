@@ -1,0 +1,103 @@
+api_version: v1
+
+app:
+  feature_flags:
+    - rabbitmq
+    - mqtt
+
+connectors:
+
+  - name: http_backend
+    type: http
+    options:
+      role: client
+      base_url: http://api.internal.test
+
+  - name: rabbitmq_core
+    type: rabbitmq
+    options:
+      url: amqp://guest:guest@rabbitmq.test:5672/%2f
+      prefetch: 5
+
+  - name: mqtt_iot
+    type: mqtt
+    options:
+      url: mqtt://mqtt.test:1883
+      client_id: chronicle-tests
+
+  - name: postgres_ledger
+    type: postgres
+    options:
+      url: postgres://postgres:postgres@postgres.test:5432/chronicle
+
+chronicles:
+
+  - name: rabbitmq_alert_pipeline
+    trigger:
+      connector: rabbitmq_core
+      options:
+        queue: alerts.primary
+        ack_mode: manual
+        prefetch: 5
+    phases:
+      - name: shape_alert
+        type: transform
+        options:
+          alert:
+            routing_key: .[0].routing_key
+            exchange: .[0].exchange
+            body: .[0].body
+            redelivered: .[0].redelivered
+      - name: forward_alert_http
+        type: http_client
+        options:
+          connector: http_backend
+          method: POST
+          path: /alerts/handle
+          body:
+            alert: .[1].alert
+          contentType: application/json
+      - name: publish_ack_event
+        type: rabbitmq
+        options:
+          connector: rabbitmq_core
+          exchange: alerts.audit
+          routing_key: processed.alerts
+          body:
+            alert: .[1].alert
+
+  - name: mqtt_sensor_ingest
+    trigger:
+      connector: mqtt_iot
+      options:
+        topic: sensors/telemetry/+
+        qos: 1
+        retain_handling: 0
+    phases:
+      - name: normalise_sensor_reading
+        type: transform
+        options:
+          reading: .[0]
+      - name: publish_sensor_update
+        type: mqtt
+        options:
+          connector: mqtt_iot
+          topic: sensors/processed
+          qos: 1
+          retain: false
+          payload: .[1].reading
+          payload_encoding: json
+      - name: upsert_reading_postgres
+        type: postgres_idempotent_insert
+        options:
+          connector: postgres_ledger
+          sql: |
+            INSERT INTO sensor_readings
+              (topic, payload_base64)
+            VALUES
+              (:topic, :payload_base64)
+            ON CONFLICT (topic) DO UPDATE SET
+              payload_base64 = EXCLUDED.payload_base64;
+          values:
+            topic: .[1].reading.topic
+            payload_base64: .[1].reading.payload.base64

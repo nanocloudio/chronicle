@@ -1,0 +1,8 @@
+---
+source: tests/config_validation_snapshots.rs
+assertion_line: 47
+expression: error
+---
+integration config validation failed:
+schema_version: "v1"
+- chronicle `orphan_route` references unknown trigger connector `missing`

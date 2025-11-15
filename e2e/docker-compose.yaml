@@ -1,0 +1,90 @@
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: chronicle-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rabbitmq-diagnostics check_running && rabbitmq-diagnostics check_local_alarms",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chronicle-harness
+
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    container_name: chronicle-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    command: >
+      /bin/sh -c "mkdir -p /mosquitto/config &&
+                  printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' > /mosquitto/config/mosquitto.conf &&
+                  mosquitto -c /mosquitto/config/mosquitto.conf"
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -t health -C 1 -W 3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chronicle-harness
+
+  postgres:
+    image: postgres:15
+    container_name: chronicle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: chronicle
+      POSTGRES_PASSWORD: chronicle
+      POSTGRES_DB: chronicle
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - chronicle-harness
+
+  mongodb:
+    image: mongo:6.0
+    container_name: chronicle-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test:
+        ["CMD", "mongo", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - chronicle-harness
+
+  redis:
+    image: redis:7
+    container_name: chronicle-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - chronicle-harness
+
+networks:
+  chronicle-harness:
+    name: chronicle-harness

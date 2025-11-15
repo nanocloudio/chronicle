@@ -1,0 +1,77 @@
+api_version: v1
+
+app:
+  min_ready_routes: all
+  readiness_cache: 250ms
+
+connectors:
+
+  - name: http_ingest
+    type: http
+    options:
+      role: server
+      host: 0.0.0.0
+      port: 9090
+      health:
+        method: GET
+        path: /healthz
+
+  - name: analytics_kafka
+    type: kafka
+    warmup: true
+    options:
+      create_topics_if_missing: true
+      brokers:
+        - localhost:9092
+
+chronicles:
+
+  - name: http_ingest_to_kafka
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /api/v1/records
+        content_type: application/json
+    phases:
+      - name: summarise_record
+        type: transform
+        options:
+          summary:
+            record_id: .[0].body.record.id
+            category: .[0].body.record.attributes.category
+            tier: .[0].body.record.attributes.tier
+            latency_ms: .[0].body.record.metrics.latency_ms
+            retries: .[0].body.record.metrics.retries
+          trace:
+            trace_id: .[0].headers.trace_id
+            observed_at: .[0].body.record.observed_at
+      - name: publish_summary
+        type: kafka_producer
+        options:
+          connector: analytics_kafka
+          topic: records.summary
+          key: .[1].summary.record_id
+          payload: .[1]
+      - name: respond_to_client
+        type: transform
+        options:
+          status: 202
+          content_type: application/json
+          body:
+            record_id: .[1].summary.record_id
+            published_topic: records.summary
+            latency_ms: .[1].summary.latency_ms
+            trace_id: .[1].trace.trace_id
+
+management:
+  host: 0.0.0.0
+  port: 9091
+  live:
+    path: /live
+  ready:
+    path: /ready
+  status:
+    path: /status
+  metrics:
+    path: /metrics

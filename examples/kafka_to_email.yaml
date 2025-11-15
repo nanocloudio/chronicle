@@ -1,0 +1,58 @@
+api_version: v1
+
+app:
+  min_ready_routes: any
+  readiness_cache: 250ms
+
+connectors:
+
+  - name: analytics_kafka
+    type: kafka
+    options:
+      brokers:
+        - localhost:9092
+
+  - name: notifications_smtp
+    type: smtp
+    options:
+      host: smtp.example.com
+      port: 587
+      auth:
+        username: notifier
+        password: example-password
+      tls:
+        mode: starttls
+        domain: smtp.example.com
+      from: alerts@example.com
+
+chronicles:
+
+  - name: kafka_latency_alerts
+    trigger:
+      connector: analytics_kafka
+      options:
+        topic: records.summary
+        group_id: latency-notifier
+        auto_offset_reset: earliest
+    phases:
+      - name: build_email
+        type: transform
+        options:
+          from: alerts@example.com
+          to:
+            - ops-team@example.com
+          subject: >
+            Record .[0].body.summary.record_id latency alert
+          body:
+            text: >
+              Record .[0].body.summary.record_id observed latency of .[0].body.summary.latency_ms ms.
+            html: >
+              <p>Record <strong>.[0].body.summary.record_id</strong> observed latency of <strong>.[0].body.summary.latency_ms</strong> ms.</p>
+      - name: send_email
+        type: smtp_send
+        options:
+          connector: notifications_smtp
+          from: .[1].from
+          to: .[1].to
+          subject: .[1].subject
+          body: .[1].body

@@ -1,0 +1,51 @@
+api_version: v1
+
+app:
+  min_ready_routes: all
+  readiness_cache: 250ms
+
+connectors:
+
+  - name: http_ingest
+    type: http
+    options:
+      role: server
+      port: 9091
+
+  - name: enrichment_grpc
+    type: grpc
+    options:
+      endpoint: https://enrichment.example.com:443
+      descriptor: schemas/enrichment.desc
+      metadata:
+        authorization: Bearer example-token
+
+chronicles:
+
+  - name: grpc_enrichment
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /api/v1/enrich
+        content_type: application/json
+    phases:
+      - name: call_enrichment_service
+        type: grpc_client
+        options:
+          connector: enrichment_grpc
+          rpc: com.nanocloud.chronicle.EnrichmentService/Enrich
+          request:
+            recordId: .[0].body.record.id
+            attributes: .[0].body.record.attributes
+            metrics: .[0].body.record.metrics
+          metadata:
+            x-request-id: .[0].headers.trace_id
+      - name: acknowledge_enrichment
+        type: transform
+        options:
+          status: 202
+          content_type: application/json
+          body:
+            record_id: .[0].body.record.id
+            enrichment_status: .[1].status

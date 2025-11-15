@@ -1,0 +1,199 @@
+api_version: v1
+
+connectors:
+
+  - name: sample_kafka_cluster
+    type: kafka
+    options:
+      brokers: localhost:9092
+
+  - name: sample_state_store
+    type: mariadb
+    options:
+      url: mysql://chronicle:chronicle@localhost:3306/chronicle
+      schema: records
+      pool:
+        max_connections: 8
+        idle_timeout_secs: 60
+
+  - name: sample_ingest_service
+    type: http_server
+    options:
+      host: 0.0.0.0
+      port: 8443
+      tls.key: key.pem
+      tls.cert: cert.pem
+      tls.ca: ca.pem
+      health.method: GET
+      health.path: /health
+
+  - name: sample_processing_api
+    type: http_client
+    options:
+      base_url: https://processor.example.com
+      tls.ca: ca.pem
+      pool:
+        max_idle_per_host: 32
+        idle_timeout_secs: 30
+
+  - name: sample_grpc_backend
+    type: grpc
+    options:
+      endpoint: https://grpc.example.com:443
+      tls.ca: ca.pem
+      descriptor: descriptors/sample.pb
+      metadata:
+        x-api-key: demo-key
+
+  - name: notification_smtp
+    type: smtp
+    options:
+      host: smtp.example.com
+      port: 587
+      auth:
+        username: notifier
+        password: super-secret
+      tls:
+        mode: starttls
+        domain: smtp.example.com
+      from: alerts@example.com
+      timeout_secs: 30
+
+chronicles:
+
+  - name: collect_record
+    trigger:
+      connector: sample_ingest_service
+      options:
+        method: POST
+        path: /api/v1/records
+        contentType: application/json
+    phases:
+      - name: summarize_record
+        type: transform
+        options:
+          summary.record_id: .[0].body.record.id
+          summary.category: .[0].body.record.attributes.category
+          summary.tier: .[0].body.record.attributes.tier
+          summary.latency_ms: .[0].body.record.metrics.latency_ms
+          trace.trace_id: .[0].headers.trace_id
+          trace.observed_at: .[0].body.record.observed_at
+      - name: publish_sample
+        type: kafka_producer
+        options:
+          connector: sample_kafka_cluster
+          topic: records.samples
+          key: .[1].summary.record_id
+          payload: .[1]
+      - name: acknowledge_ingest
+        type: transform
+        options:
+          status: 200
+          contentType: application/json
+          body.record_id: .[1].summary.record_id
+          body.trace_id: .[1].trace.trace_id
+
+  - name: relay_record
+    trigger:
+      connector: sample_kafka_cluster
+      kafka:
+        topic: records.samples
+        group_id: relay-service
+        auto_offset_reset: earliest
+    phases:
+      - name: forward_record
+        type: http_client
+        options:
+          connector: sample_processing_api
+          method: POST
+          path: /api/v1/records/relay
+          header.trace_id: .[0].body.trace.trace_id
+          body.summary: .[0].body.summary
+          body.trace: .[0].body.trace
+
+  - name: persist_record
+    trigger:
+      connector: sample_ingest_service
+      options:
+        method: POST
+        path: /api/v1/records/persist
+        contentType: application/json
+    phases:
+      - name: store_record
+        type: mariadb_idempotent_insert
+        options:
+          connector: sample_state_store
+          table: records
+          key: .[0].body.record.id
+          value.payload: .[0].body.record
+      - name: confirm_persisted
+        type: transform
+        options:
+          status: 200
+          contentType: application/json
+          body.record_id: .[0].body.record.id
+          body.inserted: .[1].count
+
+  - name: enrich_record
+    trigger:
+      connector: sample_ingest_service
+      options:
+        method: POST
+        path: /api/v1/records/enrich
+        contentType: application/json
+    phases:
+      - name: invoke_enrichment
+        type: grpc_client
+        options:
+          connector: sample_grpc_backend
+          rpc: example.records.EnrichmentService/Enrich
+          request:
+            recordId: .[0].body.record.id
+            attributes: .[0].body.record.attributes
+          metadata:
+            x-request-id: .[0].headers.message_id
+      - name: acknowledge_enrichment
+        type: transform
+        options:
+          status: 202
+          contentType: application/json
+          body.record_id: .[0].body.record.id
+
+  - name: notify_summary
+    trigger:
+      connector: sample_kafka_cluster
+      kafka:
+        topic: records.samples
+        group_id: notify-service
+    phases:
+      - name: build_notification_email
+        type: transform
+        options:
+          from: alerts@example.com
+          to.0: ops-team@example.com
+          to.1: support@example.com
+          cc.0: platform@example.com
+          subject: 'Record .[0].body.summary.record_id latency alert'
+          body.text: >
+            Record .[0].body.summary.record_id observed latency of .[0].body.summary.latency_ms ms at .[0].body.trace.observed_at (UTC).
+          body.html: >
+            <p>Record <strong>.[0].body.summary.record_id</strong> observed latency of <strong>.[0].body.summary.latency_ms</strong> ms at <em>.[0].body.trace.observed_at</em> (UTC).</p>
+          headers.x-trace-id: .[0].body.trace.trace_id
+      - name: deliver_notification_email
+        type: smtp_send
+        options:
+          connector: notification_smtp
+          from: .[1].from
+          to: .[1].to
+          cc: .[1].cc
+          subject: .[1].subject
+          body: .[1].body
+          headers: .[1].headers
+
+management:
+
+  port: 9100
+  health:
+    path: /healthz
+  metrics:
+    path: /metrics

@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "SensorReading",
+  "namespace": "com.nanocloud.chronicle",
+  "fields": [
+    { "name": "topic", "type": "string" },
+    { "name": "qos", "type": "int" },
+    { "name": "retain", "type": "boolean" },
+    { "name": "payload_base64", "type": "string" },
+    { "name": "payload_text", "type": [ "null", "string" ], "default": null }
+  ]
+}
