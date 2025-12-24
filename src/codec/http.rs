@@ -15,7 +15,7 @@ use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Method, RequestBuilder, Url};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use url::form_urlencoded;
 
 pub fn resolve_url(base: &str, path: &str) -> Result<Url> {
@@ -264,16 +264,31 @@ pub struct EncodedHttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
     pub body: Bytes,
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 pub fn encode_http_response(
     response: &HttpResponse,
 ) -> Result<EncodedHttpResponse, serde_json::Error> {
-    let body = encode_body(&response.body)?;
+    // Priority: body_b64 > body_raw_json > body
+    let body = if let Some(b64) = &response.body_b64 {
+        // Decode base64 to raw bytes
+        BASE64_ENGINE
+            .decode(b64)
+            .map(Bytes::from)
+            .unwrap_or_else(|_| Bytes::new())
+    } else if let Some(raw_json) = &response.body_raw_json {
+        // Send raw JSON string as-is (not double-encoded)
+        Bytes::from(raw_json.clone())
+    } else {
+        encode_body(&response.body)?
+    };
+
     Ok(EncodedHttpResponse {
         status: response.status,
         content_type: response.content_type.clone(),
         body,
+        headers: response.headers.clone(),
     })
 }
 
@@ -354,5 +369,272 @@ fn merge_json_value(map: &mut JsonMap<String, JsonValue>, key: &str, value: Json
         None => {
             map.insert(key.to_string(), value);
         }
+    }
+}
+
+// --- Route Template Support ---
+
+/// A compiled route template that can match paths and extract parameters.
+#[derive(Debug, Clone)]
+pub struct RouteTemplate {
+    segments: Vec<TemplateSegment>,
+    original: String,
+}
+
+#[derive(Debug, Clone)]
+enum TemplateSegment {
+    /// A literal path segment (e.g., "v2" in "/v2/...")
+    Literal(String),
+    /// A parameter segment (e.g., "{namespace}" captures into "namespace")
+    Param(String),
+}
+
+impl RouteTemplate {
+    /// Parse a route template string like "/v2/{namespace}/{name}/manifests/{reference}".
+    pub fn parse(template: &str) -> std::result::Result<Self, RouteParseError> {
+        let normalized = normalise_path(template);
+        let mut segments = Vec::new();
+
+        for part in normalized.split('/') {
+            if part.is_empty() {
+                continue;
+            }
+
+            if part.starts_with('{') && part.ends_with('}') {
+                let param_name = &part[1..part.len() - 1];
+                if param_name.is_empty() {
+                    return Err(RouteParseError::EmptyParam {
+                        template: template.to_string(),
+                    });
+                }
+                if !is_valid_param_name(param_name) {
+                    return Err(RouteParseError::InvalidParamName {
+                        template: template.to_string(),
+                        param: param_name.to_string(),
+                    });
+                }
+                segments.push(TemplateSegment::Param(param_name.to_string()));
+            } else if part.contains('{') || part.contains('}') {
+                return Err(RouteParseError::MalformedSegment {
+                    template: template.to_string(),
+                    segment: part.to_string(),
+                });
+            } else {
+                segments.push(TemplateSegment::Literal(part.to_string()));
+            }
+        }
+
+        Ok(RouteTemplate {
+            segments,
+            original: template.to_string(),
+        })
+    }
+
+    /// Try to match a request path against this template.
+    /// Returns the extracted path parameters if the match succeeds.
+    pub fn match_path(&self, path: &str) -> Option<HashMap<String, String>> {
+        let normalized = normalise_path(path);
+        let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+
+        if parts.len() != self.segments.len() {
+            return None;
+        }
+
+        let mut params = HashMap::new();
+
+        for (segment, part) in self.segments.iter().zip(parts.iter()) {
+            match segment {
+                TemplateSegment::Literal(expected) => {
+                    if *part != expected {
+                        return None;
+                    }
+                }
+                TemplateSegment::Param(name) => {
+                    // URL-decode the parameter value
+                    let decoded = percent_decode_path(part);
+                    params.insert(name.clone(), decoded);
+                }
+            }
+        }
+
+        Some(params)
+    }
+
+    /// Check if this template represents an exact path (no parameters).
+    pub fn is_exact(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|s| matches!(s, TemplateSegment::Literal(_)))
+    }
+
+    /// Get the original template string.
+    pub fn original(&self) -> &str {
+        &self.original
+    }
+
+    /// Convert to an axum-compatible route pattern.
+    /// e.g., "/v2/{namespace}/{name}/manifests/{reference}" -> "/v2/:namespace/:name/manifests/:reference"
+    pub fn to_axum_pattern(&self) -> String {
+        let mut pattern = String::new();
+        for segment in &self.segments {
+            pattern.push('/');
+            match segment {
+                TemplateSegment::Literal(lit) => pattern.push_str(lit),
+                TemplateSegment::Param(name) => {
+                    pattern.push(':');
+                    pattern.push_str(name);
+                }
+            }
+        }
+        if pattern.is_empty() {
+            "/".to_string()
+        } else {
+            pattern
+        }
+    }
+}
+
+fn is_valid_param_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn percent_decode_path(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let mut hex = String::with_capacity(2);
+            if let Some(&h1) = chars.peek() {
+                if h1.is_ascii_hexdigit() {
+                    hex.push(chars.next().unwrap());
+                    if let Some(&h2) = chars.peek() {
+                        if h2.is_ascii_hexdigit() {
+                            hex.push(chars.next().unwrap());
+                        }
+                    }
+                }
+            }
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    if byte.is_ascii() {
+                        output.push(byte as char);
+                        continue;
+                    }
+                }
+            }
+            // Failed to decode, keep original
+            output.push('%');
+            output.push_str(&hex);
+        } else if ch == '+' {
+            output.push(' ');
+        } else {
+            output.push(ch);
+        }
+    }
+
+    output
+}
+
+#[derive(Debug, Clone)]
+pub enum RouteParseError {
+    EmptyParam { template: String },
+    InvalidParamName { template: String, param: String },
+    MalformedSegment { template: String, segment: String },
+}
+
+impl std::fmt::Display for RouteParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteParseError::EmptyParam { template } => {
+                write!(f, "empty parameter `{{}}` in route template `{}`", template)
+            }
+            RouteParseError::InvalidParamName { template, param } => {
+                write!(
+                    f,
+                    "invalid parameter name `{}` in route template `{}`",
+                    param, template
+                )
+            }
+            RouteParseError::MalformedSegment { template, segment } => {
+                write!(
+                    f,
+                    "malformed segment `{}` in route template `{}`",
+                    segment, template
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouteParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_template() {
+        let tmpl = RouteTemplate::parse("/v2/").unwrap();
+        assert_eq!(tmpl.segments.len(), 1);
+        assert!(tmpl.is_exact());
+    }
+
+    #[test]
+    fn parse_template_with_params() {
+        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
+        assert_eq!(tmpl.segments.len(), 5);
+        assert!(!tmpl.is_exact());
+    }
+
+    #[test]
+    fn match_exact_path() {
+        let tmpl = RouteTemplate::parse("/v2/").unwrap();
+        let params = tmpl.match_path("/v2/").unwrap();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn match_path_with_params() {
+        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
+        let params = tmpl
+            .match_path("/v2/library/alpine/manifests/latest")
+            .unwrap();
+        assert_eq!(params.get("namespace").unwrap(), "library");
+        assert_eq!(params.get("name").unwrap(), "alpine");
+        assert_eq!(params.get("reference").unwrap(), "latest");
+    }
+
+    #[test]
+    fn match_path_mismatch() {
+        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
+        assert!(tmpl
+            .match_path("/v2/library/alpine/blobs/sha256:abc")
+            .is_none());
+    }
+
+    #[test]
+    fn match_path_url_encoded() {
+        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
+        let params = tmpl
+            .match_path("/v2/my%2Fnamespace/alpine/manifests/v1.0")
+            .unwrap();
+        assert_eq!(params.get("namespace").unwrap(), "my/namespace");
+    }
+
+    #[test]
+    fn to_axum_pattern() {
+        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
+        assert_eq!(
+            tmpl.to_axum_pattern(),
+            "/v2/:namespace/:name/manifests/:reference"
+        );
     }
 }

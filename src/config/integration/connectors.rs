@@ -140,6 +140,7 @@ pub enum ConnectorKind {
     Mongodb,
     Redis,
     Smtp,
+    ObjectStore,
     Unknown(String),
 }
 
@@ -185,6 +186,7 @@ impl ConnectorKind {
             "mongodb" => ConnectorKind::Mongodb,
             "redis" => ConnectorKind::Redis,
             "smtp" => ConnectorKind::Smtp,
+            "object_store" => ConnectorKind::ObjectStore,
             other => ConnectorKind::Unknown(other.to_string()),
         }
     }
@@ -202,6 +204,7 @@ impl ConnectorKind {
             ConnectorKind::Mongodb => "mongodb",
             ConnectorKind::Redis => "redis",
             ConnectorKind::Smtp => "smtp",
+            ConnectorKind::ObjectStore => "object_store",
             ConnectorKind::Unknown(other) => other.as_str(),
         }
     }
@@ -1014,6 +1017,30 @@ pub struct DbPoolOptions {
     pub max_connections: Option<u32>,
     #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, JsonValue>,
+}
+
+/// Configuration options for the object_store connector.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ObjectStoreConnectorOptions {
+    /// Backend type: "filesystem", "s3", "gcs", "azure"
+    pub backend: String,
+    /// Root path for the object store (filesystem: directory, S3: bucket/prefix)
+    pub root: String,
+    /// Optional region for cloud backends
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Optional endpoint URL for S3-compatible backends
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Optional access key ID for cloud backends
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// Optional secret access key for cloud backends
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, JsonValue>,
 }

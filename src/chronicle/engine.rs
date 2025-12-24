@@ -1373,6 +1373,249 @@ impl ChronicleEngine {
 
                 context.insert_slot(slot_index, JsonValue::Object(context_record));
             }
+            PhasePlan::HttpResponse { name, template } => {
+                let resolved = context
+                    .resolve_template(template)
+                    .map_err(|err| map_context_error(err, &plan.name, Some(name)))?;
+                tracing::debug!(
+                    target: "chronicle::engine",
+                    event = "http_response_resolved",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    result = ?resolved
+                );
+                context.insert_slot(slot_index, resolved);
+            }
+            PhasePlan::PostgresQuery {
+                name,
+                connector,
+                sql_template,
+                params_template,
+                extra: _,
+                timeout_ms: _,
+            } => {
+                let (connector_name, _handle) =
+                    connector.clone().expect_postgres(&plan.name, name)?;
+
+                let sql = if let Some(template) = sql_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Null
+                };
+
+                let params = if let Some(template) = params_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Array(vec![])
+                };
+
+                tracing::info!(
+                    target: "chronicle::engine",
+                    event = "postgres_query_enqueued",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    connector = %connector_name,
+                    trace_id = trace_field,
+                    record_id = record_field
+                );
+
+                let mut result = JsonMap::new();
+                result.insert("connector".to_string(), JsonValue::String(connector_name));
+                result.insert("sql".to_string(), sql);
+                result.insert("params".to_string(), params);
+                result.insert("status".to_string(), JsonValue::String("pending".into()));
+                context.insert_slot(slot_index, JsonValue::Object(result));
+            }
+            PhasePlan::PostgresExec {
+                name,
+                connector,
+                sql_template,
+                params_template,
+                extra: _,
+                timeout_ms: _,
+            } => {
+                let (connector_name, _handle) =
+                    connector.clone().expect_postgres(&plan.name, name)?;
+
+                let sql = if let Some(template) = sql_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Null
+                };
+
+                let params = if let Some(template) = params_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Array(vec![])
+                };
+
+                tracing::info!(
+                    target: "chronicle::engine",
+                    event = "postgres_exec_enqueued",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    connector = %connector_name,
+                    trace_id = trace_field,
+                    record_id = record_field
+                );
+
+                let mut result = JsonMap::new();
+                result.insert("connector".to_string(), JsonValue::String(connector_name));
+                result.insert("sql".to_string(), sql);
+                result.insert("params".to_string(), params);
+                result.insert("status".to_string(), JsonValue::String("pending".into()));
+                context.insert_slot(slot_index, JsonValue::Object(result));
+            }
+            PhasePlan::ObjectStoreGet {
+                name,
+                connector_name,
+                path_template,
+                extra: _,
+            } => {
+                let path = if let Some(template) = path_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Null
+                };
+
+                let path_str = match &path {
+                    JsonValue::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+
+                tracing::info!(
+                    target: "chronicle::engine",
+                    event = "object_store_get_enqueued",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    connector = %connector_name,
+                    path = %path_str,
+                    trace_id = trace_field,
+                    record_id = record_field
+                );
+
+                let mut result = JsonMap::new();
+                result.insert(
+                    "connector".to_string(),
+                    JsonValue::String(connector_name.clone()),
+                );
+                result.insert("path".to_string(), path);
+                result.insert("status".to_string(), JsonValue::String("pending".into()));
+                context.insert_slot(slot_index, JsonValue::Object(result));
+            }
+            PhasePlan::ObjectStorePut {
+                name,
+                connector_name,
+                path_template,
+                body_template,
+                extra: _,
+            } => {
+                let path = if let Some(template) = path_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Null
+                };
+
+                let body = if let Some(template) = body_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Null
+                };
+
+                let path_str = match &path {
+                    JsonValue::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+
+                tracing::info!(
+                    target: "chronicle::engine",
+                    event = "object_store_put_enqueued",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    connector = %connector_name,
+                    path = %path_str,
+                    trace_id = trace_field,
+                    record_id = record_field
+                );
+
+                let mut result = JsonMap::new();
+                result.insert(
+                    "connector".to_string(),
+                    JsonValue::String(connector_name.clone()),
+                );
+                result.insert("path".to_string(), path);
+                result.insert("body_b64".to_string(), body);
+                result.insert("status".to_string(), JsonValue::String("pending".into()));
+                context.insert_slot(slot_index, JsonValue::Object(result));
+            }
+            PhasePlan::Guard {
+                name,
+                condition_template,
+                response_template,
+                extra: _,
+            } => {
+                let condition = if let Some(template) = condition_template.as_ref() {
+                    context
+                        .resolve_template(template)
+                        .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                } else {
+                    JsonValue::Bool(true)
+                };
+
+                // If condition is falsy, short-circuit with the response
+                let is_truthy = match &condition {
+                    JsonValue::Bool(b) => *b,
+                    JsonValue::Null => false,
+                    JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                    JsonValue::String(s) => !s.is_empty(),
+                    JsonValue::Array(a) => !a.is_empty(),
+                    JsonValue::Object(o) => !o.is_empty(),
+                };
+
+                tracing::debug!(
+                    target: "chronicle::engine",
+                    event = "guard_evaluated",
+                    chronicle = %plan.name,
+                    phase = %phase_name,
+                    condition = ?condition,
+                    is_truthy = is_truthy,
+                    trace_id = trace_field,
+                    record_id = record_field
+                );
+
+                if !is_truthy {
+                    // Short-circuit: resolve response and set as final slot
+                    let response = if let Some(template) = response_template.as_ref() {
+                        context
+                            .resolve_template(template)
+                            .map_err(|err| map_context_error(err, &plan.name, Some(name)))?
+                    } else {
+                        JsonValue::Null
+                    };
+                    context.insert_slot(slot_index, response);
+                    // Return empty actions to indicate short-circuit
+                    return Ok(vec![]);
+                }
+
+                // Condition passed, continue with a pass-through
+                let mut result = JsonMap::new();
+                result.insert("guard_passed".to_string(), JsonValue::Bool(true));
+                context.insert_slot(slot_index, JsonValue::Object(result));
+            }
             PhasePlan::Unsupported { name, kind } => {
                 return Err(ChronicleEngineError::UnsupportedPhase {
                     chronicle: plan.name.clone(),
@@ -1405,10 +1648,36 @@ fn build_http_response(context: &ExecutionContext, phase_count: usize) -> Option
         .map(|s| s.to_string());
     let body = map.get("body").cloned().unwrap_or(JsonValue::Null);
 
+    // Extract body_b64 for binary responses
+    let body_b64 = map
+        .get("body_b64")
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string());
+
+    // Extract body_raw_json for pre-serialized JSON
+    let body_raw_json = map
+        .get("body_raw_json")
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string());
+
+    // Extract custom headers
+    let headers = map
+        .get("headers")
+        .and_then(|value| value.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(HttpResponse {
         status,
         content_type,
         body,
+        body_b64,
+        body_raw_json,
+        headers,
     })
 }
 
@@ -1658,6 +1927,12 @@ pub struct HttpResponse {
     pub status: u16,
     pub content_type: Option<String>,
     pub body: JsonValue,
+    /// Base64-encoded body for binary responses
+    pub body_b64: Option<String>,
+    /// Raw JSON string to be sent as-is (not double-encoded)
+    pub body_raw_json: Option<String>,
+    /// Custom response headers
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1919,8 +2194,14 @@ impl PhasePlan {
             | PhasePlan::MqttPublish { connector, .. }
             | PhasePlan::SmtpSend { connector, .. }
             | PhasePlan::Mongodb(MongodbPhasePlan { connector, .. })
-            | PhasePlan::Redis(RedisPhasePlan { connector, .. }) => {
+            | PhasePlan::Redis(RedisPhasePlan { connector, .. })
+            | PhasePlan::PostgresQuery { connector, .. }
+            | PhasePlan::PostgresExec { connector, .. } => {
                 connectors.insert(connector.name().to_string());
+            }
+            PhasePlan::ObjectStoreGet { connector_name, .. }
+            | PhasePlan::ObjectStorePut { connector_name, .. } => {
+                connectors.insert(connector_name.clone());
             }
             PhasePlan::Parallel(plan) => {
                 for child in &plan.children {
@@ -1929,6 +2210,8 @@ impl PhasePlan {
             }
             PhasePlan::Serialize(_)
             | PhasePlan::Transform { .. }
+            | PhasePlan::HttpResponse { .. }
+            | PhasePlan::Guard { .. }
             | PhasePlan::Unsupported { .. } => {}
         }
     }
@@ -1944,9 +2227,9 @@ impl PhasePlan {
             | PhasePlan::MqttPublish { connector, .. }
             | PhasePlan::SmtpSend { connector, .. }
             | PhasePlan::Mongodb(MongodbPhasePlan { connector, .. })
-            | PhasePlan::Redis(RedisPhasePlan { connector, .. }) => {
-                budgets.push(connector.retry_budget())
-            }
+            | PhasePlan::Redis(RedisPhasePlan { connector, .. })
+            | PhasePlan::PostgresQuery { connector, .. }
+            | PhasePlan::PostgresExec { connector, .. } => budgets.push(connector.retry_budget()),
             PhasePlan::Parallel(plan) => {
                 for child in &plan.children {
                     child.plan.collect_retry_budgets(budgets);
@@ -1954,6 +2237,10 @@ impl PhasePlan {
             }
             PhasePlan::Serialize(_)
             | PhasePlan::Transform { .. }
+            | PhasePlan::HttpResponse { .. }
+            | PhasePlan::ObjectStoreGet { .. }
+            | PhasePlan::ObjectStorePut { .. }
+            | PhasePlan::Guard { .. }
             | PhasePlan::Unsupported { .. } => {}
         }
     }
@@ -2230,6 +2517,52 @@ enum PhasePlan {
         values_template: Option<JsonValue>,
         extra: JsonValue,
         timeout_ms: Option<u64>,
+    },
+    HttpResponse {
+        name: String,
+        template: JsonValue,
+    },
+    PostgresQuery {
+        name: String,
+        connector: ConnectorHandle,
+        sql_template: Option<JsonValue>,
+        params_template: Option<JsonValue>,
+        #[allow(dead_code)]
+        extra: JsonValue,
+        #[allow(dead_code)]
+        timeout_ms: Option<u64>,
+    },
+    PostgresExec {
+        name: String,
+        connector: ConnectorHandle,
+        sql_template: Option<JsonValue>,
+        params_template: Option<JsonValue>,
+        #[allow(dead_code)]
+        extra: JsonValue,
+        #[allow(dead_code)]
+        timeout_ms: Option<u64>,
+    },
+    ObjectStoreGet {
+        name: String,
+        connector_name: String,
+        path_template: Option<JsonValue>,
+        #[allow(dead_code)]
+        extra: JsonValue,
+    },
+    ObjectStorePut {
+        name: String,
+        connector_name: String,
+        path_template: Option<JsonValue>,
+        body_template: Option<JsonValue>,
+        #[allow(dead_code)]
+        extra: JsonValue,
+    },
+    Guard {
+        name: String,
+        condition_template: Option<JsonValue>,
+        response_template: Option<JsonValue>,
+        #[allow(dead_code)]
+        extra: JsonValue,
     },
     Unsupported {
         name: String,
@@ -2919,6 +3252,143 @@ impl PhasePlan {
                     timeout_ms,
                 })
             }
+            PhaseKind::HttpResponse => Ok(Self::HttpResponse {
+                name: phase.name.clone(),
+                template: raw_options,
+            }),
+            PhaseKind::PostgresQuery => {
+                let mut options = clone_object(&raw_options).ok_or_else(|| {
+                    ChronicleEngineError::InvalidPhaseOptions {
+                        chronicle: chronicle_name.to_string(),
+                        phase: phase.name.clone(),
+                        reason: "postgres_query options must be an object".to_string(),
+                    }
+                })?;
+
+                let connector_name =
+                    take_string(chronicle_name, &phase.name, &mut options, "connector")?;
+                let sql_template = options.remove("sql");
+                let params_template = options.remove("params");
+                let timeout_ms = take_optional_u64(&mut options, "timeout_ms");
+
+                let connector = registry
+                    .postgres(&connector_name)
+                    .cloned()
+                    .map(|config| ConnectorHandle::Postgres {
+                        name: connector_name.clone(),
+                        config,
+                    })
+                    .unwrap_or_else(|| ConnectorHandle::Missing {
+                        name: connector_name.clone(),
+                        expected: "postgres",
+                    });
+
+                Ok(Self::PostgresQuery {
+                    name: phase.name.clone(),
+                    connector,
+                    sql_template,
+                    params_template,
+                    extra: JsonValue::Object(options),
+                    timeout_ms,
+                })
+            }
+            PhaseKind::PostgresExec => {
+                let mut options = clone_object(&raw_options).ok_or_else(|| {
+                    ChronicleEngineError::InvalidPhaseOptions {
+                        chronicle: chronicle_name.to_string(),
+                        phase: phase.name.clone(),
+                        reason: "postgres_exec options must be an object".to_string(),
+                    }
+                })?;
+
+                let connector_name =
+                    take_string(chronicle_name, &phase.name, &mut options, "connector")?;
+                let sql_template = options.remove("sql");
+                let params_template = options.remove("params");
+                let timeout_ms = take_optional_u64(&mut options, "timeout_ms");
+
+                let connector = registry
+                    .postgres(&connector_name)
+                    .cloned()
+                    .map(|config| ConnectorHandle::Postgres {
+                        name: connector_name.clone(),
+                        config,
+                    })
+                    .unwrap_or_else(|| ConnectorHandle::Missing {
+                        name: connector_name.clone(),
+                        expected: "postgres",
+                    });
+
+                Ok(Self::PostgresExec {
+                    name: phase.name.clone(),
+                    connector,
+                    sql_template,
+                    params_template,
+                    extra: JsonValue::Object(options),
+                    timeout_ms,
+                })
+            }
+            PhaseKind::ObjectStoreGet => {
+                let mut options = clone_object(&raw_options).ok_or_else(|| {
+                    ChronicleEngineError::InvalidPhaseOptions {
+                        chronicle: chronicle_name.to_string(),
+                        phase: phase.name.clone(),
+                        reason: "object_store_get options must be an object".to_string(),
+                    }
+                })?;
+
+                let connector_name =
+                    take_string(chronicle_name, &phase.name, &mut options, "connector")?;
+                let path_template = options.remove("path");
+
+                Ok(Self::ObjectStoreGet {
+                    name: phase.name.clone(),
+                    connector_name,
+                    path_template,
+                    extra: JsonValue::Object(options),
+                })
+            }
+            PhaseKind::ObjectStorePut => {
+                let mut options = clone_object(&raw_options).ok_or_else(|| {
+                    ChronicleEngineError::InvalidPhaseOptions {
+                        chronicle: chronicle_name.to_string(),
+                        phase: phase.name.clone(),
+                        reason: "object_store_put options must be an object".to_string(),
+                    }
+                })?;
+
+                let connector_name =
+                    take_string(chronicle_name, &phase.name, &mut options, "connector")?;
+                let path_template = options.remove("path");
+                let body_template = options.remove("body_b64");
+
+                Ok(Self::ObjectStorePut {
+                    name: phase.name.clone(),
+                    connector_name,
+                    path_template,
+                    body_template,
+                    extra: JsonValue::Object(options),
+                })
+            }
+            PhaseKind::Guard => {
+                let mut options = clone_object(&raw_options).ok_or_else(|| {
+                    ChronicleEngineError::InvalidPhaseOptions {
+                        chronicle: chronicle_name.to_string(),
+                        phase: phase.name.clone(),
+                        reason: "guard options must be an object".to_string(),
+                    }
+                })?;
+
+                let condition_template = options.remove("condition");
+                let response_template = options.remove("response");
+
+                Ok(Self::Guard {
+                    name: phase.name.clone(),
+                    condition_template,
+                    response_template,
+                    extra: JsonValue::Object(options),
+                })
+            }
             PhaseKind::Unknown(ref kind) => Ok(Self::Unsupported {
                 name: phase.name.clone(),
                 kind: kind.clone(),
@@ -2941,6 +3411,12 @@ impl PhasePlan {
             | PhasePlan::Redis(RedisPhasePlan { name, .. })
             | PhasePlan::MariadbInsert { name, .. }
             | PhasePlan::PostgresInsert { name, .. }
+            | PhasePlan::HttpResponse { name, .. }
+            | PhasePlan::PostgresQuery { name, .. }
+            | PhasePlan::PostgresExec { name, .. }
+            | PhasePlan::ObjectStoreGet { name, .. }
+            | PhasePlan::ObjectStorePut { name, .. }
+            | PhasePlan::Guard { name, .. }
             | PhasePlan::Unsupported { name, .. } => name,
         }
     }
@@ -2960,6 +3436,12 @@ impl PhasePlan {
             PhasePlan::Redis(_) => "redis",
             PhasePlan::MariadbInsert { .. } => "mariadb_idempotent_insert",
             PhasePlan::PostgresInsert { .. } => "postgres_idempotent_insert",
+            PhasePlan::HttpResponse { .. } => "http_response",
+            PhasePlan::PostgresQuery { .. } => "postgres_query",
+            PhasePlan::PostgresExec { .. } => "postgres_exec",
+            PhasePlan::ObjectStoreGet { .. } => "object_store_get",
+            PhasePlan::ObjectStorePut { .. } => "object_store_put",
+            PhasePlan::Guard { .. } => "guard",
             PhasePlan::Unsupported { kind, .. } => kind.as_str(),
         }
     }
@@ -4358,6 +4840,14 @@ fn take_optional_string(map: &mut JsonMap<String, JsonValue>, key: &str) -> Opti
         JsonValue::String(inner) => Some(inner),
         JsonValue::Null => None,
         other => Some(other.to_string()),
+    })
+}
+
+fn take_optional_u64(map: &mut JsonMap<String, JsonValue>, key: &str) -> Option<u64> {
+    map.remove(key).and_then(|value| match value {
+        JsonValue::Number(n) => n.as_u64(),
+        JsonValue::String(s) => s.parse().ok(),
+        _ => None,
     })
 }
 

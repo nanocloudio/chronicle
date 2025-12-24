@@ -107,6 +107,9 @@ fn http_response_encoding_serialises_structured_bodies() {
         status: 201,
         content_type: Some("application/json".to_string()),
         body: json!({ "status": "created" }),
+        body_b64: None,
+        body_raw_json: None,
+        headers: std::collections::BTreeMap::new(),
     };
 
     let encoded = encode_http_response(&response).expect("http response encoded");

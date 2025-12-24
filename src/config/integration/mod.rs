@@ -26,10 +26,10 @@ pub use connectors::{
     HttpClientTlsOptions, HttpServerConnectorOptions, HttpServerHealthOptions,
     HttpServerTlsOptions, KafkaConnectorOptions, KafkaSaslOptions, KafkaTlsOptions,
     KafkaTopicOptions, MariadbConnectorOptions, MariadbTlsOptions, MongodbConnectorOptions,
-    MongodbTlsOptions, MqttConnectorOptions, MqttTlsOptions, OptionMap, PostgresConnectorOptions,
-    PostgresTlsOptions, RabbitmqConnectorOptions, RabbitmqTlsOptions, RedisConnectorOptions,
-    RedisPoolOptions, RedisTlsOptions, ScalarValue, SmtpAuthOptions, SmtpConnectorOptions,
-    SmtpTlsMode, SmtpTlsOptions,
+    MongodbTlsOptions, MqttConnectorOptions, MqttTlsOptions, ObjectStoreConnectorOptions,
+    OptionMap, PostgresConnectorOptions, PostgresTlsOptions, RabbitmqConnectorOptions,
+    RabbitmqTlsOptions, RedisConnectorOptions, RedisPoolOptions, RedisTlsOptions, ScalarValue,
+    SmtpAuthOptions, SmtpConnectorOptions, SmtpTlsMode, SmtpTlsOptions,
 };
 pub use management::{ManagementConfig, ManagementEndpointConfig};
 

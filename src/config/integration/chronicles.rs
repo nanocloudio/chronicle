@@ -95,11 +95,17 @@ pub enum PhaseKind {
     Mongodb,
     Redis,
     HttpClient,
+    HttpResponse,
     GrpcClient,
     PostgresIdempotentInsert,
     MariadbIdempotentInsert,
+    PostgresQuery,
+    PostgresExec,
     Serialize,
     SmtpSend,
+    ObjectStoreGet,
+    ObjectStorePut,
+    Guard,
     Unknown(String),
 }
 
@@ -114,11 +120,17 @@ impl PhaseKind {
             "mongodb" => PhaseKind::Mongodb,
             "redis" => PhaseKind::Redis,
             "http_client" => PhaseKind::HttpClient,
+            "http_response" => PhaseKind::HttpResponse,
             "grpc_client" => PhaseKind::GrpcClient,
             "postgres_idempotent_insert" => PhaseKind::PostgresIdempotentInsert,
             "mariadb_idempotent_insert" => PhaseKind::MariadbIdempotentInsert,
+            "postgres_query" => PhaseKind::PostgresQuery,
+            "postgres_exec" => PhaseKind::PostgresExec,
             "serialize" => PhaseKind::Serialize,
             "smtp_send" => PhaseKind::SmtpSend,
+            "object_store_get" => PhaseKind::ObjectStoreGet,
+            "object_store_put" => PhaseKind::ObjectStorePut,
+            "guard" => PhaseKind::Guard,
             other => PhaseKind::Unknown(other.to_string()),
         }
     }
@@ -133,11 +145,17 @@ impl PhaseKind {
             PhaseKind::Mongodb => "mongodb",
             PhaseKind::Redis => "redis",
             PhaseKind::HttpClient => "http_client",
+            PhaseKind::HttpResponse => "http_response",
             PhaseKind::GrpcClient => "grpc_client",
             PhaseKind::PostgresIdempotentInsert => "postgres_idempotent_insert",
             PhaseKind::MariadbIdempotentInsert => "mariadb_idempotent_insert",
+            PhaseKind::PostgresQuery => "postgres_query",
+            PhaseKind::PostgresExec => "postgres_exec",
             PhaseKind::Serialize => "serialize",
             PhaseKind::SmtpSend => "smtp_send",
+            PhaseKind::ObjectStoreGet => "object_store_get",
+            PhaseKind::ObjectStorePut => "object_store_put",
+            PhaseKind::Guard => "guard",
             PhaseKind::Unknown(other) => other.as_str(),
         }
     }
@@ -386,6 +404,7 @@ pub(crate) fn validate_trigger_requirements(
             | ConnectorKind::Postgres
             | ConnectorKind::Mariadb
             | ConnectorKind::Smtp
+            | ConnectorKind::ObjectStore
             | ConnectorKind::Unknown(_) => {}
         }
 
@@ -466,7 +485,13 @@ pub(crate) fn validate_phase_requirements(
                 | PhaseKind::Parallel
                 | PhaseKind::Serialize
                 | PhaseKind::HttpClient
+                | PhaseKind::HttpResponse
                 | PhaseKind::GrpcClient
+                | PhaseKind::PostgresQuery
+                | PhaseKind::PostgresExec
+                | PhaseKind::ObjectStoreGet
+                | PhaseKind::ObjectStorePut
+                | PhaseKind::Guard
                 | PhaseKind::Unknown(_) => {}
             }
         }
@@ -611,8 +636,14 @@ fn validate_phase_connector_binding(
         PhaseKind::Redis => Some(ConnectorKind::Redis),
         PhaseKind::PostgresIdempotentInsert => Some(ConnectorKind::Postgres),
         PhaseKind::MariadbIdempotentInsert => Some(ConnectorKind::Mariadb),
+        PhaseKind::PostgresQuery | PhaseKind::PostgresExec => Some(ConnectorKind::Postgres),
         PhaseKind::SmtpSend => Some(ConnectorKind::Smtp),
-        PhaseKind::Transform | PhaseKind::Serialize | PhaseKind::Unknown(_) => None,
+        PhaseKind::ObjectStoreGet | PhaseKind::ObjectStorePut => Some(ConnectorKind::ObjectStore),
+        PhaseKind::Transform
+        | PhaseKind::HttpResponse
+        | PhaseKind::Serialize
+        | PhaseKind::Guard
+        | PhaseKind::Unknown(_) => None,
     };
 
     let Some(name) = connector_name else {

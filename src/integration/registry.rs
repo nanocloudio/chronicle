@@ -3,9 +3,9 @@ use crate::config::integration::{
     GrpcTlsOptions, HttpClientConnectorOptions, HttpClientPoolOptions, HttpClientTlsOptions,
     HttpServerConnectorOptions, HttpServerHealthOptions, HttpServerTlsOptions, IntegrationConfig,
     KafkaConnectorOptions, MariadbConnectorOptions, MongodbConnectorOptions, MqttConnectorOptions,
-    PhaseKind, PostgresConnectorOptions, RabbitmqConnectorOptions, RedisConnectorOptions,
-    RedisPoolOptions, RetryBudget, ScalarValue, SmtpAuthOptions, SmtpConnectorOptions, SmtpTlsMode,
-    SmtpTlsOptions,
+    ObjectStoreConnectorOptions, PhaseKind, PostgresConnectorOptions, RabbitmqConnectorOptions,
+    RedisConnectorOptions, RedisPoolOptions, RetryBudget, ScalarValue, SmtpAuthOptions,
+    SmtpConnectorOptions, SmtpTlsMode, SmtpTlsOptions,
 };
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -32,6 +32,7 @@ pub struct ConnectorRegistry {
     mongodb: HashMap<String, MongodbConnector>,
     redis: HashMap<String, RedisConnector>,
     smtp: HashMap<String, SmtpConnector>,
+    object_store: HashMap<String, ObjectStoreConnector>,
     unknown: HashMap<String, ConnectorConfig>,
     base_dir: PathBuf,
 }
@@ -262,6 +263,22 @@ impl ConnectorRegistry {
 
                     registry.smtp.insert(connector.name.clone(), handle);
                 }
+                ConnectorKind::ObjectStore => {
+                    let options = decode_options::<ObjectStoreConnectorOptions>(connector)?;
+                    let handle = ObjectStoreConnector {
+                        name: connector.name.clone(),
+                        backend: options.backend,
+                        root: options.root,
+                        region: options.region,
+                        endpoint: options.endpoint,
+                        access_key_id: options.access_key_id,
+                        secret_access_key: options.secret_access_key,
+                        timeouts: connector.timeouts,
+                        retry_budget: connector.retry_budget.clone(),
+                        extra: options.extra,
+                    };
+                    registry.object_store.insert(connector.name.clone(), handle);
+                }
                 ConnectorKind::Unknown(_) => {
                     registry
                         .unknown
@@ -317,6 +334,10 @@ impl ConnectorRegistry {
         self.smtp.get(name)
     }
 
+    pub fn object_store(&self, name: &str) -> Option<&ObjectStoreConnector> {
+        self.object_store.get(name)
+    }
+
     pub fn has_kafka_connectors(&self) -> bool {
         !self.kafka.is_empty()
     }
@@ -343,6 +364,10 @@ impl ConnectorRegistry {
 
     pub fn has_smtp_connectors(&self) -> bool {
         !self.smtp.is_empty()
+    }
+
+    pub fn has_object_store_connectors(&self) -> bool {
+        !self.object_store.is_empty()
     }
 
     pub fn unknown(&self) -> impl Iterator<Item = (&String, &ConnectorConfig)> {
@@ -388,6 +413,9 @@ impl ConnectorRegistry {
             visitor(handle);
         }
         for handle in self.smtp.values() {
+            visitor(handle);
+        }
+        for handle in self.object_store.values() {
             visitor(handle);
         }
     }
@@ -824,6 +852,38 @@ pub struct DbPoolConfig {
     pub max_connections: Option<u32>,
     pub idle_timeout_secs: Option<u64>,
     pub extra: std::collections::BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectStoreConnector {
+    pub name: String,
+    pub backend: String,
+    pub root: String,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub timeouts: ConnectorTimeouts,
+    pub retry_budget: Option<RetryBudget>,
+    pub extra: std::collections::BTreeMap<String, JsonValue>,
+}
+
+impl ConnectorHandle for ObjectStoreConnector {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn timeouts(&self) -> &ConnectorTimeouts {
+        &self.timeouts
+    }
+
+    fn retry_budget(&self) -> Option<&RetryBudget> {
+        self.retry_budget.as_ref()
+    }
+
+    fn extra(&self) -> &BTreeMap<String, JsonValue> {
+        &self.extra
+    }
 }
 
 fn decode_options<T>(connector: &ConnectorConfig) -> Result<T, ConnectorRegistryError>

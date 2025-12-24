@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 use crate::backpressure::BackpressureManager;
 use crate::codec::http::{
-    binary_body_to_json, encode_http_response, headers_to_json, normalise_headers, normalise_path,
-    path_to_json, query_to_json,
+    encode_http_response, headers_to_json, normalise_headers, normalise_path, path_to_json,
+    query_to_json, RouteTemplate,
 };
 use crate::error::Result;
 use crate::readiness::{
@@ -16,6 +16,8 @@ use axum::http::{
 };
 use axum::routing::any;
 use axum::{body::Bytes, Router};
+use base64::engine::general_purpose::STANDARD as BASE64_ENGINE;
+use base64::Engine;
 use chronicle_core::chronicle::dispatcher::{
     ActionDispatchError, ActionDispatcher, DeliveryContext,
 };
@@ -54,14 +56,14 @@ struct HttpServerInstance {
 }
 
 struct ServerBindings {
-    routes: HashMap<String, Vec<HttpRoute>>,
+    routes: Vec<HttpRoute>,
     health_routes: Vec<HealthRoute>,
 }
 
 impl ServerBindings {
     fn new() -> Self {
         Self {
-            routes: HashMap::new(),
+            routes: Vec::new(),
             health_routes: Vec::new(),
         }
     }
@@ -70,7 +72,7 @@ impl ServerBindings {
 struct HttpServerState {
     engine: Arc<chronicle_core::chronicle::engine::ChronicleEngine>,
     dispatcher: Arc<ActionDispatcher>,
-    routes: HashMap<String, Vec<HttpRoute>>, // path -> routes per method
+    routes: Vec<HttpRoute>,
     health_routes: Vec<HealthRoute>,
     readiness: Option<ReadinessController>,
     backpressure: BackpressureManager,
@@ -92,6 +94,7 @@ struct HttpRoute {
     method: Method,
     expects_json: bool,
     retry_budget: Option<RetryBudget>,
+    template: RouteTemplate,
 }
 
 #[derive(Clone)]
@@ -185,6 +188,14 @@ impl HttpTriggerRuntime {
                 .map(normalise_path)
                 .unwrap_or_else(|| "/".to_string());
 
+            let template = RouteTemplate::parse(&path).map_err(|err| {
+                crate::err!(
+                    "invalid route template `{}` for chronicle `{}`: {err}",
+                    path,
+                    chronicle.name
+                )
+            })?;
+
             let method = options
                 .get("method")
                 .and_then(|value| value.as_str())
@@ -213,6 +224,7 @@ impl HttpTriggerRuntime {
                 method,
                 expects_json,
                 retry_budget,
+                template,
             };
 
             let entry = servers
@@ -226,7 +238,7 @@ impl HttpTriggerRuntime {
                 }
             }
 
-            entry.routes.entry(path).or_default().push(route);
+            entry.routes.push(route);
         }
 
         let factory = Arc::new(ConnectorFactoryRegistry::new(Arc::clone(&registry)));
@@ -301,7 +313,13 @@ fn build_health_route(connector: &str, config: &HttpServerHealthConfig) -> Resul
 }
 
 fn register_health_route(entry: &mut ServerBindings, connector: &str, route: HealthRoute) {
-    if entry.routes.contains_key(&route.path) {
+    // Check if any route template would conflict with the health route path
+    let conflicts = entry
+        .routes
+        .iter()
+        .any(|r| r.template.is_exact() && r.template.match_path(&route.path).is_some());
+
+    if conflicts {
         warn!(
             connector = connector,
             path = route.path.as_str(),
@@ -325,16 +343,9 @@ fn spawn_http_server(instance: HttpServerInstance, shutdown: CancellationToken) 
     tokio::spawn(async move {
         let HttpServerInstance { addr, state } = instance;
 
-        let paths: Vec<String> = state.routes.keys().cloned().collect();
         let mut router = Router::new();
-        for path in paths {
-            let route_state = state.clone();
-            router = router.route(
-                path.as_str(),
-                any(move |request| handle_http_trigger(route_state.clone(), request)),
-            );
-        }
 
+        // Register health routes first (exact match takes priority)
         for health in &state.health_routes {
             let method = health.method.clone();
             let path = health.path.clone();
@@ -343,6 +354,10 @@ fn spawn_http_server(instance: HttpServerInstance, shutdown: CancellationToken) 
                 any(move |request| handle_health_probe(method.clone(), request)),
             );
         }
+
+        // Use a fallback to catch all other requests and do template matching
+        let route_state = state.clone();
+        router = router.fallback(move |request| handle_http_trigger(route_state.clone(), request));
 
         match TcpListener::bind(addr).await {
             Ok(listener) => {
@@ -403,15 +418,30 @@ async fn handle_http_trigger(
     let path = parts.uri.path().to_string();
     let method = parts.method.clone();
 
-    let route_entry = state.routes.get(&path);
-    let routes = match route_entry {
-        Some(routes) => routes,
-        None => return Err(StatusCode::NOT_FOUND),
-    };
+    // Find matching route by template matching
+    let mut matched_route: Option<(HttpRoute, HashMap<String, String>)> = None;
+    let mut method_mismatch = false;
 
-    let route = match routes.iter().find(|route| route.method == method) {
-        Some(route) => route.clone(),
-        None => return Err(StatusCode::METHOD_NOT_ALLOWED),
+    for route in &state.routes {
+        if let Some(path_params) = route.template.match_path(&path) {
+            if route.method == method {
+                matched_route = Some((route.clone(), path_params));
+                break;
+            } else {
+                method_mismatch = true;
+            }
+        }
+    }
+
+    let (route, path_params) = match matched_route {
+        Some(matched) => matched,
+        None => {
+            if method_mismatch {
+                return Err(StatusCode::METHOD_NOT_ALLOWED);
+            } else {
+                return Err(StatusCode::NOT_FOUND);
+            }
+        }
     };
 
     let _http_permit = match state.backpressure.http.try_acquire_now() {
@@ -440,6 +470,7 @@ async fn handle_http_trigger(
         &parts.method,
         &parts.headers,
         &bytes,
+        &path_params,
     )?;
 
     match state.engine.execute(&route.chronicle, payload) {
@@ -633,6 +664,13 @@ fn execution_to_response(
             StatusCode::from_u16(encoded.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         let mut builder = Response::builder().status(status);
+
+        // Apply custom headers first
+        for (name, value) in &encoded.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+
+        // Apply content-type (may override custom header)
         if let Some(content_type) = encoded.content_type.as_ref() {
             builder = builder.header(CONTENT_TYPE, content_type);
         }
@@ -655,6 +693,7 @@ fn build_trigger_payload(
     method: &Method,
     headers: &axum::http::HeaderMap,
     body: &[u8],
+    path_params: &HashMap<String, String>,
 ) -> std::result::Result<JsonValue, StatusCode> {
     let header_pairs = normalise_headers(headers);
     let header_json = headers_to_json(&header_pairs);
@@ -663,6 +702,19 @@ fn build_trigger_payload(
 
     let normalised_path = normalise_path(path);
 
+    // Build path_params as JSON object
+    let path_params_json: JsonMap<String, JsonValue> = path_params
+        .iter()
+        .map(|(k, v)| (k.clone(), JsonValue::String(v.clone())))
+        .collect();
+
+    // Always include body_b64 for binary access
+    let body_b64 = if body.is_empty() {
+        JsonValue::Null
+    } else {
+        JsonValue::String(BASE64_ENGINE.encode(body))
+    };
+
     let body_json = if route.expects_json {
         if body.is_empty() {
             JsonValue::Null
@@ -670,7 +722,14 @@ fn build_trigger_payload(
             serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?
         }
     } else {
-        binary_body_to_json(body)
+        // For non-JSON bodies, try to parse as JSON anyway (for flexibility)
+        if body.is_empty() {
+            JsonValue::Null
+        } else if let Ok(json) = serde_json::from_slice::<JsonValue>(body) {
+            json
+        } else {
+            JsonValue::Null
+        }
     };
 
     let mut metadata = JsonMap::new();
@@ -701,17 +760,38 @@ fn build_trigger_payload(
         }
     }
 
+    // Build the http sub-object with the new structure
+    let mut http = JsonMap::new();
+    http.insert(
+        "headers".to_string(),
+        JsonValue::Object(header_json.clone()),
+    );
+    http.insert(
+        "path_params".to_string(),
+        JsonValue::Object(path_params_json),
+    );
+    http.insert("query".to_string(), JsonValue::Object(query_json.clone()));
+    http.insert("body_b64".to_string(), body_b64);
+    http.insert("method".to_string(), JsonValue::String(method.to_string()));
+    http.insert(
+        "path".to_string(),
+        JsonValue::String(normalised_path.clone()),
+    );
+
     let mut root = JsonMap::new();
+    // Legacy fields for backward compatibility
     root.insert(
         "headers".to_string(),
         JsonValue::Object(header_json.clone()),
     );
     root.insert("header".to_string(), JsonValue::Object(header_json));
-    root.insert("query".to_string(), JsonValue::Object(query_json.clone()));
+    root.insert("query".to_string(), JsonValue::Object(query_json));
     root.insert("request".to_string(), JsonValue::Object(legacy_request));
     root.insert("path".to_string(), JsonValue::Object(path_json));
     root.insert("body".to_string(), body_json);
     root.insert("metadata".to_string(), JsonValue::Object(metadata));
+    // New http sub-object for artifact gateway
+    root.insert("http".to_string(), JsonValue::Object(http));
 
     Ok(JsonValue::Object(root))
 }
@@ -818,7 +898,16 @@ mod tests {
     #[test]
     fn register_health_route_skips_conflicts() {
         let mut bindings = ServerBindings::new();
-        bindings.routes.insert("/health".to_string(), Vec::new());
+
+        // Add an existing exact route at /health to simulate a conflict
+        let existing_route = HttpRoute {
+            chronicle: "test_chronicle".to_string(),
+            method: Method::GET,
+            expects_json: true,
+            retry_budget: None,
+            template: RouteTemplate::parse("/health").unwrap(),
+        };
+        bindings.routes.push(existing_route);
 
         let route = HealthRoute {
             path: "/health".to_string(),
