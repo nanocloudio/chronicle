@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![expect(dead_code, reason = "Test helpers may not be used by all test files")]
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{HashMap, VecDeque};
@@ -34,7 +34,10 @@ impl MockRabbitmqBroker {
         payload: JsonValue,
         headers: JsonMap<String, JsonValue>,
     ) -> MockRabbitmqConfirmation {
-        let mut inner = self.inner.lock().expect("rabbitmq broker state");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            eprintln!("mock rabbitmq broker lock poisoned: {e}");
+            std::process::abort()
+        });
         let tag = inner.next_delivery_tag;
         inner.next_delivery_tag += 1;
 
@@ -58,7 +61,10 @@ impl MockRabbitmqBroker {
     pub fn next_delivery(&self) -> Option<MockRabbitmqDelivery> {
         self.inner
             .lock()
-            .expect("rabbitmq broker state")
+            .unwrap_or_else(|e| {
+                eprintln!("mock rabbitmq broker lock poisoned: {e}");
+                std::process::abort()
+            })
             .queue
             .pop_front()
     }
@@ -67,7 +73,10 @@ impl MockRabbitmqBroker {
         if let Some(entry) = self
             .inner
             .lock()
-            .expect("rabbitmq broker state")
+            .unwrap_or_else(|e| {
+                eprintln!("mock rabbitmq broker lock poisoned: {e}");
+                std::process::abort()
+            })
             .confirmations
             .get_mut(&delivery_tag)
         {
@@ -78,7 +87,10 @@ impl MockRabbitmqBroker {
     pub fn is_acknowledged(&self, delivery_tag: u64) -> bool {
         self.inner
             .lock()
-            .expect("rabbitmq broker state")
+            .unwrap_or_else(|e| {
+                eprintln!("mock rabbitmq broker lock poisoned: {e}");
+                std::process::abort()
+            })
             .confirmations
             .get(&delivery_tag)
             .copied()
@@ -177,7 +189,10 @@ impl MockMqttBroker {
         qos: u8,
         retain: bool,
     ) -> MockMqttMessage {
-        let mut inner = self.inner.lock().expect("mqtt broker state");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| {
+            eprintln!("mock mqtt broker lock poisoned: {e}");
+            std::process::abort()
+        });
         let packet_id = if qos > 0 {
             inner.next_packet_id = inner.next_packet_id.wrapping_add(1).max(1);
             inner.next_packet_id
@@ -200,7 +215,10 @@ impl MockMqttBroker {
     pub fn next(&self) -> Option<MockMqttMessage> {
         self.inner
             .lock()
-            .expect("mqtt broker state")
+            .unwrap_or_else(|e| {
+                eprintln!("mock mqtt broker lock poisoned: {e}");
+                std::process::abort()
+            })
             .queue
             .pop_front()
     }

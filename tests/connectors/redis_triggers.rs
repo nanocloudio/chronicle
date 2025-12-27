@@ -15,8 +15,11 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
+
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T = ()> = Result<T, TestError>;
 
 #[derive(Clone)]
 struct TestDriverState {
@@ -95,22 +98,18 @@ impl DeliverySnapshot {
     }
 }
 
-fn build_config(yaml: &str) -> Arc<IntegrationConfig> {
+fn build_config(yaml: &str) -> TestResult<Arc<IntegrationConfig>> {
     let decorated = support::feature_flags::enable_optional_feature_flags(yaml);
-    Arc::new(
-        IntegrationConfig::from_reader(decorated.as_bytes())
-            .expect("integration config to parse successfully"),
-    )
+    let config = IntegrationConfig::from_reader(decorated.as_bytes())?;
+    Ok(Arc::new(config))
 }
 
-fn build_registry(config: &Arc<IntegrationConfig>) -> Arc<ConnectorRegistry> {
-    Arc::new(
-        ConnectorRegistry::build(config, ".")
-            .expect("connector registry to construct successfully"),
-    )
+fn build_registry(config: &Arc<IntegrationConfig>) -> TestResult<Arc<ConnectorRegistry>> {
+    let registry = ConnectorRegistry::build(config, ".")?;
+    Ok(Arc::new(registry))
 }
 
-async fn wait_for_acks(state: &TestDriverState, expected: usize) {
+async fn wait_for_acks(state: &TestDriverState, expected: usize) -> TestResult {
     timeout(Duration::from_secs(1), async {
         loop {
             if state.ack_count() >= expected {
@@ -120,29 +119,24 @@ async fn wait_for_acks(state: &TestDriverState, expected: usize) {
         }
     })
     .await
-    .expect("timed out waiting for redis trigger acknowledgements");
+    .map_err(|_| "timed out waiting for redis trigger acknowledgements")?;
+    Ok(())
 }
 
 async fn spawn_runtime<R>(
     mut runtime: R,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<chronicle::error::Result<()>>
+) -> TestResult<tokio::task::JoinHandle<chronicle::error::Result<()>>>
 where
     R: TransportRuntime + Send + 'static,
 {
-    runtime
-        .prepare()
-        .await
-        .expect("runtime preparation should succeed");
-    runtime
-        .start(shutdown.clone())
-        .await
-        .expect("runtime start should succeed");
-    tokio::spawn(async move { runtime.run().wait().await })
+    runtime.prepare().await?;
+    runtime.start(shutdown.clone()).await?;
+    Ok(tokio::spawn(async move { runtime.run().wait().await }))
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn redis_pubsub_runtime_fans_out_messages() {
+async fn redis_pubsub_runtime_fans_out_messages() -> TestResult {
     let yaml = r#"api_version: v1
 connectors:
   - name: redis_events
@@ -165,10 +159,9 @@ chronicles:
           event.payload: .[0].payload
 "#;
 
-    let config = build_config(yaml);
-    let registry = build_registry(&config);
-    let engine =
-        Arc::new(ChronicleEngine::new(config.clone(), registry.clone()).expect("engine build"));
+    let config = build_config(yaml)?;
+    let registry = build_registry(&config)?;
+    let engine = Arc::new(ChronicleEngine::new(config.clone(), registry.clone())?);
 
     let driver_state = TestDriverState::new(vec![
         RedisDelivery::PubSub {
@@ -200,13 +193,12 @@ chronicles:
             }
         },
     )
-    .await
-    .expect("runtime build");
+    .await?;
 
     let shutdown = CancellationToken::new();
-    let run_task = spawn_runtime(runtime, shutdown.clone()).await;
+    let run_task = spawn_runtime(runtime, shutdown.clone()).await?;
 
-    wait_for_acks(&driver_state, 3).await;
+    wait_for_acks(&driver_state, 3).await?;
 
     let snapshots = driver_state.snapshots().await;
     assert_eq!(
@@ -225,14 +217,12 @@ chronicles:
     );
 
     shutdown.cancel();
-    run_task
-        .await
-        .expect("redis trigger join handle")
-        .expect("redis trigger runtime completes without error");
+    run_task.await??;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn redis_stream_runtime_replays_duplicate_entries() {
+async fn redis_stream_runtime_replays_duplicate_entries() -> TestResult {
     let yaml = r#"api_version: v1
 connectors:
   - name: redis_streams
@@ -257,10 +247,9 @@ chronicles:
           entry.payload: .[0].payload
 "#;
 
-    let config = build_config(yaml);
-    let registry = build_registry(&config);
-    let engine =
-        Arc::new(ChronicleEngine::new(config.clone(), registry.clone()).expect("engine build"));
+    let config = build_config(yaml)?;
+    let registry = build_registry(&config)?;
+    let engine = Arc::new(ChronicleEngine::new(config.clone(), registry.clone())?);
 
     let deliveries = vec![
         RedisDelivery::Stream {
@@ -297,13 +286,12 @@ chronicles:
             }
         },
     )
-    .await
-    .expect("runtime build");
+    .await?;
 
     let shutdown = CancellationToken::new();
-    let run_task = spawn_runtime(runtime, shutdown.clone()).await;
+    let run_task = spawn_runtime(runtime, shutdown.clone()).await?;
 
-    wait_for_acks(&driver_state, 3).await;
+    wait_for_acks(&driver_state, 3).await?;
 
     let snapshots = driver_state.snapshots().await;
     assert_eq!(
@@ -325,10 +313,8 @@ chronicles:
     );
 
     shutdown.cancel();
-    run_task
-        .await
-        .expect("redis trigger join handle")
-        .expect("redis trigger runtime completes without error");
+    run_task.await??;
+    Ok(())
 }
 
 fn stream_fields(payload: &str, timestamp: Option<&str>) -> HashMap<String, Vec<u8>> {

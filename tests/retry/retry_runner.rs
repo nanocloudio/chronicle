@@ -6,6 +6,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
 fn build_retry_settings(initial_ms: u64, max_ms: u64, multiplier: f64) -> RetrySettings {
     let mut extras = JsonMap::new();
     extras.insert(
@@ -13,9 +15,10 @@ fn build_retry_settings(initial_ms: u64, max_ms: u64, multiplier: f64) -> RetryS
         JsonValue::Number(initial_ms.into()),
     );
     extras.insert("retry_max_ms".to_string(), JsonValue::Number(max_ms.into()));
+    // from_f64 returns None for NaN/Inf, but 2.0 is always valid
     extras.insert(
         "retry_multiplier".to_string(),
-        JsonValue::Number(JsonNumber::from_f64(multiplier).unwrap()),
+        JsonValue::Number(JsonNumber::from_f64(multiplier).unwrap_or_else(|| JsonNumber::from(2))),
     );
     RetrySettings::from_extras(&extras, &JsonMap::new())
 }
@@ -46,8 +49,10 @@ impl RetryContext for ErrorSequenceContext {
         self.polls.pop_front().unwrap_or(Ok(None))
     }
 
-    async fn handle_item(&mut self, _item: Self::Item) {
-        panic!("should not receive items in this scenario");
+    async fn handle_item(&mut self, item: Self::Item) {
+        // This scenario only errors, so receiving an item is a test failure
+        let _ = item; // Acknowledge unused
+        std::process::abort();
     }
 
     async fn report_error(&mut self, _error: &Self::Error, delay: Duration) {
@@ -69,12 +74,16 @@ impl RetryContext for IdleContext {
         Ok(None)
     }
 
-    async fn handle_item(&mut self, _item: Self::Item) {
-        panic!("idle context should never see items");
+    async fn handle_item(&mut self, item: Self::Item) {
+        // Idle context returns Ok(None) from poll, so items are never received
+        let _ = item;
+        std::process::abort();
     }
 
-    async fn report_error(&mut self, _error: &Self::Error, _delay: Duration) {
-        panic!("idle context should not report errors");
+    async fn report_error(&mut self, error: &Self::Error, delay: Duration) {
+        // Idle context returns Ok(None) from poll, so errors never occur
+        let _ = (error, delay);
+        std::process::abort();
     }
 }
 
@@ -101,7 +110,7 @@ async fn retry_runner_backoff_increases_and_caps() {
 }
 
 #[tokio::test]
-async fn retry_runner_cancels_when_shutdown_fires() {
+async fn retry_runner_cancels_when_shutdown_fires() -> TestResult {
     let settings = build_retry_settings(100, 1_000, 2.0);
     let shutdown = CancellationToken::new();
     let cancel = shutdown.clone();
@@ -116,5 +125,6 @@ async fn retry_runner_cancels_when_shutdown_fires() {
         run_retry_loop(shutdown, settings, Duration::from_millis(20), &mut context),
     )
     .await
-    .expect("runner should exit on cancellation");
+    .map_err(|_| "runner should exit on cancellation within timeout")?;
+    Ok(())
 }

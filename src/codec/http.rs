@@ -495,10 +495,9 @@ impl RouteTemplate {
 }
 
 fn is_valid_param_name(name: &str) -> bool {
-    if name.is_empty() {
+    let Some(first) = name.chars().next() else {
         return false;
-    }
-    let first = name.chars().next().unwrap();
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
@@ -511,28 +510,34 @@ fn percent_decode_path(input: &str) -> String {
 
     while let Some(ch) = chars.next() {
         if ch == '%' {
-            let mut hex = String::with_capacity(2);
-            if let Some(&h1) = chars.peek() {
-                if h1.is_ascii_hexdigit() {
-                    hex.push(chars.next().unwrap());
-                    if let Some(&h2) = chars.peek() {
-                        if h2.is_ascii_hexdigit() {
-                            hex.push(chars.next().unwrap());
+            // Try to read two hex digits
+            let h1 = chars.next_if(|c| c.is_ascii_hexdigit());
+            let h2 = h1.and_then(|_| chars.next_if(|c| c.is_ascii_hexdigit()));
+
+            match (h1, h2) {
+                (Some(c1), Some(c2)) => {
+                    let hex: String = [c1, c2].iter().collect();
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        if byte.is_ascii() {
+                            output.push(byte as char);
+                            continue;
                         }
                     }
+                    // Valid hex but not decodable, keep original
+                    output.push('%');
+                    output.push(c1);
+                    output.push(c2);
+                }
+                (Some(c1), None) => {
+                    // Only one hex digit, keep original
+                    output.push('%');
+                    output.push(c1);
+                }
+                (None, _) => {
+                    // No hex digits after %, keep the %
+                    output.push('%');
                 }
             }
-            if hex.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    if byte.is_ascii() {
-                        output.push(byte as char);
-                        continue;
-                    }
-                }
-            }
-            // Failed to decode, keep original
-            output.push('%');
-            output.push_str(&hex);
         } else if ch == '+' {
             output.push(' ');
         } else {
@@ -575,66 +580,3 @@ impl std::fmt::Display for RouteParseError {
 }
 
 impl std::error::Error for RouteParseError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_simple_template() {
-        let tmpl = RouteTemplate::parse("/v2/").unwrap();
-        assert_eq!(tmpl.segments.len(), 1);
-        assert!(tmpl.is_exact());
-    }
-
-    #[test]
-    fn parse_template_with_params() {
-        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
-        assert_eq!(tmpl.segments.len(), 5);
-        assert!(!tmpl.is_exact());
-    }
-
-    #[test]
-    fn match_exact_path() {
-        let tmpl = RouteTemplate::parse("/v2/").unwrap();
-        let params = tmpl.match_path("/v2/").unwrap();
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn match_path_with_params() {
-        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
-        let params = tmpl
-            .match_path("/v2/library/alpine/manifests/latest")
-            .unwrap();
-        assert_eq!(params.get("namespace").unwrap(), "library");
-        assert_eq!(params.get("name").unwrap(), "alpine");
-        assert_eq!(params.get("reference").unwrap(), "latest");
-    }
-
-    #[test]
-    fn match_path_mismatch() {
-        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
-        assert!(tmpl
-            .match_path("/v2/library/alpine/blobs/sha256:abc")
-            .is_none());
-    }
-
-    #[test]
-    fn match_path_url_encoded() {
-        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
-        let params = tmpl
-            .match_path("/v2/my%2Fnamespace/alpine/manifests/v1.0")
-            .unwrap();
-        assert_eq!(params.get("namespace").unwrap(), "my/namespace");
-    }
-
-    #[test]
-    fn to_axum_pattern() {
-        let tmpl = RouteTemplate::parse("/v2/{namespace}/{name}/manifests/{reference}").unwrap();
-        assert_eq!(
-            tmpl.to_axum_pattern(),
-            "/v2/:namespace/:name/manifests/:reference"
-        );
-    }
-}

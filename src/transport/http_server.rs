@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::readiness::{
     retry_after_hint_seconds, DependencyHealth, ReadinessController, RouteState,
 };
+use crate::transport::health::{HealthRoute, HttpRoute, ServerBindings};
 use crate::transport::{TaskTransportRuntime, TransportKind, TransportRuntime};
 use async_trait::async_trait;
 use axum::http::{
@@ -24,10 +25,8 @@ use chronicle_core::chronicle::dispatcher::{
 use chronicle_core::chronicle::engine::{
     ChronicleAction, ChronicleEngineError, ChronicleExecution,
 };
-use chronicle_core::config::integration::{AppConfig, RetryBudget};
-use chronicle_core::integration::{
-    factory::ConnectorFactoryRegistry, registry::HttpServerHealthConfig,
-};
+use chronicle_core::config::integration::AppConfig;
+use chronicle_core::integration::factory::ConnectorFactoryRegistry;
 use chronicle_core::retry::retry_after_seconds_from_budget;
 use chrono::Utc;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -55,20 +54,6 @@ struct HttpServerInstance {
     state: Arc<HttpServerState>,
 }
 
-struct ServerBindings {
-    routes: Vec<HttpRoute>,
-    health_routes: Vec<HealthRoute>,
-}
-
-impl ServerBindings {
-    fn new() -> Self {
-        Self {
-            routes: Vec::new(),
-            health_routes: Vec::new(),
-        }
-    }
-}
-
 struct HttpServerState {
     engine: Arc<chronicle_core::chronicle::engine::ChronicleEngine>,
     dispatcher: Arc<ActionDispatcher>,
@@ -86,21 +71,6 @@ struct CachedLimitResponse {
     observed_at: Instant,
     body: Bytes,
     retry_after: u64,
-}
-
-#[derive(Clone)]
-struct HttpRoute {
-    chronicle: String,
-    method: Method,
-    expects_json: bool,
-    retry_budget: Option<RetryBudget>,
-    template: RouteTemplate,
-}
-
-#[derive(Clone)]
-struct HealthRoute {
-    path: String,
-    method: Method,
 }
 
 impl HttpServerState {
@@ -227,14 +197,12 @@ impl HttpTriggerRuntime {
                 template,
             };
 
-            let entry = servers
-                .entry(socket_addr)
-                .or_insert_with(ServerBindings::new);
+            let entry = servers.entry(socket_addr).or_default();
 
             if processed_connectors.insert(connector_name.clone()) {
                 if let Some(health_cfg) = server.health.as_ref() {
-                    let health_route = build_health_route(connector_name, health_cfg)?;
-                    register_health_route(entry, connector_name, health_route);
+                    let health_route = HealthRoute::from_config(connector_name, health_cfg)?;
+                    entry.register_health_route(connector_name, health_route);
                 }
             }
 
@@ -295,48 +263,6 @@ impl HttpTriggerRuntime {
     pub fn server_count(&self) -> usize {
         self.server_count
     }
-}
-
-fn build_health_route(connector: &str, config: &HttpServerHealthConfig) -> Result<HealthRoute> {
-    let method_raw = config.method.as_deref().unwrap_or("GET");
-    let method = Method::from_bytes(method_raw.as_bytes()).map_err(|err| {
-        crate::err!(
-            "invalid http_server health.method `{}` for connector `{}`: {err}",
-            method_raw,
-            connector
-        )
-    })?;
-    let path_raw = config.path.as_deref().unwrap_or("/health");
-    let path = normalise_path(path_raw);
-
-    Ok(HealthRoute { path, method })
-}
-
-fn register_health_route(entry: &mut ServerBindings, connector: &str, route: HealthRoute) {
-    // Check if any route template would conflict with the health route path
-    let conflicts = entry
-        .routes
-        .iter()
-        .any(|r| r.template.is_exact() && r.template.match_path(&route.path).is_some());
-
-    if conflicts {
-        warn!(
-            connector = connector,
-            path = route.path.as_str(),
-            "skipping http_server health probe because path conflicts with an existing route"
-        );
-        return;
-    }
-
-    if entry
-        .health_routes
-        .iter()
-        .any(|existing| existing.path == route.path && existing.method == route.method)
-    {
-        return;
-    }
-
-    entry.health_routes.push(route);
 }
 
 fn spawn_http_server(instance: HttpServerInstance, shutdown: CancellationToken) -> JoinHandle<()> {
@@ -605,7 +531,12 @@ fn build_not_ready_response(route: &str, retry_after: u64) -> axum::response::Re
         .header(CACHE_CONTROL, "no-store")
         .header(RETRY_AFTER, retry_after.to_string())
         .body(Body::from(payload.to_string()))
-        .expect("http readiness response")
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
 }
 
 fn build_budget_exhausted_response(route: &str) -> axum::response::Response {
@@ -622,7 +553,12 @@ fn build_budget_exhausted_response(route: &str) -> axum::response::Response {
         .header(CONTENT_TYPE, "application/json")
         .header(CACHE_CONTROL, "no-store")
         .body(Body::from(payload.to_string()))
-        .expect("budget exhausted response")
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
 }
 
 fn build_limit_response_body(route: &str, retry_after: u64, detail: Option<&str>) -> Bytes {
@@ -648,7 +584,12 @@ fn build_limit_response_from_body(body: Bytes, retry_after: u64) -> axum::respon
         .header(CACHE_CONTROL, "no-store")
         .header(RETRY_AFTER, retry_after.to_string())
         .body(Body::from(body))
-        .expect("http limit response")
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap_or_default()
+        })
 }
 
 fn execution_to_response(
@@ -874,50 +815,5 @@ fn log_actions(actions: &[chronicle_core::chronicle::engine::ChronicleAction]) {
                 info!(connector, command, "redis command action emitted");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn health_route_defaults_to_get_health() {
-        let cfg = HttpServerHealthConfig {
-            method: None,
-            path: None,
-            extra: BTreeMap::new(),
-        };
-
-        let route = build_health_route("http_in", &cfg).expect("health route");
-        assert_eq!(route.method, Method::GET);
-        assert_eq!(route.path, "/health");
-    }
-
-    #[test]
-    fn register_health_route_skips_conflicts() {
-        let mut bindings = ServerBindings::new();
-
-        // Add an existing exact route at /health to simulate a conflict
-        let existing_route = HttpRoute {
-            chronicle: "test_chronicle".to_string(),
-            method: Method::GET,
-            expects_json: true,
-            retry_budget: None,
-            template: RouteTemplate::parse("/health").unwrap(),
-        };
-        bindings.routes.push(existing_route);
-
-        let route = HealthRoute {
-            path: "/health".to_string(),
-            method: Method::GET,
-        };
-
-        register_health_route(&mut bindings, "http_in", route);
-        assert!(
-            bindings.health_routes.is_empty(),
-            "conflicting path should be ignored"
-        );
     }
 }

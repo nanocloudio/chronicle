@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, reason = "Test helpers may not be used by all test files")]
 
 pub fn enable_optional_feature_flags(yaml: &str) -> String {
     let has_app_section = yaml

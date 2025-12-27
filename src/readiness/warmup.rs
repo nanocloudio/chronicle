@@ -1,5 +1,10 @@
 use crate::config::integration::{AppConfig, ConnectorConfig, ConnectorKind, JitterMode};
-#[allow(unused_imports)]
+#[cfg(any(
+    feature = "db-postgres",
+    feature = "db-mariadb",
+    feature = "grpc",
+    feature = "kafka"
+))]
 use crate::error::Context;
 use crate::error::{ChronicleError, Result as ChronicleResult};
 use crate::integration::factory::ConnectorFactoryRegistry;

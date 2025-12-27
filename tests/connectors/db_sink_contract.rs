@@ -1,13 +1,14 @@
 #![cfg(feature = "db-mariadb")]
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use chronicle::chronicle::engine::ChronicleAction;
+use common::TestResult;
 use serde_json::json;
 
 #[test]
-fn persist_record_phase_writes_to_mariadb_and_acks() {
+fn persist_record_phase_writes_to_mariadb_and_acks() -> TestResult {
     let engine = common::build_engine();
 
     let payload = json!({
@@ -27,9 +28,7 @@ fn persist_record_phase_writes_to_mariadb_and_acks() {
         }
     });
 
-    let execution = engine
-        .execute("persist_record", payload)
-        .expect("persist_record executes");
+    let execution = engine.execute("persist_record", payload)?;
 
     assert_eq!(execution.actions.len(), 1);
     assert_eq!(execution.record_id.as_deref(), Some("rec-123"));
@@ -40,7 +39,7 @@ fn persist_record_phase_writes_to_mariadb_and_acks() {
     );
     let ack_frame = execution.context[2]
         .as_object()
-        .expect("ack frame should be an object");
+        .ok_or("ack frame should be an object")?;
     assert_eq!(
         ack_frame
             .get("body")
@@ -49,28 +48,29 @@ fn persist_record_phase_writes_to_mariadb_and_acks() {
         Some("rec-123")
     );
 
-    match &execution.actions[0] {
-        ChronicleAction::MariadbInsert {
-            connector,
-            key,
-            values,
-            record_id,
-            ..
-        } => {
-            assert_eq!(connector, "sample_state_store");
-            assert_eq!(key, "rec-123");
-            assert_eq!(
-                values["payload"]["attributes"]["category"],
-                json!("telemetry")
-            );
-            assert_eq!(record_id.as_deref(), Some("rec-123"));
-        }
-        other => panic!("unexpected action: {other:?}"),
-    }
+    let ChronicleAction::MariadbInsert {
+        connector,
+        key,
+        values,
+        record_id,
+        ..
+    } = &execution.actions[0]
+    else {
+        return Err(format!("unexpected action: {:?}", execution.actions[0]).into());
+    };
 
-    let response = execution.response.expect("ack response");
+    assert_eq!(connector, "sample_state_store");
+    assert_eq!(key, "rec-123");
+    assert_eq!(
+        values["payload"]["attributes"]["category"],
+        json!("telemetry")
+    );
+    assert_eq!(record_id.as_deref(), Some("rec-123"));
+
+    let response = execution.response.ok_or("ack response missing")?;
     assert_eq!(response.status, 200);
     assert_eq!(response.content_type.as_deref(), Some("application/json"));
     assert_eq!(response.body["record_id"], json!("rec-123"));
     assert_eq!(response.body["inserted"], json!(1));
+    Ok(())
 }

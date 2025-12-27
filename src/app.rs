@@ -105,8 +105,9 @@ impl ChronicleApp {
         let mut engine: Option<Arc<ChronicleEngine>> = None;
         let mut readiness: Option<ReadinessController> = None;
         let mut dependency_health: Option<DependencyHealth> = None;
-        #[allow(unused_mut)]
         let mut transports: Vec<Box<dyn TransportRuntime>> = Vec::new();
+        // transports is mutated conditionally based on feature flags
+        let _ = &transports;
         let mut app_policy = AppConfig::default();
         let mut pending_backpressure: Option<BackpressureManager> = None;
 
@@ -518,10 +519,11 @@ impl ChronicleApp {
         {
             tokio::select! {
                 res = async {
-                    management_task
-                        .as_mut()
-                        .expect("management task guard ensures presence")
-                        .await
+                    if let Some(task) = management_task.as_mut() {
+                        task.await
+                    } else {
+                        std::future::pending().await
+                    }
                 }, if management_task.is_some() => {
                     tracing::warn!("management server task terminated unexpectedly");
                     match res {
@@ -535,10 +537,11 @@ impl ChronicleApp {
                     }
                 }
                 res = async {
-                    kafka_task
-                        .as_mut()
-                        .expect("kafka task guard ensures presence")
-                        .await
+                    if let Some(task) = kafka_task.as_mut() {
+                        task.await
+                    } else {
+                        std::future::pending().await
+                    }
                 }, if kafka_task.is_some() => {
                     tracing::warn!("Kafka consumer task terminated unexpectedly");
                     match res {
@@ -572,10 +575,11 @@ impl ChronicleApp {
         {
             tokio::select! {
                 res = async {
-                    management_task
-                        .as_mut()
-                        .expect("management task guard ensures presence")
-                        .await
+                    if let Some(task) = management_task.as_mut() {
+                        task.await
+                    } else {
+                        std::future::pending().await
+                    }
                 }, if management_task.is_some() => {
                     tracing::warn!("management server task terminated unexpectedly");
                     match res {

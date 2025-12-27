@@ -103,8 +103,11 @@ impl DocumentedChronicleHarness {
 
         let raw_config =
             IntegrationConfig::from_path(&config_path).context("failed to load fixtures")?;
+        let config_dir = config_path
+            .parent()
+            .context("fixture path should include a directory")?;
         let registry = Arc::new(
-            ConnectorRegistry::build(&raw_config, config_path.parent().unwrap())
+            ConnectorRegistry::build(&raw_config, config_dir)
                 .context("failed to build connector registry")?,
         );
         let factory = ConnectorFactoryRegistry::new(Arc::clone(&registry));

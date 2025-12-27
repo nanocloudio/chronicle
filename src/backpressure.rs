@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::error;
 
 /// Aggregates the configured concurrency gates for subsystems (HTTP entrypoints, Kafka consumers).
 #[derive(Clone, Default)]
@@ -75,15 +76,25 @@ impl BackpressureController {
                 }
                 Err(_) => {
                     self.metrics.throttled.fetch_add(1, Ordering::Relaxed);
-                    let permit = semaphore
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("backpressure semaphore closed");
-                    self.metrics.inflight.fetch_add(1, Ordering::Relaxed);
-                    BackpressurePermit {
-                        inner: Some(permit),
-                        metrics: Arc::clone(&self.metrics),
+                    match semaphore.clone().acquire_owned().await {
+                        Ok(permit) => {
+                            self.metrics.inflight.fetch_add(1, Ordering::Relaxed);
+                            BackpressurePermit {
+                                inner: Some(permit),
+                                metrics: Arc::clone(&self.metrics),
+                            }
+                        }
+                        Err(_closed) => {
+                            error!(
+                                target: "chronicle::backpressure",
+                                event = "semaphore_closed",
+                                "backpressure semaphore unexpectedly closed, proceeding without limit"
+                            );
+                            BackpressurePermit {
+                                inner: None,
+                                metrics: Arc::clone(&self.metrics),
+                            }
+                        }
                     }
                 }
             }

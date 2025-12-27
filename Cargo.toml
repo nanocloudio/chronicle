@@ -7,6 +7,104 @@ edition = "2021"
 name = "schema_validate"
 path = "tools/schema_validate.rs"
 
+# Engine tests
+[[test]]
+name = "smoke"
+path = "tests/engine/smoke.rs"
+
+[[test]]
+name = "smoke_startup"
+path = "tests/engine/smoke_startup.rs"
+
+[[test]]
+name = "error_contract"
+path = "tests/engine/error_contract.rs"
+
+[[test]]
+name = "backpressure_test"
+path = "tests/engine/backpressure_test.rs"
+
+[[test]]
+name = "telemetry"
+path = "tests/engine/telemetry.rs"
+
+# Config tests
+[[test]]
+name = "config_validation"
+path = "tests/config/config_validation.rs"
+
+[[test]]
+name = "config_validation_snapshots"
+path = "tests/config/config_validation_snapshots.rs"
+
+[[test]]
+name = "documented_chronicles"
+path = "tests/config/documented_chronicles.rs"
+
+# Connector tests
+[[test]]
+name = "kafka_roundtrip"
+path = "tests/connectors/kafka_roundtrip.rs"
+
+[[test]]
+name = "http_roundtrip"
+path = "tests/connectors/http_roundtrip.rs"
+
+[[test]]
+name = "postgres_phase"
+path = "tests/connectors/postgres_phase.rs"
+
+[[test]]
+name = "redis_triggers"
+path = "tests/connectors/redis_triggers.rs"
+
+[[test]]
+name = "db_sink_contract"
+path = "tests/connectors/db_sink_contract.rs"
+
+[[test]]
+name = "message_brokers"
+path = "tests/connectors/message_brokers.rs"
+
+[[test]]
+name = "codec_http_tests"
+path = "tests/connectors/codec_http_tests.rs"
+
+# Readiness tests
+[[test]]
+name = "management_ready"
+path = "tests/readiness/management_ready.rs"
+
+[[test]]
+name = "readiness_properties"
+path = "tests/readiness/readiness_properties.rs"
+
+[[test]]
+name = "transport_health_tests"
+path = "tests/readiness/transport_health_tests.rs"
+
+# Retry tests
+[[test]]
+name = "retry_tests"
+path = "tests/retry/retry_tests.rs"
+
+[[test]]
+name = "retry_plan_tests"
+path = "tests/retry/retry_plan_tests.rs"
+
+[[test]]
+name = "retry_runner"
+path = "tests/retry/retry_runner.rs"
+
+# Lifecycle tests
+[[test]]
+name = "shutdown_lifecycle"
+path = "tests/lifecycle/shutdown_lifecycle.rs"
+
+[[test]]
+name = "connector_lifecycle"
+path = "tests/lifecycle/connector_lifecycle.rs"
+
 [features]
 default = ["http-in"]
 full = [
@@ -88,6 +186,23 @@ metrics-util = "0.20.0"
 tempfile = "3.23.0"
 insta = { version = "1.39.0", default-features = false, features = ["redactions"] }
 proptest = "1.5.0"
+
+[lints.rust]
+# Enforce strict lint policies
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Deny allow_attributes to prevent unnoticed #[allow(...)] usage
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# Disable false-positive prone lint for recursive methods using self
+only_used_in_recursion = "allow"
+# Other strict lints
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
 
 [profile.release]
 opt-level = "z"

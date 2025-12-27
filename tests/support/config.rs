@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, reason = "Test helpers may not be used by all test files")]
 
 /// Test-only reimplementation of the sanitiser used during integration config loading.
 pub fn sanitise_document(raw: &str) -> String {

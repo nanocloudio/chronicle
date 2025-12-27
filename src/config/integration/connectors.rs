@@ -454,7 +454,8 @@ fn insert_nested_json(target: &mut JsonValue, raw_key: &str, value: JsonValue) {
                     };
                 }
 
-                cursor = array.get_mut(*index).expect("index within bounds");
+                // Safety: resize above ensures index is within bounds
+                cursor = &mut array[*index];
             }
         }
     }
@@ -652,11 +653,12 @@ fn parse_circuit_breaker(
         return None;
     }
 
+    // All three are guaranteed to be Some if we reach this point
     Some(CircuitBreakerConfig {
         failure_rate,
-        window: window.expect("window validated"),
-        open_base: open_base.expect("open_base validated"),
-        open_max: open_max.expect("open_max validated"),
+        window: window.unwrap_or_default(),
+        open_base: open_base.unwrap_or_default(),
+        open_max: open_max.unwrap_or_default(),
     })
 }
 
@@ -1023,7 +1025,6 @@ pub struct DbPoolOptions {
 
 /// Configuration options for the object_store connector.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ObjectStoreConnectorOptions {
     /// Backend type: "filesystem", "s3", "gcs", "azure"
     pub backend: String,

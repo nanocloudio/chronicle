@@ -100,10 +100,10 @@ async fn start_management_server(
     let management_cfg = config
         .management
         .as_ref()
-        .expect("management configuration present");
+        .context("management configuration present")?;
     let server = ManagementServer::build(management_cfg)
         .context("build management server")?
-        .expect("management server configured");
+        .context("management server configured")?;
 
     let shutdown = CancellationToken::new();
     let state_clone = state.clone();
@@ -127,7 +127,7 @@ async fn ready_endpoint_exposes_retry_after_and_honours_cache() -> Result<()> {
     controller
         .set_route_state("route_a", RouteState::NotReady)
         .await
-        .expect("route_a transitions to NOT_READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to NOT_READY: {e:?}"))?;
     controller
         .set_dependency_state(
             "route_a",
@@ -135,7 +135,7 @@ async fn ready_endpoint_exposes_retry_after_and_honours_cache() -> Result<()> {
             EndpointState::Unhealthy,
         )
         .await
-        .expect("dependency transitions to UNHEALTHY");
+        .map_err(|e| anyhow::anyhow!("dependency transition to UNHEALTHY: {e:?}"))?;
 
     let (base_url, shutdown, server_task) =
         start_management_server(&config, controller.clone()).await?;
@@ -155,7 +155,7 @@ async fn ready_endpoint_exposes_retry_after_and_honours_cache() -> Result<()> {
     let retry_after = response
         .headers()
         .get("retry-after")
-        .expect("Retry-After header present")
+        .context("Retry-After header present")?
         .to_str()
         .context("Retry-After header is valid ASCII")?;
     assert_eq!(
@@ -166,7 +166,7 @@ async fn ready_endpoint_exposes_retry_after_and_honours_cache() -> Result<()> {
     controller
         .set_route_state("route_a", RouteState::Ready)
         .await
-        .expect("route_a transitions to READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to READY: {e:?}"))?;
 
     let cached_response = request_ready().await?;
     assert_eq!(
@@ -202,7 +202,7 @@ async fn ready_endpoint_retry_after_matches_cache_duration() -> Result<()> {
     controller
         .set_route_state("route_a", RouteState::NotReady)
         .await
-        .expect("route_a transitions to NOT_READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to NOT_READY: {e:?}"))?;
 
     let (base_url, shutdown, server_task) =
         start_management_server(&config, controller.clone()).await?;
@@ -217,7 +217,7 @@ async fn ready_endpoint_retry_after_matches_cache_duration() -> Result<()> {
     let retry_after = response
         .headers()
         .get("retry-after")
-        .expect("Retry-After header present")
+        .context("Retry-After header present")?
         .to_str()
         .context("Retry-After header is valid ASCII")?;
     assert_eq!(
@@ -239,7 +239,7 @@ async fn status_endpoint_reports_snapshots_and_timestamps() -> Result<()> {
     controller
         .set_route_state("route_a", RouteState::NotReady)
         .await
-        .expect("route_a transitions to NOT_READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to NOT_READY: {e:?}"))?;
 
     let (base_url, shutdown, server_task) =
         start_management_server(&config, controller.clone()).await?;
@@ -260,13 +260,15 @@ async fn status_endpoint_reports_snapshots_and_timestamps() -> Result<()> {
 
     let payload = fetch_status().await?;
     assert_eq!(payload["app_state"], "NOT_READY");
-    let routes = payload["routes"].as_array().expect("routes array present");
+    let routes = payload["routes"]
+        .as_array()
+        .context("routes array present")?;
     assert_eq!(routes.len(), 1);
     assert_eq!(routes[0]["id"], "route_a");
     assert_eq!(routes[0]["state"], "NOT_READY");
     let unhealthy = routes[0]["unhealthy"]
         .as_array()
-        .expect("unhealthy array present");
+        .context("unhealthy array present")?;
     assert!(
         unhealthy
             .iter()
@@ -279,13 +281,14 @@ async fn status_endpoint_reports_snapshots_and_timestamps() -> Result<()> {
     );
     let ts = payload["ts"]
         .as_str()
-        .expect("status payload includes timestamp string");
-    DateTime::<FixedOffset>::parse_from_rfc3339(ts).expect("timestamp should be RFC3339 formatted");
+        .context("status payload includes timestamp string")?;
+    DateTime::<FixedOffset>::parse_from_rfc3339(ts)
+        .context("timestamp should be RFC3339 formatted")?;
 
     controller
         .set_route_state("route_a", RouteState::Ready)
         .await
-        .expect("route_a transitions to READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to READY: {e:?}"))?;
     controller
         .set_dependency_state(
             "route_a",
@@ -293,7 +296,7 @@ async fn status_endpoint_reports_snapshots_and_timestamps() -> Result<()> {
             EndpointState::Healthy,
         )
         .await
-        .expect("dependency transitions to HEALTHY");
+        .map_err(|e| anyhow::anyhow!("dependency transition to HEALTHY: {e:?}"))?;
 
     let cached_payload = fetch_status().await?;
     assert_eq!(
@@ -306,7 +309,7 @@ async fn status_endpoint_reports_snapshots_and_timestamps() -> Result<()> {
     assert_eq!(refreshed["app_state"], "READY");
     let refreshed_routes = refreshed["routes"]
         .as_array()
-        .expect("refreshed routes array present");
+        .context("refreshed routes array present")?;
     assert_eq!(refreshed_routes[0]["state"], "READY");
 
     shutdown.cancel();
@@ -323,7 +326,7 @@ async fn metrics_endpoint_reports_prometheus_gauges() -> Result<()> {
     controller
         .set_route_state("route_a", RouteState::NotReady)
         .await
-        .expect("route_a transitions to NOT_READY");
+        .map_err(|e| anyhow::anyhow!("route_a transition to NOT_READY: {e:?}"))?;
 
     let (base_url, shutdown, server_task) =
         start_management_server(&config, controller.clone()).await?;
@@ -388,6 +391,84 @@ async fn metrics_endpoint_reports_prometheus_gauges() -> Result<()> {
     assert!(
         body.contains("chronicle_retry_budget_exhausted_total{route=\"route_a\",endpoint=\"endpoint.http_processing\"} 1"),
         "retry budget exhaustion counter should include endpoint label"
+    );
+
+    shutdown.cancel();
+    let _ = server_task.await;
+    Ok(())
+}
+
+fn build_live_config(port: u16) -> Result<IntegrationConfig> {
+    let yaml = format!(
+        r#"
+api_version: v1
+app:
+  warmup_timeout: 1s
+connectors:
+  - name: http_ingest
+    type: http
+    options:
+      role: server
+      host: 127.0.0.1
+      port: 8080
+chronicles:
+  - name: route_a
+    trigger:
+      connector: http_ingest
+      options:
+        method: GET
+        path: /ingest
+    phases: []
+  - name: route_b
+    trigger:
+      connector: http_ingest
+      options:
+        method: POST
+        path: /submit
+    phases: []
+management:
+  host: 127.0.0.1
+  port: {port}
+  live:
+    path: /live
+"#
+    );
+
+    IntegrationConfig::from_reader(yaml.as_bytes())
+        .context("failed to parse inline live endpoint config")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_endpoint_reports_ok_with_chronicle_count() -> Result<()> {
+    let port = reserve_port().context("reserve management port")?;
+    let config = build_live_config(port)?;
+
+    let controller = ReadinessController::initialise(&config);
+    let (base_url, shutdown, server_task) =
+        start_management_server(&config, controller.clone()).await?;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{base_url}/live"))
+        .send()
+        .await
+        .context("perform liveness request")?;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "live endpoint should always return 200 OK"
+    );
+
+    let payload: Value = response.json().await.context("decode liveness response")?;
+
+    assert_eq!(
+        payload["status"], "ok",
+        "live endpoint should report status=ok"
+    );
+    assert_eq!(
+        payload["chronicles_loaded"], 2,
+        "live endpoint should report loaded chronicle count"
     );
 
     shutdown.cancel();

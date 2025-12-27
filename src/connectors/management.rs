@@ -182,7 +182,7 @@ async fn status_report(Extension(state): Extension<AppState>) -> impl IntoRespon
     }
 }
 
-async fn metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
+async fn metrics(Extension(state): Extension<AppState>) -> Result<Response<Body>, StatusCode> {
     let readiness_snapshot = match state.readiness.as_ref() {
         Some(controller) => Some(
             controller
@@ -198,7 +198,7 @@ async fn metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
-        .expect("metrics response")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn metrics_body(state: &AppState, readiness: Option<&ReadinessSnapshot>) -> String {

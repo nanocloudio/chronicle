@@ -4,6 +4,9 @@ use chronicle::readiness::state::{ApplicationState, RouteState};
 use proptest::prelude::*;
 use std::time::Duration;
 
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T = ()> = Result<T, TestError>;
+
 const ROUTE_YAML: &str = r#"
 api_version: v1
 app:
@@ -139,16 +142,18 @@ chronicles:
 proptest! {
     #[test]
     fn cached_snapshot_tracks_route_transitions(ttl_ms in 0u64..50, sequence in route_state_sequence()) {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
+            TestCaseError::Fail(format!("runtime: {e}").into())
+        })?;
         runtime.block_on(async {
-            let controller = build_controller();
+            let controller = build_controller()?;
             let ttl = Duration::from_millis(ttl_ms);
 
             for state in sequence {
                 let applied = controller
                     .set_route_state("route_a", state)
                     .await
-                    .expect("valid transition");
+                    .map_err(|e| format!("valid transition: {e:?}"))?;
                 assert_eq!(applied, state);
 
                 if !ttl.is_zero() {
@@ -162,7 +167,7 @@ proptest! {
                     .routes
                     .iter()
                     .find(|route| route.name == "route_a")
-                    .expect("route snapshot")
+                    .ok_or("route snapshot missing")?
                     .state;
 
                 assert_eq!(route_state, state);
@@ -174,28 +179,29 @@ proptest! {
                     );
                 }
             }
-        });
+            Ok::<(), TestError>(())
+        }).map_err(|e| TestCaseError::Fail(e.to_string().into()))?;
     }
 }
 
 #[test]
-fn multi_route_readiness_and_degraded_states() {
-    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+fn multi_route_readiness_and_degraded_states() -> TestResult {
+    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let controller = build_multi_route_controller();
+        let controller = build_multi_route_controller()?;
         // Inspect priorities surfaced in snapshots.
         let snapshot = controller.routes_snapshot().await;
         let alpha_policy = snapshot
             .iter()
             .find(|route| route.name == "alpha")
-            .expect("alpha route present")
+            .ok_or("alpha route present")?
             .policy
             .clone();
         assert_eq!(alpha_policy.readiness_priority, Some(10));
         let beta_policy = snapshot
             .iter()
             .find(|route| route.name == "beta")
-            .expect("beta route present")
+            .ok_or("beta route present")?
             .policy
             .clone();
         assert_eq!(beta_policy.readiness_priority, Some(5));
@@ -209,11 +215,11 @@ fn multi_route_readiness_and_degraded_states() {
         controller
             .set_route_state("alpha", RouteState::Ready)
             .await
-            .expect("alpha transitions to READY");
+            .map_err(|e| format!("alpha transitions to READY: {e:?}"))?;
         controller
             .set_route_state("beta", RouteState::Ready)
             .await
-            .expect("beta transitions to READY");
+            .map_err(|e| format!("beta transitions to READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::NotReady,
@@ -223,7 +229,7 @@ fn multi_route_readiness_and_degraded_states() {
         controller
             .set_route_state("gamma", RouteState::Ready)
             .await
-            .expect("gamma transitions to READY");
+            .map_err(|e| format!("gamma transitions to READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Ready
@@ -232,7 +238,7 @@ fn multi_route_readiness_and_degraded_states() {
         controller
             .set_route_state("beta", RouteState::Degraded)
             .await
-            .expect("beta transitions to DEGRADED");
+            .map_err(|e| format!("beta transitions to DEGRADED: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Degraded,
@@ -242,7 +248,7 @@ fn multi_route_readiness_and_degraded_states() {
         controller
             .set_route_state("alpha", RouteState::NotReady)
             .await
-            .expect("alpha transitions to NOT_READY");
+            .map_err(|e| format!("alpha transitions to NOT_READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Degraded,
@@ -252,30 +258,30 @@ fn multi_route_readiness_and_degraded_states() {
         controller
             .set_route_state("beta", RouteState::Ready)
             .await
-            .expect("beta returns to READY");
+            .map_err(|e| format!("beta returns to READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Ready
         );
-    });
+        Ok(())
+    })
 }
 
 #[test]
-fn readiness_priority_respected_for_numeric_thresholds() {
-    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+fn readiness_priority_respected_for_numeric_thresholds() -> TestResult {
+    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let config = IntegrationConfig::from_reader(PRIORITY_ROUTE_YAML.as_bytes())
-            .expect("priority config loads");
+        let config = IntegrationConfig::from_reader(PRIORITY_ROUTE_YAML.as_bytes())?;
         let controller = ReadinessController::initialise(&config);
 
         controller
             .set_route_state("alpha", RouteState::Ready)
             .await
-            .expect("alpha transitions to READY");
+            .map_err(|e| format!("alpha transitions to READY: {e:?}"))?;
         controller
             .set_route_state("beta", RouteState::NotReady)
             .await
-            .expect("beta transitions to NOT_READY");
+            .map_err(|e| format!("beta transitions to NOT_READY: {e:?}"))?;
 
         assert_eq!(
             controller.application_state().await,
@@ -286,7 +292,7 @@ fn readiness_priority_respected_for_numeric_thresholds() {
         controller
             .set_route_state("beta", RouteState::Ready)
             .await
-            .expect("beta transitions to READY");
+            .map_err(|e| format!("beta transitions to READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Ready,
@@ -296,25 +302,24 @@ fn readiness_priority_respected_for_numeric_thresholds() {
         controller
             .set_route_state("alpha", RouteState::NotReady)
             .await
-            .expect("alpha transitions to NOT_READY");
+            .map_err(|e| format!("alpha transitions to NOT_READY: {e:?}"))?;
         assert_eq!(
             controller.application_state().await,
             ApplicationState::Ready,
             "lower priority routes may become NOT_READY without tripping the global threshold"
         );
-    });
+        Ok(())
+    })
 }
 
-fn build_controller() -> ReadinessController {
-    let config =
-        IntegrationConfig::from_reader(ROUTE_YAML.as_bytes()).expect("fixture config loads");
-    ReadinessController::initialise(&config)
+fn build_controller() -> TestResult<ReadinessController> {
+    let config = IntegrationConfig::from_reader(ROUTE_YAML.as_bytes())?;
+    Ok(ReadinessController::initialise(&config))
 }
 
-fn build_multi_route_controller() -> ReadinessController {
-    let config = IntegrationConfig::from_reader(MULTI_ROUTE_YAML.as_bytes())
-        .expect("multi-route config loads");
-    ReadinessController::initialise(&config)
+fn build_multi_route_controller() -> TestResult<ReadinessController> {
+    let config = IntegrationConfig::from_reader(MULTI_ROUTE_YAML.as_bytes())?;
+    Ok(ReadinessController::initialise(&config))
 }
 
 fn route_state_sequence() -> impl Strategy<Value = Vec<RouteState>> {

@@ -202,7 +202,12 @@ impl ExecutionContext {
         }
 
         let mut iter = segments.into_iter();
-        let slot_index = match iter.next().expect("segments not empty") {
+        let Some(first_segment) = iter.next() else {
+            // This branch is unreachable due to the early return above,
+            // but we handle it for completeness.
+            return Ok(JsonValue::Array(self.snapshot_slots()));
+        };
+        let slot_index = match first_segment {
             Segment::Index(idx) => idx,
             _ => {
                 return Err(ContextError::InvalidJqExpression {
@@ -258,7 +263,7 @@ impl ExecutionContext {
                         format!("{path}[{index}]")
                     };
 
-                    if !current.is_array() {
+                    let Some(array) = current.as_array() else {
                         return Err(ContextError::TypeMismatch {
                             expression: original.to_string(),
                             slot: slot_index,
@@ -266,9 +271,8 @@ impl ExecutionContext {
                             expected: "array",
                             actual: value_type_name(current),
                         });
-                    }
+                    };
 
-                    let array = current.as_array().expect("value verified as array");
                     current = array.get(*index).ok_or_else(|| ContextError::MissingPath {
                         expression: original.to_string(),
                         slot: slot_index,
@@ -620,7 +624,8 @@ fn insert_nested_json(target: &mut JsonValue, raw_key: &str, value: JsonValue) {
                     };
                 }
 
-                cursor = array.get_mut(*index).expect("index within bounds");
+                // Safety: resize above ensures index is within bounds
+                cursor = &mut array[*index];
             }
         }
     }
@@ -642,7 +647,9 @@ fn parse_segments(raw: &str) -> Vec<Segment> {
         format!(".{raw}")
     };
 
-    parse_jq_segments(&expression).expect("flattened context key must be valid jq expression")
+    // Flattened context keys should always be valid jq expressions.
+    // If parsing fails unexpectedly, return empty segments (causing insert_nested_json to no-op).
+    parse_jq_segments(&expression).unwrap_or_default()
 }
 
 fn ensure_object(value: &mut JsonValue) -> &mut JsonMap<String, JsonValue> {

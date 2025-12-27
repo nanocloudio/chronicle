@@ -152,7 +152,13 @@ impl FileSchemaSource {
 
     pub fn load(&self, chronicle: &str, phase: &str) -> Result<SchemaInfo, ChronicleEngineError> {
         {
-            let cached = self.cached.lock().expect("schema cache lock");
+            let Ok(cached) = self.cached.lock() else {
+                return Err(ChronicleEngineError::SchemaResolution {
+                    chronicle: chronicle.to_string(),
+                    phase: phase.to_string(),
+                    reason: "schema cache lock poisoned".to_string(),
+                });
+            };
             if let Some(schema) = cached.as_ref() {
                 return Ok(SchemaInfo {
                     schema: schema.clone(),
@@ -186,7 +192,13 @@ impl FileSchemaSource {
         })?;
 
         {
-            let mut cached = self.cached.lock().expect("schema cache lock");
+            let Ok(mut cached) = self.cached.lock() else {
+                return Err(ChronicleEngineError::SchemaResolution {
+                    chronicle: chronicle.to_string(),
+                    phase: phase.to_string(),
+                    reason: "schema cache lock poisoned".to_string(),
+                });
+            };
             *cached = Some(schema.clone());
         }
 
@@ -203,6 +215,15 @@ impl FileSchemaSource {
     }
 }
 
+/// Configuration for a schema registry source.
+pub struct RegistrySchemaConfig {
+    pub endpoint: String,
+    pub subject: String,
+    pub version: SchemaRegistryVersion,
+    pub credentials: Option<RegistryCredentials>,
+    pub fallback: Option<Arc<FileSchemaSource>>,
+}
+
 pub struct RegistrySchemaSource {
     endpoint: String,
     subject: String,
@@ -214,15 +235,10 @@ pub struct RegistrySchemaSource {
 }
 
 impl RegistrySchemaSource {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chronicle: &str,
         phase: &str,
-        endpoint: String,
-        subject: String,
-        version: SchemaRegistryVersion,
-        credentials: Option<RegistryCredentials>,
-        fallback: Option<Arc<FileSchemaSource>>,
+        config: RegistrySchemaConfig,
     ) -> Result<Self, ChronicleEngineError> {
         let client =
             Client::builder()
@@ -234,18 +250,26 @@ impl RegistrySchemaSource {
                 })?;
 
         Ok(Self {
-            endpoint,
-            subject,
-            version,
-            credentials,
+            endpoint: config.endpoint,
+            subject: config.subject,
+            version: config.version,
+            credentials: config.credentials,
             client,
             cache: Mutex::new(None),
-            fallback,
+            fallback: config.fallback,
         })
     }
 
     pub fn load(&self, chronicle: &str, phase: &str) -> Result<SchemaInfo, ChronicleEngineError> {
-        if let Some(cached) = self.cache.lock().expect("registry cache").clone() {
+        let cache_guard =
+            self.cache
+                .lock()
+                .map_err(|_| ChronicleEngineError::SchemaResolution {
+                    chronicle: chronicle.to_string(),
+                    phase: phase.to_string(),
+                    reason: "registry cache lock poisoned".to_string(),
+                })?;
+        if let Some(cached) = cache_guard.clone() {
             return Ok(SchemaInfo {
                 schema: cached.schema.clone(),
                 schema_id: Some(cached.schema_id),
@@ -255,6 +279,7 @@ impl RegistrySchemaSource {
                 },
             });
         }
+        drop(cache_guard);
 
         match self.fetch_schema() {
             Ok(fetched) => {
@@ -267,7 +292,13 @@ impl RegistrySchemaSource {
                     },
                 };
 
-                let mut cache = self.cache.lock().expect("registry cache");
+                let Ok(mut cache) = self.cache.lock() else {
+                    return Err(ChronicleEngineError::SchemaResolution {
+                        chronicle: chronicle.to_string(),
+                        phase: phase.to_string(),
+                        reason: "registry cache lock poisoned".to_string(),
+                    });
+                };
                 *cache = Some(fetched);
                 Ok(info)
             }

@@ -1,8 +1,10 @@
 use chronicle::backpressure::BackpressureController;
 use std::time::Duration;
 
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
 #[tokio::test(flavor = "multi_thread")]
-async fn tracks_throttled_and_inflight() {
+async fn tracks_throttled_and_inflight() -> TestResult {
     let controller = BackpressureController::new(Some(1));
 
     let permit_one = controller.acquire().await;
@@ -21,12 +23,13 @@ async fn tracks_throttled_and_inflight() {
     assert_eq!(snapshot.throttled, 1, "second acquire increments throttled");
 
     drop(permit_one);
-    let permit_two = waiter.await.expect("waiter task");
+    let permit_two = waiter.await?;
     drop(permit_two);
 
     let snapshot = controller.snapshot();
     assert_eq!(snapshot.inflight, 0);
     assert_eq!(snapshot.throttled, 1);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

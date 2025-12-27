@@ -1155,15 +1155,15 @@ pub async fn dispatch_rabbitmq_publish(
             let payload = payload_bytes.clone();
             async move {
                 publisher
-                    .publish(
+                    .publish(crate::integration::factory::RabbitmqPublishRequest {
                         exchange,
                         routing_key,
-                        &payload,
+                        payload: &payload,
                         properties,
-                        publish_options,
-                        confirm.unwrap_or(true),
+                        options: publish_options,
+                        confirm: confirm.unwrap_or(true),
                         timeout,
-                    )
+                    })
                     .await
             }
         })

@@ -1,7 +1,121 @@
-use crate::config::integration::{JitterMode, RetryBudget};
+use crate::config::integration::{DeliveryPolicy, JitterMode, RetryBudget};
 use rand::Rng;
 use std::cmp::{max, min};
 use std::time::Duration;
+
+/// A retry plan that computes backoff delays for delivery attempts.
+///
+/// This encapsulates the logic for merging a delivery policy with a retry budget
+/// to determine how many retries are allowed and what backoff delays to use.
+///
+/// Used internally by `ActionDispatcher`. Exposed for integration testing.
+#[derive(Debug, Clone)]
+pub struct RetryPlan {
+    max_retries: u32,
+    max_elapsed: Option<Duration>,
+    base_backoff: Duration,
+    max_backoff: Duration,
+    jitter: JitterMode,
+}
+
+impl RetryPlan {
+    /// Create a new retry plan by merging an optional delivery policy with an optional retry budget.
+    ///
+    /// The plan uses the most restrictive settings from both sources:
+    /// - Minimum of policy retries and budget max_attempts
+    /// - Maximum of policy min_backoff and budget base_backoff
+    /// - Minimum of policy max_backoff and budget max_backoff
+    pub fn new(policy: Option<&DeliveryPolicy>, budget: Option<&RetryBudget>) -> Self {
+        let policy_attempts = policy
+            .and_then(|p| p.retries)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let budget_attempts = budget
+            .and_then(|b| b.max_attempts)
+            .unwrap_or(u32::MAX)
+            .max(1);
+        let max_attempts = policy_attempts.min(budget_attempts).max(1);
+
+        let mut base_backoff = policy
+            .and_then(|p| p.backoff.as_ref().map(|b| b.min))
+            .or_else(|| budget.and_then(|b| b.base_backoff))
+            .unwrap_or(Duration::from_millis(0));
+        if let Some(envelope) = budget.and_then(|b| b.base_backoff) {
+            if base_backoff < envelope {
+                base_backoff = envelope;
+            }
+        }
+
+        let mut max_backoff = policy
+            .and_then(|p| p.backoff.as_ref().map(|b| b.max))
+            .or_else(|| budget.and_then(|b| b.max_backoff))
+            .unwrap_or(base_backoff);
+        if let Some(envelope) = budget.and_then(|b| b.max_backoff) {
+            if max_backoff > envelope {
+                max_backoff = envelope;
+            }
+        }
+        if max_backoff < base_backoff {
+            max_backoff = base_backoff;
+        }
+
+        Self {
+            max_retries: max_attempts.saturating_sub(1),
+            max_elapsed: budget.and_then(|b| b.max_elapsed),
+            base_backoff,
+            max_backoff,
+            jitter: budget.and_then(|b| b.jitter).unwrap_or(JitterMode::None),
+        }
+    }
+
+    /// Compute the next delay for a retry, if one is allowed.
+    ///
+    /// Returns `None` if:
+    /// - The attempt count has exceeded max_retries
+    /// - The elapsed time has exceeded max_elapsed
+    /// - The remaining time within max_elapsed is less than the computed delay
+    pub fn next_delay(&self, attempt: u32, elapsed: Duration) -> Option<Duration> {
+        if attempt >= self.max_retries {
+            return None;
+        }
+
+        let mut delay = self.backoff_for(attempt + 1);
+        delay = match self.jitter {
+            JitterMode::None => delay,
+            JitterMode::Equal => jitter_between(delay.mul_f64(0.5), delay),
+            JitterMode::Full => jitter_between(Duration::from_secs(0), delay),
+        };
+
+        if let Some(limit) = self.max_elapsed {
+            if elapsed >= limit {
+                return None;
+            }
+            let remaining = limit - elapsed;
+            if remaining < delay {
+                return None;
+            }
+        }
+
+        Some(delay)
+    }
+
+    /// Compute the backoff duration for a given attempt index.
+    ///
+    /// Uses exponential backoff starting from base_backoff and capped at max_backoff.
+    pub fn backoff_for(&self, attempt_index: u32) -> Duration {
+        if self.base_backoff.is_zero() {
+            return Duration::from_secs(0);
+        }
+
+        let exponent = attempt_index.saturating_sub(1).min(16);
+        let factor = 1u32 << exponent;
+        let mut delay = self.base_backoff.mul_f64(factor as f64);
+        if delay > self.max_backoff {
+            delay = self.max_backoff;
+        }
+        delay
+    }
+}
 
 pub fn merge_retry_budgets<'a, I>(budgets: I) -> Option<RetryBudget>
 where
@@ -113,31 +227,5 @@ fn duration_to_seconds(duration: Duration) -> u64 {
         secs.max(1)
     } else {
         secs.saturating_add(1).max(1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retry_after_respects_elapsed_and_backoff() {
-        let budget = RetryBudget {
-            max_attempts: Some(3),
-            max_elapsed: Some(Duration::from_secs(2)),
-            base_backoff: Some(Duration::from_secs(5)),
-            max_backoff: Some(Duration::from_secs(10)),
-            jitter: Some(JitterMode::None),
-        };
-        assert_eq!(
-            retry_after_seconds_from_budget(Some(&budget)),
-            2,
-            "retry-after should clamp to max_elapsed"
-        );
-    }
-
-    #[test]
-    fn retry_after_defaults_to_one_second() {
-        assert_eq!(retry_after_seconds_from_budget(None), 1);
     }
 }

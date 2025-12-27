@@ -1,3 +1,29 @@
+//! Chronicle executor: async action dispatcher.
+//!
+//! This module implements the **async executor** component of the engine pipeline.
+//! It receives `ChronicleExecution` payloads from the engine and delivers actions
+//! to their target connectors (HTTP, Kafka, RabbitMQ, MQTT, databases, etc.).
+//!
+//! # Tokio Dependency
+//!
+//! Unlike the synchronous loader/planner in [`crate::chronicle::engine`], this module
+//! **requires Tokio** for:
+//!
+//! - Async HTTP client requests (`reqwest`, `tonic`)
+//! - Message broker publishing (Kafka, RabbitMQ, MQTT)
+//! - Database operations (PostgreSQL, MariaDB, MongoDB, Redis)
+//! - Email delivery (SMTP via `lettre`)
+//! - Retry delays and timeouts (`tokio::time`)
+//!
+//! # Design Rationale
+//!
+//! The executor is intentionally separated from the engine to:
+//!
+//! - Keep plan building synchronous and testable
+//! - Enable different dispatch strategies (immediate, batched, queued)
+//! - Support retry policies with exponential backoff
+//! - Handle circuit breaker patterns for connector health
+
 use crate::chronicle::engine::ChronicleAction;
 use crate::chronicle_event;
 #[cfg(feature = "http-out")]
@@ -8,7 +34,7 @@ use crate::codec::http::{
 use crate::codec::payload::EncodedPayload;
 #[cfg(feature = "smtp")]
 use crate::config::integration::SmtpTlsMode;
-use crate::config::integration::{DeliveryPolicy, JitterMode, RetryBudget};
+use crate::config::integration::{DeliveryPolicy, RetryBudget};
 #[cfg(any(feature = "http-out", feature = "grpc"))]
 use crate::error::Context;
 use crate::error::{ChronicleError, Error as ErrorKind, Result};
@@ -17,7 +43,7 @@ use crate::integration::factory::SmtpHandle;
 use crate::integration::factory::{ConnectorFactoryError, ConnectorFactoryRegistry};
 use crate::metrics::metrics;
 use crate::readiness::{DependencyHealth, ReadinessController};
-use crate::retry::jitter_between;
+use crate::retry::RetryPlan;
 #[cfg(all(not(feature = "grpc"), any(feature = "http-out", feature = "mqtt")))]
 use bytes::Bytes;
 #[cfg(feature = "grpc")]
@@ -50,7 +76,16 @@ use std::result::Result as StdResult;
 #[cfg(feature = "grpc")]
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "smtp",
+    feature = "kafka",
+    feature = "db-postgres",
+    feature = "db-mariadb"
+))]
+use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
 #[cfg(feature = "grpc")]
 use tokio::fs;
@@ -242,7 +277,7 @@ impl GrpcDescriptorCache {
         if let Some(pool) = self
             .pools
             .lock()
-            .expect("descriptor cache lock")
+            .map_err(|_| crate::err!("descriptor cache lock poisoned"))?
             .get(path)
             .cloned()
         {
@@ -262,7 +297,7 @@ impl GrpcDescriptorCache {
 
         self.pools
             .lock()
-            .expect("descriptor cache lock")
+            .map_err(|_| crate::err!("descriptor cache lock poisoned"))?
             .insert(path.to_path_buf(), pool.clone());
 
         Ok(pool)
@@ -420,7 +455,10 @@ struct MqttPublishRequest<'a> {
     record_id: Option<&'a str>,
 }
 
-#[cfg_attr(not(feature = "rabbitmq"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "rabbitmq"),
+    expect(dead_code, reason = "Struct only used with rabbitmq feature")
+)]
 struct RabbitmqPublishRequest<'a> {
     connector: &'a str,
     url: &'a str,
@@ -464,10 +502,17 @@ impl ActionDispatcher {
     }
 
     fn record_connector_failure(&self, connector: &str, kind: &'static str, err: &ActionError) {
-        let mut health = self
-            .connector_health
-            .lock()
-            .expect("connector health lock poisoned");
+        let Ok(mut health) = self.connector_health.lock() else {
+            tracing::error!(
+                target: "chronicle::dispatcher",
+                event = "health_lock_poisoned",
+                connector = connector,
+                kind,
+                error = %err,
+                "failed to record connector failure: health lock poisoned"
+            );
+            return;
+        };
         let entry = health
             .entry(connector.to_string())
             .or_insert_with(ConnectorConnectionState::new);
@@ -484,10 +529,16 @@ impl ActionDispatcher {
     }
 
     fn record_connector_success(&self, connector: &str, kind: &'static str) {
-        let mut health = self
-            .connector_health
-            .lock()
-            .expect("connector health lock poisoned");
+        let Ok(mut health) = self.connector_health.lock() else {
+            tracing::error!(
+                target: "chronicle::dispatcher",
+                event = "health_lock_poisoned",
+                connector = connector,
+                kind,
+                "failed to record connector success: health lock poisoned"
+            );
+            return;
+        };
         let entry = health
             .entry(connector.to_string())
             .or_insert_with(ConnectorConnectionState::new);
@@ -995,7 +1046,7 @@ impl ActionDispatcher {
             let kind = action_kind(action);
             let connector_name = action_connector(action).map(|name| name.to_string());
             let mut attempt: u32 = 0;
-            let retry_plan = DeliveryRetryPlan::new(context.policy, context.retry_budget);
+            let retry_plan = RetryPlan::new(context.policy, context.retry_budget);
             let attempt_window = Instant::now();
 
             loop {
@@ -1107,7 +1158,7 @@ impl ActionDispatcher {
             let kind = action_kind(action);
             let connector_name = action_connector(action).map(|name| name.to_string());
             let mut attempt: u32 = 0;
-            let retry_plan = DeliveryRetryPlan::new(context.policy, context.retry_budget);
+            let retry_plan = RetryPlan::new(context.policy, context.retry_budget);
             let attempt_window = Instant::now();
 
             loop {
@@ -1851,140 +1902,6 @@ async fn record_retry_failure(dispatcher: &ActionDispatcher, route: &str) -> boo
             );
             true
         }
-    }
-}
-
-struct DeliveryRetryPlan {
-    max_retries: u32,
-    max_elapsed: Option<Duration>,
-    base_backoff: Duration,
-    max_backoff: Duration,
-    jitter: JitterMode,
-}
-
-impl DeliveryRetryPlan {
-    fn new(policy: Option<&DeliveryPolicy>, budget: Option<&RetryBudget>) -> Self {
-        let policy_attempts = policy
-            .and_then(|p| p.retries)
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
-        let budget_attempts = budget
-            .and_then(|b| b.max_attempts)
-            .unwrap_or(u32::MAX)
-            .max(1);
-        let max_attempts = policy_attempts.min(budget_attempts).max(1);
-        let mut base_backoff = policy
-            .and_then(|p| p.backoff.as_ref().map(|b| b.min))
-            .or_else(|| budget.and_then(|b| b.base_backoff))
-            .unwrap_or(Duration::from_millis(0));
-        if let Some(envelope) = budget.and_then(|b| b.base_backoff) {
-            if base_backoff < envelope {
-                base_backoff = envelope;
-            }
-        }
-        let mut max_backoff = policy
-            .and_then(|p| p.backoff.as_ref().map(|b| b.max))
-            .or_else(|| budget.and_then(|b| b.max_backoff))
-            .unwrap_or(base_backoff);
-        if let Some(envelope) = budget.and_then(|b| b.max_backoff) {
-            if max_backoff > envelope {
-                max_backoff = envelope;
-            }
-        }
-        if max_backoff < base_backoff {
-            max_backoff = base_backoff;
-        }
-
-        Self {
-            max_retries: max_attempts.saturating_sub(1),
-            max_elapsed: budget.and_then(|b| b.max_elapsed),
-            base_backoff,
-            max_backoff,
-            jitter: budget.and_then(|b| b.jitter).unwrap_or(JitterMode::None),
-        }
-    }
-
-    fn next_delay(&self, attempt: u32, elapsed: Duration) -> Option<Duration> {
-        if attempt >= self.max_retries {
-            return None;
-        }
-
-        let mut delay = self.backoff_for(attempt + 1);
-        delay = match self.jitter {
-            JitterMode::None => delay,
-            JitterMode::Equal => jitter_between(delay.mul_f64(0.5), delay),
-            JitterMode::Full => jitter_between(Duration::from_secs(0), delay),
-        };
-
-        if let Some(limit) = self.max_elapsed {
-            if elapsed >= limit {
-                return None;
-            }
-            let remaining = limit - elapsed;
-            if remaining < delay {
-                return None;
-            }
-        }
-
-        Some(delay)
-    }
-
-    fn backoff_for(&self, attempt_index: u32) -> Duration {
-        if self.base_backoff.is_zero() {
-            return Duration::from_secs(0);
-        }
-
-        let exponent = attempt_index.saturating_sub(1).min(16);
-        let factor = 1u32 << exponent;
-        let mut delay = self.base_backoff.mul_f64(factor as f64);
-        if delay > self.max_backoff {
-            delay = self.max_backoff;
-        }
-        delay
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::integration::{BackoffPolicy, DeliveryPolicy, RetryBudget};
-
-    #[test]
-    fn retries_respect_tightest_budget() {
-        let policy = DeliveryPolicy {
-            retries: Some(5),
-            backoff: Some(BackoffPolicy {
-                min: Duration::from_millis(10),
-                max: Duration::from_millis(10),
-            }),
-            idempotent: None,
-        };
-        let budget = RetryBudget {
-            max_attempts: Some(3),
-            max_elapsed: None,
-            base_backoff: Some(Duration::from_millis(5)),
-            max_backoff: Some(Duration::from_millis(5)),
-            jitter: Some(JitterMode::None),
-        };
-        let plan = DeliveryRetryPlan::new(Some(&policy), Some(&budget));
-        assert!(plan.next_delay(0, Duration::ZERO).is_some());
-        assert!(plan.next_delay(1, Duration::ZERO).is_some());
-        assert!(plan.next_delay(2, Duration::ZERO).is_none());
-    }
-
-    #[test]
-    fn elapsed_window_enforced() {
-        let policy = DeliveryPolicy::default();
-        let budget = RetryBudget {
-            max_attempts: Some(2),
-            max_elapsed: Some(Duration::from_millis(50)),
-            base_backoff: Some(Duration::from_millis(40)),
-            max_backoff: Some(Duration::from_millis(40)),
-            jitter: Some(JitterMode::None),
-        };
-        let plan = DeliveryRetryPlan::new(Some(&policy), Some(&budget));
-        assert!(plan.next_delay(0, Duration::from_millis(10)).is_some());
-        assert!(plan.next_delay(0, Duration::from_millis(60)).is_none());
     }
 }
 

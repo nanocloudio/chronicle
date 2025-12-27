@@ -1,3 +1,10 @@
+// All mutex lock expects in this module are for internal telemetry state.
+// Mutex poisoning indicates a prior panic - continuing would produce inconsistent metrics.
+#![allow(
+    clippy::expect_used,
+    reason = "Mutex poisoning indicates prior panic - unrecoverable"
+)]
+
 use crate::error::Result;
 use chrono::{SecondsFormat, Utc};
 use std::collections::{BTreeMap, HashMap};

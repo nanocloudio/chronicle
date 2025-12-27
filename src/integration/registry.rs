@@ -1,3 +1,43 @@
+//! Connector registry: outbound connector configuration and client factories.
+//!
+//! This module contains the **connector** (outbound) handles that configure and
+//! provide access to external systems for sending data.
+//!
+//! # Architecture Boundaries
+//!
+//! Chronicle uses a clear separation between inbound and outbound data flows:
+//!
+//! - **Connectors** (outbound, this module): Configuration wrappers and client
+//!   factories for sending data to external systems. Each connector handle stores
+//!   parsed configuration (URLs, credentials, TLS settings, pool options) and
+//!   provides accessors for phases to create clients. Examples:
+//!   - [`KafkaConnector`] - Kafka producer configuration
+//!   - [`PostgresConnector`], [`MariadbConnector`] - Database connections
+//!   - [`HttpClientConnector`] - HTTP client configuration
+//!   - [`SmtpConnector`] - Email sending configuration
+//!   - [`RabbitmqConnector`], [`MqttConnector`] - Message broker configuration
+//!
+//! - **Triggers** (inbound): Components that receive events from external sources.
+//!   See [`transport`] for trigger runtimes.
+//!
+//! - **Phases** (processing): Transform and route data between triggers and
+//!   connectors. See [`chronicle::phase`] for phase handlers.
+//!
+//! # Usage
+//!
+//! The [`ConnectorRegistry`] is built from an [`IntegrationConfig`] and provides
+//! typed access to connector handles by name:
+//!
+//! ```ignore
+//! let registry = ConnectorRegistry::build(&config, config_dir)?;
+//! if let Some(kafka) = registry.kafka("my-kafka-connector") {
+//!     // Use kafka.brokers, kafka.timeouts, etc.
+//! }
+//! ```
+//!
+//! [`transport`]: crate::transport
+//! [`chronicle::phase`]: crate::chronicle::phase
+
 use crate::config::integration::{
     ConnectorConfig, ConnectorKind, ConnectorTimeouts, DbPoolOptions, GrpcConnectorOptions,
     GrpcTlsOptions, HttpClientConnectorOptions, HttpClientPoolOptions, HttpClientTlsOptions,

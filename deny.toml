@@ -1,0 +1,108 @@
+# Chronicle dependency policy configuration for cargo-deny
+#
+# Run with: cargo deny check
+# Install: cargo install cargo-deny
+#
+# This configuration prevents:
+# - Duplicate TLS stacks or async runtimes
+# - Known-problematic licenses
+# - Unmaintained crates
+
+[graph]
+# Only check the main workspace crate
+targets = []
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+
+[licenses]
+unlicensed = "deny"
+copyleft = "warn"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Prevent multiple TLS implementations (prefer rustls)
+[[bans.deny]]
+name = "native-tls"
+wrappers = []
+
+[[bans.deny]]
+name = "openssl"
+wrappers = []
+
+[[bans.deny]]
+name = "openssl-sys"
+wrappers = []
+
+# Prevent multiple async runtimes (prefer tokio)
+[[bans.deny]]
+name = "async-std"
+wrappers = []
+
+[[bans.deny]]
+name = "smol"
+wrappers = []
+
+# Skip specific crates from duplicate detection
+[[bans.skip]]
+name = "syn"
+# Multiple versions of syn are common due to proc-macro ecosystem
+
+[[bans.skip]]
+name = "http"
+# http 0.2 and http 1.x coexist during ecosystem migration
+
+[[bans.skip]]
+name = "hyper"
+# hyper 0.14 and hyper 1.x coexist during ecosystem migration
+
+[[bans.skip]]
+name = "reqwest"
+# reqwest 0.11 and reqwest 0.12 coexist during ecosystem migration
+
+[[bans.skip]]
+name = "tower"
+# tower 0.4 and tower 0.5 coexist during ecosystem migration
+
+[[bans.skip]]
+name = "tokio-executor-trait"
+# Multiple versions for different lapin compatibility
+
+[[bans.skip]]
+name = "async-io"
+# Multiple versions due to ecosystem dependencies
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -9,10 +9,22 @@ use std::sync::Arc;
 fn load_engine() -> ChronicleEngine {
     let config_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chronicle-integration.yaml");
-    let config = IntegrationConfig::from_path(&config_path).expect("fixture config");
-    let registry = ConnectorRegistry::build(&config, config_path.parent().expect("fixture dir"))
-        .expect("registry build");
-    ChronicleEngine::new(Arc::new(config), Arc::new(registry)).expect("engine build")
+    let config = IntegrationConfig::from_path(&config_path).unwrap_or_else(|e| {
+        eprintln!("benchmark setup failed - fixture config: {e}");
+        std::process::abort()
+    });
+    let fixture_dir = config_path.parent().unwrap_or_else(|| {
+        eprintln!("benchmark setup failed - fixture path has no parent");
+        std::process::abort()
+    });
+    let registry = ConnectorRegistry::build(&config, fixture_dir).unwrap_or_else(|e| {
+        eprintln!("benchmark setup failed - registry build: {e}");
+        std::process::abort()
+    });
+    ChronicleEngine::new(Arc::new(config), Arc::new(registry)).unwrap_or_else(|e| {
+        eprintln!("benchmark setup failed - engine build: {e}");
+        std::process::abort()
+    })
 }
 
 fn bench_collect_record(c: &mut Criterion) {
@@ -42,7 +54,10 @@ fn bench_collect_record(c: &mut Criterion) {
             let payload = payload_template.clone();
             let result = engine
                 .execute("collect_record", payload)
-                .expect("collect_record benchmark success");
+                .unwrap_or_else(|e| {
+                    eprintln!("benchmark failed - collect_record: {e}");
+                    std::process::abort()
+                });
             assert_eq!(result.actions.len(), 1);
         });
     });

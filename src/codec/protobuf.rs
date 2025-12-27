@@ -98,7 +98,9 @@ impl DescriptorSource {
 
     pub fn load(&self, message: &str) -> Result<DescriptorData, String> {
         let pool = {
-            let mut guard = self.cached.lock().expect("descriptor cache lock");
+            let Ok(mut guard) = self.cached.lock() else {
+                return Err("descriptor cache lock poisoned".to_string());
+            };
             if let Some(pool) = guard.as_ref() {
                 pool.clone()
             } else {

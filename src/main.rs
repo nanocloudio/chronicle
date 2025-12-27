@@ -1,4 +1,7 @@
-#![allow(clippy::result_large_err)]
+#![allow(
+    clippy::result_large_err,
+    reason = "Error types contain contextual information"
+)]
 
 use anyhow::{anyhow, Context};
 use chronicle::config::{integration::known_feature_flags, ChronicleConfig, IntegrationConfig};

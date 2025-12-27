@@ -1,13 +1,16 @@
 use chronicle::config::IntegrationConfig;
 use insta::assert_snapshot;
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 fn expect_validation_error(yaml: &str) -> String {
     let decorated = support::feature_flags::enable_optional_feature_flags(yaml);
     match IntegrationConfig::from_reader(decorated.as_bytes()) {
-        Ok(_) => panic!("validation should fail"),
+        Ok(_) => {
+            eprintln!("validation should fail but config parsed successfully");
+            std::process::abort()
+        }
         Err(err) => err.to_string(),
     }
 }

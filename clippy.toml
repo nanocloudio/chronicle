@@ -1,0 +1,10 @@
+# Clippy configuration for chronicle
+# Disallow broad allow attributes to prevent unnoticed dead code
+
+# Disallow allow_attributes - any #[allow(...)] must be justified
+allow-unwrap-in-tests = true
+
+# Threshold for clippy::enum-variant-size lint (default 200 bytes)
+# Large enum variants are acceptable for phase plans where boxing would
+# add unnecessary indirection.
+enum-variant-size-threshold = 512

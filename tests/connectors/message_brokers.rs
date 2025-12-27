@@ -1,6 +1,6 @@
 #![cfg(all(feature = "rabbitmq", feature = "mqtt"))]
 
-#[path = "support/mod.rs"]
+#[path = "../support/mod.rs"]
 mod support;
 
 use async_trait::async_trait;
@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use support::mocks::{MockMqttBroker, MockRabbitmqBroker};
 
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T = ()> = Result<T, TestError>;
+
 struct MessageBrokerHarness {
     config: Arc<IntegrationConfig>,
     registry: Arc<ConnectorRegistry>,
@@ -29,34 +32,29 @@ struct MessageBrokerHarness {
 }
 
 impl MessageBrokerHarness {
-    fn new() -> Self {
+    fn new() -> TestResult<Self> {
         let config_path =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/message_brokers.yaml");
-        let config =
-            Arc::new(IntegrationConfig::from_path(&config_path).expect("message broker config"));
-        let registry = Arc::new(
-            ConnectorRegistry::build(&config, config_path.parent().expect("fixture dir"))
-                .expect("registry build"),
-        );
-        let engine = Arc::new(
-            ChronicleEngine::new(Arc::clone(&config), Arc::clone(&registry)).expect("engine build"),
-        );
+        let config = Arc::new(IntegrationConfig::from_path(&config_path)?);
+        let fixture_dir = config_path.parent().ok_or("fixture path has no parent")?;
+        let registry = Arc::new(ConnectorRegistry::build(&config, fixture_dir)?);
+        let engine = Arc::new(ChronicleEngine::new(
+            Arc::clone(&config),
+            Arc::clone(&registry),
+        )?);
 
-        Self {
+        Ok(Self {
             config,
             registry,
             engine,
-        }
+        })
     }
 
-    fn execute(&self, chronicle: &str, payload: JsonValue) -> ChronicleActionBundle {
-        let execution = self
-            .engine
-            .execute(chronicle, payload)
-            .unwrap_or_else(|err| panic!("chronicle `{chronicle}` failed: {err:?}"));
-        ChronicleActionBundle {
+    fn execute(&self, chronicle: &str, payload: JsonValue) -> TestResult<ChronicleActionBundle> {
+        let execution = self.engine.execute(chronicle, payload)?;
+        Ok(ChronicleActionBundle {
             actions: execution.actions,
-        }
+        })
     }
 
     fn config(&self) -> Arc<IntegrationConfig> {
@@ -88,8 +86,8 @@ impl ChronicleActionBundle {
 }
 
 #[test]
-fn rabbitmq_pipeline_emits_http_and_publish() {
-    let harness = MessageBrokerHarness::new();
+fn rabbitmq_pipeline_emits_http_and_publish() -> TestResult {
+    let harness = MessageBrokerHarness::new()?;
     let payload = json!({
         "routing_key": "alerts.high",
         "exchange": "alerts.incoming",
@@ -100,72 +98,70 @@ fn rabbitmq_pipeline_emits_http_and_publish() {
         "redelivered": false
     });
 
-    let bundle = harness.execute("rabbitmq_alert_pipeline", payload);
+    let bundle = harness.execute("rabbitmq_alert_pipeline", payload)?;
     bundle.expect_actions(2);
 
-    let http_req = match &bundle.actions[0] {
-        ChronicleAction::HttpRequest {
-            connector,
-            method,
-            path,
-            content_type,
-            ..
-        } => {
-            assert_eq!(connector, "http_backend");
-            assert_eq!(method, "POST");
-            assert_eq!(path, "/alerts/handle");
-            assert_eq!(content_type.as_deref(), Some("application/json"));
-            true
-        }
-        other => panic!("expected HTTP request action, got {other:?}"),
+    let ChronicleAction::HttpRequest {
+        connector,
+        method,
+        path,
+        content_type,
+        ..
+    } = &bundle.actions[0]
+    else {
+        return Err(format!("expected HTTP request action, got {:?}", bundle.actions[0]).into());
     };
-    assert!(http_req, "http request action missing");
+    assert_eq!(connector, "http_backend");
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/alerts/handle");
+    assert_eq!(content_type.as_deref(), Some("application/json"));
 
-    let publish_action = match &bundle.actions[1] {
-        ChronicleAction::RabbitmqPublish {
-            connector,
-            exchange,
-            routing_key,
-            payload,
-            headers,
-            ..
-        } => {
-            assert_eq!(connector, "rabbitmq_core");
-            assert_eq!(exchange.as_deref(), Some("alerts.audit"));
-            assert_eq!(routing_key.as_deref(), Some("processed.alerts"));
-
-            let broker = MockRabbitmqBroker::default();
-            let header_map: JsonMap<String, JsonValue> =
-                headers.as_object().cloned().unwrap_or_default();
-            let confirmation = broker.publish(
-                "alerts.audit",
-                "processed.alerts",
-                payload.clone(),
-                header_map,
-            );
-
-            let delivery = broker.next_delivery().expect("delivery queued");
-            assert_eq!(delivery.exchange(), "alerts.audit");
-            assert_eq!(delivery.routing_key(), "processed.alerts");
-            assert_eq!(delivery.payload(), payload);
-
-            delivery.clone().ack(&broker);
-            confirmation.ack();
-            assert!(
-                confirmation.is_acknowledged(),
-                "mock confirmation should be acknowledged"
-            );
-
-            true
-        }
-        other => panic!("expected RabbitMQ publish action, got {other:?}"),
+    let ChronicleAction::RabbitmqPublish {
+        connector,
+        exchange,
+        routing_key,
+        payload,
+        headers,
+        ..
+    } = &bundle.actions[1]
+    else {
+        return Err(format!(
+            "expected RabbitMQ publish action, got {:?}",
+            bundle.actions[1]
+        )
+        .into());
     };
-    assert!(publish_action, "rabbitmq publish action missing");
+    assert_eq!(connector, "rabbitmq_core");
+    assert_eq!(exchange.as_deref(), Some("alerts.audit"));
+    assert_eq!(routing_key.as_deref(), Some("processed.alerts"));
+
+    let broker = MockRabbitmqBroker::default();
+    let header_map: JsonMap<String, JsonValue> = headers.as_object().cloned().unwrap_or_default();
+    let confirmation = broker.publish(
+        "alerts.audit",
+        "processed.alerts",
+        payload.clone(),
+        header_map,
+    );
+
+    let delivery = broker.next_delivery().ok_or("delivery queued")?;
+    assert_eq!(delivery.exchange(), "alerts.audit");
+    assert_eq!(delivery.routing_key(), "processed.alerts");
+    assert_eq!(delivery.payload(), payload);
+
+    delivery.clone().ack(&broker);
+    confirmation.ack();
+    assert!(
+        confirmation.is_acknowledged(),
+        "mock confirmation should be acknowledged"
+    );
+
+    Ok(())
 }
 
 #[test]
-fn mqtt_pipeline_emits_publish_and_postgres_query() {
-    let harness = MessageBrokerHarness::new();
+fn mqtt_pipeline_emits_publish_and_postgres_query() -> TestResult {
+    let harness = MessageBrokerHarness::new()?;
     let payload = json!({
         "topic": "sensors/telemetry/node-1",
         "qos": 1,
@@ -181,81 +177,81 @@ fn mqtt_pipeline_emits_publish_and_postgres_query() {
         }
     });
 
-    let bundle = harness.execute("mqtt_sensor_ingest", payload);
+    let bundle = harness.execute("mqtt_sensor_ingest", payload)?;
     bundle.expect_actions(2);
 
-    let mqtt_publish = match &bundle.actions[0] {
-        ChronicleAction::MqttPublish {
-            connector,
-            topic,
-            qos,
-            retain,
-            payload,
-            payload_encoding,
-            encoded_payload,
-            ..
-        } => {
-            assert_eq!(connector, "mqtt_iot");
-            assert_eq!(topic, "sensors/processed");
-            assert_eq!(*qos, 1);
-            assert!(!retain);
-            assert_eq!(payload["topic"], json!("sensors/telemetry/node-1"));
-            assert_eq!(payload_encoding, "json");
-            assert!(
-                !encoded_payload.is_empty(),
-                "encoded payload should not be empty"
-            );
-
-            let broker = MockMqttBroker::default();
-            let publish_result = broker.push(topic.clone(), payload.clone(), *qos, *retain);
-            assert_eq!(publish_result.qos(), 1);
-            assert!(
-                broker.next().is_some(),
-                "mqtt broker should expose queued message"
-            );
-            assert!(publish_result.packet_id() >= 1);
-
-            true
-        }
-        other => panic!("expected MQTT publish action, got {other:?}"),
+    let ChronicleAction::MqttPublish {
+        connector,
+        topic,
+        qos,
+        retain,
+        payload,
+        payload_encoding,
+        encoded_payload,
+        ..
+    } = &bundle.actions[0]
+    else {
+        return Err(format!("expected MQTT publish action, got {:?}", bundle.actions[0]).into());
     };
-    assert!(mqtt_publish, "mqtt publish action missing");
 
-    let postgres_query = match &bundle.actions[1] {
-        ChronicleAction::PostgresQuery {
-            connector,
-            sql,
-            parameters,
-            ..
-        } => {
-            assert_eq!(connector, "postgres_ledger");
-            assert!(
-                sql.contains("INSERT INTO sensor_readings"),
-                "unexpected SQL: {sql}"
-            );
-            assert_eq!(
-                parameters["topic"],
-                json!("sensors/telemetry/node-1"),
-                "topic parameter mismatch"
-            );
-            assert_eq!(
-                parameters["payload_base64"],
-                json!("eyJ0ZW1wIjoxOC41fQ=="),
-                "payload parameter mismatch"
-            );
-            true
-        }
-        other => panic!("expected Postgres query action, got {other:?}"),
+    assert_eq!(connector, "mqtt_iot");
+    assert_eq!(topic, "sensors/processed");
+    assert_eq!(*qos, 1);
+    assert!(!retain);
+    assert_eq!(payload["topic"], json!("sensors/telemetry/node-1"));
+    assert_eq!(payload_encoding, "json");
+    assert!(
+        !encoded_payload.is_empty(),
+        "encoded payload should not be empty"
+    );
+
+    let broker = MockMqttBroker::default();
+    let publish_result = broker.push(topic.clone(), payload.clone(), *qos, *retain);
+    assert_eq!(publish_result.qos(), 1);
+    assert!(
+        broker.next().is_some(),
+        "mqtt broker should expose queued message"
+    );
+    assert!(publish_result.packet_id() >= 1);
+
+    let ChronicleAction::PostgresQuery {
+        connector,
+        sql,
+        parameters,
+        ..
+    } = &bundle.actions[1]
+    else {
+        return Err(format!(
+            "expected Postgres query action, got {:?}",
+            bundle.actions[1]
+        )
+        .into());
     };
-    assert!(postgres_query, "postgres query action missing");
+
+    assert_eq!(connector, "postgres_ledger");
+    assert!(
+        sql.contains("INSERT INTO sensor_readings"),
+        "unexpected SQL: {sql}"
+    );
+    assert_eq!(
+        parameters["topic"],
+        json!("sensors/telemetry/node-1"),
+        "topic parameter mismatch"
+    );
+    assert_eq!(
+        parameters["payload_base64"],
+        json!("eyJ0ZW1wIjoxOC41fQ=="),
+        "payload parameter mismatch"
+    );
+    Ok(())
 }
 
 #[test]
-fn metrics_snapshot_records_publish_results() {
+fn metrics_snapshot_records_publish_results() -> TestResult {
     let counters = runtime_counters();
     let before = counters.snapshot();
 
-    let harness = MessageBrokerHarness::new();
+    let harness = MessageBrokerHarness::new()?;
 
     let rabbit_payload = json!({
         "routing_key": "alerts.high",
@@ -266,7 +262,7 @@ fn metrics_snapshot_records_publish_results() {
         },
         "redelivered": false
     });
-    harness.execute("rabbitmq_alert_pipeline", rabbit_payload);
+    harness.execute("rabbitmq_alert_pipeline", rabbit_payload)?;
 
     let mqtt_payload = json!({
         "topic": "sensors/telemetry/node-2",
@@ -278,7 +274,7 @@ fn metrics_snapshot_records_publish_results() {
             "json": { "temp": 20.0 }
         }
     });
-    harness.execute("mqtt_sensor_ingest", mqtt_payload);
+    harness.execute("mqtt_sensor_ingest", mqtt_payload)?;
 
     let after = counters.snapshot();
 
@@ -298,6 +294,7 @@ fn metrics_snapshot_records_publish_results() {
         after.mqtt_publish_failure, before.mqtt_publish_failure,
         "mqtt publish failure counter should not change"
     );
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -331,8 +328,8 @@ impl RabbitmqConsumer for TestRabbitConsumer {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rabbitmq_trigger_runtime_captures_consumer_config() {
-    let harness = MessageBrokerHarness::new();
+async fn rabbitmq_trigger_runtime_captures_consumer_config() -> TestResult {
+    let harness = MessageBrokerHarness::new()?;
     let captured = Arc::new(Mutex::new(Vec::<RabbitmqConsumerConfig>::new()));
     let capture_clone = Arc::clone(&captured);
 
@@ -345,24 +342,31 @@ async fn rabbitmq_trigger_runtime_captures_consumer_config() {
         move |config: RabbitmqConsumerConfig| {
             let capture = Arc::clone(&capture_clone);
             async move {
-                capture.lock().expect("capture lock").push(config.clone());
+                capture
+                    .lock()
+                    .unwrap_or_else(|e| {
+                        eprintln!("capture lock poisoned: {e}");
+                        std::process::abort()
+                    })
+                    .push(config.clone());
                 Ok(TestRabbitConsumer)
             }
         },
     )
-    .await
-    .expect("rabbitmq runtime build");
+    .await?;
 
     assert_eq!(runtime.consumer_count(), 1);
-    let configs = captured.lock().expect("captured config");
+    let configs = captured
+        .lock()
+        .map_err(|e| format!("captured config lock: {e}"))?;
     assert_eq!(configs.len(), 1);
     let cfg = &configs[0];
     assert_eq!(cfg.queue, "alerts.primary");
     assert_eq!(cfg.prefetch, Some(5));
-    match cfg.ack_mode {
-        RabbitmqAckMode::Manual => {}
-        RabbitmqAckMode::Auto => panic!("expected manual ack mode"),
+    if !matches!(cfg.ack_mode, RabbitmqAckMode::Manual) {
+        return Err("expected manual ack mode".into());
     }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -390,8 +394,8 @@ impl MqttSubscriber for TestMqttSubscriber {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mqtt_trigger_runtime_registers_subscriber() {
-    let harness = MessageBrokerHarness::new();
+async fn mqtt_trigger_runtime_registers_subscriber() -> TestResult {
+    let harness = MessageBrokerHarness::new()?;
     let registrations = Arc::new(Mutex::new(Vec::<(String, u8)>::new()));
     let registrations_clone = Arc::clone(&registrations);
 
@@ -406,30 +410,37 @@ async fn mqtt_trigger_runtime_registers_subscriber() {
             async move {
                 registrations
                     .lock()
-                    .expect("registration lock")
+                    .unwrap_or_else(|e| {
+                        eprintln!("registration lock poisoned: {e}");
+                        std::process::abort()
+                    })
                     .push((config.topic.clone(), config.qos));
                 Ok(TestMqttSubscriber)
             }
         },
     )
-    .await
-    .expect("mqtt runtime build");
+    .await?;
 
     assert_eq!(runtime.subscriber_count(), 1);
-    let entries = registrations.lock().expect("registrations");
+    let entries = registrations
+        .lock()
+        .map_err(|e| format!("registrations lock: {e}"))?;
     assert_eq!(
         entries.as_slice(),
         &[("sensors/telemetry/+".to_string(), 1)]
     );
+    Ok(())
 }
 
 #[test]
-fn connector_flags_gate_trigger_runtimes() {
+fn connector_flags_gate_trigger_runtimes() -> TestResult {
     let integration_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/message_brokers.yaml");
-    let config = IntegrationConfig::from_path(&integration_path).expect("load integration");
-    let registry = ConnectorRegistry::build(&config, integration_path.parent().unwrap())
-        .expect("registry build");
+    let config = IntegrationConfig::from_path(&integration_path)?;
+    let fixture_dir = integration_path
+        .parent()
+        .ok_or("fixture path has no parent")?;
+    let registry = ConnectorRegistry::build(&config, fixture_dir)?;
 
     let disabled = ConnectorFlags {
         rabbitmq: false,
@@ -454,4 +465,5 @@ fn connector_flags_gate_trigger_runtimes() {
         should_start_mongodb_runtime(&enabled, &registry),
         expect_mongodb
     );
+    Ok(())
 }

@@ -9,15 +9,18 @@ use chronicle::integration::registry::ConnectorRegistry;
 use serde_json::json;
 use std::sync::Arc;
 
-fn build_registry(yaml: &str) -> (IntegrationConfig, ConnectorFactoryRegistry) {
-    let config = IntegrationConfig::from_reader(yaml.as_bytes()).expect("config");
-    let registry = ConnectorRegistry::build(&config, ".").expect("registry");
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+type TestResult<T = ()> = Result<T, TestError>;
+
+fn build_registry(yaml: &str) -> TestResult<(IntegrationConfig, ConnectorFactoryRegistry)> {
+    let config = IntegrationConfig::from_reader(yaml.as_bytes())?;
+    let registry = ConnectorRegistry::build(&config, ".")?;
     let factory = ConnectorFactoryRegistry::new(Arc::new(registry));
-    (config, factory)
+    Ok((config, factory))
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_phase_from_config_resolves_parameters() {
+async fn postgres_phase_from_config_resolves_parameters() -> TestResult {
     let yaml = r#"api_version: v1
 connectors:
   - name: analytics_pg
@@ -49,17 +52,17 @@ chronicles:
           values.payload: .[0].body.event
 "#;
 
-    let (config, factory) = build_registry(yaml);
+    let (config, factory) = build_registry(yaml)?;
     let chronicle = config
         .chronicles
         .iter()
         .find(|c| c.name == "store_event")
-        .expect("chronicle exists");
+        .ok_or("chronicle exists")?;
     let phase = chronicle
         .phases
         .iter()
         .find(|p| p.name == "write_event")
-        .expect("phase exists");
+        .ok_or("phase exists")?;
 
     let executor = PostgresInsertPhaseExecutor;
     let mut context = ExecutionContext::new();
@@ -75,10 +78,7 @@ chronicles:
         }),
     );
 
-    let result = executor
-        .execute(phase, &mut context, &factory)
-        .await
-        .expect("postgres executor");
+    let result = executor.execute(phase, &mut context, &factory).await?;
 
     assert_eq!(result["connector"], json!("analytics_pg"));
     assert_eq!(
@@ -88,4 +88,5 @@ chronicles:
     assert_eq!(result["parameters"]["event_id"], json!("evt-123"));
     assert_eq!(result["parameters"]["payload"]["kind"], json!("click"));
     assert_eq!(result["schema"], json!("public"));
+    Ok(())
 }

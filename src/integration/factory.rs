@@ -1,3 +1,10 @@
+// All mutex lock expects in this module are for connector caches.
+// Mutex poisoning indicates a prior panic - continuing would produce inconsistent state.
+#![allow(
+    clippy::expect_used,
+    reason = "Mutex poisoning indicates prior panic - unrecoverable"
+)]
+
 use crate::config::integration::{ConnectorTimeouts, SmtpTlsMode};
 use crate::error::Error as ChronicleError;
 #[cfg(feature = "grpc")]
@@ -37,6 +44,7 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(any(feature = "http-out", feature = "grpc", feature = "mqtt"))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -119,13 +127,11 @@ pub struct ConnectorFactoryRegistry {
     #[cfg(feature = "http-out")]
     http_clients: ConnectorCache<HttpClientHandle>,
     #[cfg(not(feature = "http-out"))]
-    #[allow(dead_code)]
-    http_clients: (),
+    _http_clients: (),
     #[cfg(feature = "grpc")]
     grpc_clients: ConnectorCache<GrpcClientHandle>,
     #[cfg(not(feature = "grpc"))]
-    #[allow(dead_code)]
-    grpc_clients: (),
+    _grpc_clients: (),
     kafka_producers: ConnectorCache<KafkaProducerHandle>,
     #[cfg(feature = "db-mariadb")]
     mariadb_pools: ConnectorCache<MariaDbPoolHandle>,
@@ -142,8 +148,7 @@ pub struct ConnectorFactoryRegistry {
     #[cfg(feature = "smtp")]
     smtp_clients: ConnectorCache<SmtpHandle>,
     #[cfg(not(feature = "smtp"))]
-    #[allow(dead_code)]
-    smtp_clients: (),
+    _smtp_clients: (),
 }
 
 impl ConnectorFactoryRegistry {
@@ -153,11 +158,11 @@ impl ConnectorFactoryRegistry {
             #[cfg(feature = "http-out")]
             http_clients: ConnectorCache::new(),
             #[cfg(not(feature = "http-out"))]
-            http_clients: (),
+            _http_clients: (),
             #[cfg(feature = "grpc")]
             grpc_clients: ConnectorCache::new(),
             #[cfg(not(feature = "grpc"))]
-            grpc_clients: (),
+            _grpc_clients: (),
             kafka_producers: ConnectorCache::new(),
             #[cfg(feature = "db-mariadb")]
             mariadb_pools: ConnectorCache::new(),
@@ -174,7 +179,7 @@ impl ConnectorFactoryRegistry {
             #[cfg(feature = "smtp")]
             smtp_clients: ConnectorCache::new(),
             #[cfg(not(feature = "smtp"))]
-            smtp_clients: (),
+            _smtp_clients: (),
         };
         registry.for_each_handle(|handle| {
             tracing::debug!(
@@ -661,6 +666,18 @@ impl RabbitmqHandle {
     }
 }
 
+/// Request parameters for RabbitMQ publish operations.
+#[cfg(feature = "rabbitmq")]
+pub struct RabbitmqPublishRequest<'a> {
+    pub exchange: &'a str,
+    pub routing_key: &'a str,
+    pub payload: &'a [u8],
+    pub properties: AmqpBasicProperties,
+    pub options: BasicPublishOptions,
+    pub confirm: bool,
+    pub timeout: Option<Duration>,
+}
+
 #[cfg(feature = "rabbitmq")]
 #[derive(Debug)]
 pub struct RabbitmqPublisher {
@@ -720,17 +737,19 @@ impl RabbitmqPublisher {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn publish(
         &self,
-        exchange: &str,
-        routing_key: &str,
-        payload: &[u8],
-        properties: AmqpBasicProperties,
-        options: BasicPublishOptions,
-        confirm: bool,
-        timeout: Option<Duration>,
+        request: RabbitmqPublishRequest<'_>,
     ) -> Result<(), ConnectorFactoryError> {
+        let RabbitmqPublishRequest {
+            exchange,
+            routing_key,
+            payload,
+            properties,
+            options,
+            confirm,
+            timeout,
+        } = request;
         let confirm_future = self
             .channel
             .basic_publish(exchange, routing_key, options, payload, properties)
@@ -1188,7 +1207,16 @@ pub enum ConnectorFactoryError {
 }
 
 impl ConnectorFactoryError {
-    #[allow(dead_code)]
+    #[cfg(any(
+        feature = "http-out",
+        feature = "grpc",
+        feature = "kafka",
+        feature = "rabbitmq",
+        feature = "mqtt",
+        feature = "db-mariadb",
+        feature = "db-postgres",
+        feature = "smtp"
+    ))]
     fn build_failure(name: impl Into<String>, kind: &'static str, source: ChronicleError) -> Self {
         let name = name.into();
         let arc = Arc::new(source);
@@ -1262,7 +1290,14 @@ impl ConnectorFactoryError {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    feature = "http-out",
+    feature = "kafka",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "db-mariadb",
+    feature = "db-postgres"
+))]
 fn contextual_error(context: impl Into<String>, source: ChronicleError) -> ChronicleError {
     ChronicleError::with_context(context.into(), source)
 }
@@ -2041,7 +2076,16 @@ fn build_smtp_handle(connector: &SmtpConnector) -> Result<SmtpHandle, ConnectorF
     })
 }
 
-#[allow(dead_code)]
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "smtp"
+))]
 fn map_from_btree(
     map: &std::collections::BTreeMap<String, JsonValue>,
 ) -> JsonMap<String, JsonValue> {
@@ -2061,7 +2105,7 @@ fn json_to_config_value(value: &JsonValue) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "http-out")]
 fn join_pem_files(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,

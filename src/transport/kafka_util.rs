@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
 
+use crate::transport::runtime::sleep_with_shutdown;
 use std::future::Future;
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Sleeps for the provided duration unless the shutdown token is cancelled.
 /// Returns `true` if shutdown was requested before the delay elapsed.
+///
+/// This is a thin wrapper around [`sleep_with_shutdown`] for backward compatibility.
+#[inline]
 pub async fn wait_backoff(delay: Duration, shutdown: &CancellationToken) -> bool {
-    tokio::select! {
-        _ = shutdown.cancelled() => true,
-        _ = sleep(delay) => false,
-    }
+    sleep_with_shutdown(delay, shutdown).await
 }
 
 /// Executes the provided commit future and invokes `on_error` if it fails.

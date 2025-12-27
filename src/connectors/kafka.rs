@@ -33,7 +33,6 @@ impl KafkaConsumerLoop {
         })
     }
 
-    #[allow(clippy::needless_return)]
     pub async fn run(self, state: AppState, shutdown: CancellationToken) -> Result<()> {
         tracing::info!(
             brokers = %self.config.brokers.join(","),
@@ -42,18 +41,19 @@ impl KafkaConsumerLoop {
             "starting Kafka consumer loop"
         );
 
-        #[cfg(feature = "kafka")]
-        {
-            return self.run_kafka_loop(state, shutdown).await;
-        }
+        self.run_impl(state, shutdown).await
+    }
 
-        #[cfg(not(feature = "kafka"))]
-        {
-            let _ = (state, shutdown);
-            Err(crate::err!(
-                "Kafka support requested but the binary was built without the `kafka` feature"
-            ))
-        }
+    #[cfg(feature = "kafka")]
+    async fn run_impl(self, state: AppState, shutdown: CancellationToken) -> Result<()> {
+        self.run_kafka_loop(state, shutdown).await
+    }
+
+    #[cfg(not(feature = "kafka"))]
+    async fn run_impl(self, _state: AppState, _shutdown: CancellationToken) -> Result<()> {
+        Err(crate::err!(
+            "Kafka support requested but the binary was built without the `kafka` feature"
+        ))
     }
 
     #[cfg(feature = "kafka")]

@@ -1,3 +1,37 @@
+//! Transport layer: trigger runtimes and inbound message handling.
+//!
+//! This module contains the **trigger** (inbound) implementations that receive
+//! events from external sources and initiate chronicle execution.
+//!
+//! # Architecture Boundaries
+//!
+//! Chronicle uses a clear separation between inbound and outbound data flows:
+//!
+//! - **Triggers** (inbound, this module): Components that receive events from
+//!   external sources and initiate chronicle execution. Examples:
+//!   - [`kafka::KafkaTriggerRuntime`] - Consumes from Kafka topics
+//!   - [`rabbitmq::RabbitmqTriggerRuntime`] - Consumes from RabbitMQ queues
+//!   - [`http_server::HttpTriggerRoute`] - Handles HTTP requests
+//!   - [`mqtt::MqttTriggerRuntime`] - Subscribes to MQTT topics
+//!   - [`redis::RedisTriggerRuntime`] - Reads from Redis streams
+//!   - [`mongodb::MongodbTriggerRuntime`] - Tails MongoDB change streams
+//!
+//! - **Connectors** (outbound): Configuration wrappers and client factories for
+//!   sending data to external systems. See [`integration::registry`] for connector
+//!   handles like `KafkaConnector`, `PostgresConnector`, `HttpClientConnector`.
+//!
+//! - **Phases** (processing): Transform and route data between triggers and
+//!   connectors. See [`chronicle::phase`] for phase handlers.
+//!
+//! # Shared Utilities
+//!
+//! - [`runtime::sleep_with_shutdown`] - Shutdown-aware async sleep
+//! - [`kafka_util`] - Kafka-specific helpers (commit logging, backoff)
+//! - [`readiness_gate`] - Route-level readiness gating
+//!
+//! [`integration::registry`]: crate::integration::registry
+//! [`chronicle::phase`]: crate::chronicle::phase
+
 use crate::error::Result;
 use async_trait::async_trait;
 use std::fmt::{Display, Formatter};
@@ -8,6 +42,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub mod broker;
+#[cfg(feature = "http-in")]
+pub mod health;
 #[cfg(feature = "http-in")]
 pub mod http_server;
 #[cfg(feature = "kafka")]
@@ -162,15 +198,11 @@ impl TransportRuntime for TaskTransportRuntime {
     }
 
     async fn start(&mut self, shutdown: CancellationToken) -> Result<()> {
-        if self.spawner.is_none() {
+        let Some(spawner) = self.spawner.take() else {
             return Err(crate::err!("transport `{}` already started", self.name));
-        }
+        };
 
         self.update_health(TransportHealth::Starting);
-        let spawner = self
-            .spawner
-            .take()
-            .expect("spawner present after start guard");
         let spawned = spawner(shutdown.clone());
 
         if let Ok(mut guard) = self.tasks.lock() {
@@ -183,8 +215,20 @@ impl TransportRuntime for TaskTransportRuntime {
     }
 
     fn run(&mut self) -> TransportRun {
+        // Contract: run() must only be called once per transport.
+        // Debug assertion catches programming errors; in release, we return an error.
+        debug_assert!(
+            !self.run_registered,
+            "transport `{}` run() called multiple times",
+            self.name
+        );
         if self.run_registered {
-            panic!("transport `{}` run() called multiple times", self.name);
+            let name = self.name;
+            return TransportRun::new(self.kind, name, async move {
+                Err(crate::err!(
+                    "transport `{name}` run() called multiple times"
+                ))
+            });
         }
         self.run_registered = true;
 
@@ -196,9 +240,12 @@ impl TransportRuntime for TaskTransportRuntime {
         TransportRun::new(kind, name, async move {
             loop {
                 let handle = {
-                    let mut guard = tasks
-                        .lock()
-                        .expect("transport task collection lock poisoned");
+                    let Ok(mut guard) = tasks.lock() else {
+                        // Mutex poisoned - prior panic left inconsistent state
+                        return Err(crate::err!(
+                            "transport `{name}` task collection lock poisoned"
+                        ));
+                    };
                     guard.pop()
                 };
 

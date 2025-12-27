@@ -527,11 +527,9 @@ impl RedisDriver {
                 RedisDriverState::PubSub { subscription }
             }
             RedisTriggerMode::Stream => {
-                let stream = config
-                    .options
-                    .stream
-                    .as_ref()
-                    .expect("stream name validated at parse");
+                let Some(stream) = config.options.stream.as_ref() else {
+                    return Err(RedisDriverError::MissingStreamConfig);
+                };
                 let group = config.options.group.clone();
                 let connection =
                     build_stream_connection(&client, &config.connector, stream, group.as_deref())
@@ -674,7 +672,9 @@ impl RedisTriggerDriver for RedisDriver {
                 RedisDriverState::PubSub { subscription }
             }
             RedisTriggerMode::Stream => {
-                let stream = self.config.options.stream.as_ref().expect("stream checked");
+                let Some(stream) = self.config.options.stream.as_ref() else {
+                    return Err(RedisDriverError::MissingStreamConfig);
+                };
                 let state = match &self.state {
                     RedisDriverState::Stream {
                         group,
@@ -1040,4 +1040,6 @@ pub enum RedisDriverError {
         #[source]
         source: std::io::Error,
     },
+    #[error("stream mode requires stream option but none was provided")]
+    MissingStreamConfig,
 }
