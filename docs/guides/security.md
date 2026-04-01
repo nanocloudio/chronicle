@@ -28,6 +28,8 @@ following combinations are respected in configs and infrastructure:
 | Redis | `redis://` vs `rediss://`. | TLS block accepts CA/cert/key. | Use ACL users with scoped permissions. |
 | MongoDB | `mongodb://` vs `mongodb+srv://` or `options.tls.*`. | Provide CA/cert/key; Chronicle preserves paths for the driver. | Authentication via URI or `options.auth`. |
 | SQL (MariaDB/Postgres) | DSN without TLS extras. | Supply `tls` object (CA/cert/key) or TLS-specific DSN schemes. | Prefer dedicated DB roles with least privilege. |
+| Lattice (execution store) | etcd v3 gRPC; plaintext by default. | Configure TLS at the Lattice cluster; Chronicle connects as a standard etcd client. | Lattice ACLs control key-space access. |
+| Clustor (execution store) | Not supported; mTLS required. | `tls_cert`, `tls_key`, `tls_ca` are required. Peer communication uses mTLS with `trust_domain` verification. | Raft RPC is authenticated by mutual TLS; no additional auth layer. |
 
 General recommendations:
 - Store cert/key material alongside the integration file with restrictive file
@@ -45,6 +47,9 @@ General recommendations:
   data.
 - `/metrics` can reveal connector counts and topic names; avoid making it
   world-readable.
+- `/executions` may expose payload contents from execution slots; apply the
+  same network isolation and auth as `/status`. When `app.state.retention` is
+  `0s`, the endpoint is disabled and returns `501`.
 
 ## 4. Supply Chain & Dependencies
 - Track dependency drift with `tools/audit-deps.sh`; pay attention to security

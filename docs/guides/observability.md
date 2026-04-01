@@ -18,6 +18,10 @@ metrics, dashboards, alerts, and log search workflows. Pair it with
 - **`/metrics`** emits Prometheus text, including readiness gauges
   (`chronicle_app_state`, `chronicle_route_state`, `chronicle_endpoint_state`)
   plus connector/backpressure counters.
+- **`/executions`** exposes retained execution state when `app.state.retention`
+  is non-zero. Query by ID (`/executions/{id}`) or list with filters
+  (`/executions?chronicle=X&status=running&limit=50`). Returns `501` when
+  retention is disabled.
 - Custom paths are normalized (missing `/` prefixes fixed automatically). Secure
   the management surface per `docs/guides/security.md`.
 
@@ -76,6 +80,22 @@ graphs:
 description: Sanity check for expected connector types at startup.
 ```
 
+### Execution State
+```yaml
+title: Execution Throughput
+targets:
+  - expr: rate(chronicle_execution_completed_total[5m])
+    legendFormat: "{{chronicle}} {{status}}"
+description: Completed executions per second by chronicle and outcome.
+```
+```yaml
+title: Active Executions
+targets:
+  - expr: chronicle_execution_active
+    legendFormat: "{{chronicle}}"
+description: In-flight executions per chronicle (retained minus completed).
+```
+
 ## 3. Alert Catalog
 | Alert | Expression | Threshold | Rationale |
 | --- | --- | --- | --- |
@@ -83,6 +103,8 @@ description: Sanity check for expected connector types at startup.
 | `ChronicleKafkaDrainingSlow` | `increase(chronicle_backpressure_kafka_throttled_total[5m])` | >100 /5m | Kafka consumers blocked by downstream dependencies. |
 | `ChronicleErrorRatio` | `rate(chronicle_action_errors_total[5m]) / rate(chronicle_actions_total[5m])` | >0.02 | Chronicle-level failure budget. Use `trace_id` to diagnose. |
 | `ChronicleConfigDrift` | `chronicle_connectors_total{type="none"} != 0` | n/a | Signals invalid config/no connectors loaded. |
+| `ChronicleExecutionStoreErrors` | `increase(chronicle_execution_store_errors_total[5m])` | >0 | Execution store is failing; investigate provider health. Does not affect dispatch. |
+| `ChronicleExecutionBacklog` | `chronicle_execution_active` | >1000 | Executions accumulating faster than completing; check downstream latency. |
 
 ## 4. Logging & Tracing
 - Logs are structured key/value lines: `ts`, `level`, `service`, `component`,
@@ -104,6 +126,10 @@ description: Sanity check for expected connector types at startup.
   sorted by `actions` to find large fan-outs before throttling triggers.
 - **Readiness flaps**: `reason="dependency_update"` grouped by `route` or
   `endpoint`.
+- **Execution stitching**: `execution_id="<value>"` correlates all log lines
+  for a single execution across engine and dispatcher.
+- **Failed executions**: `event="execution_completed" status="failed"` surfaces
+  executions where one or more actions did not succeed.
 
 ## 5. Implementation Checklist
 1. Ensure `management.metrics` is enabled so `/metrics` emits counters above.

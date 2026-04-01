@@ -66,6 +66,25 @@ and `docs/guides/security.md` for telemetry and hardening details.
   depth rarely exceeds half the configured ceiling. Alert expressions live in
   `docs/guides/observability.md`.
 
+### Execution state
+- **Provider selection**: Use `memory` for development and single-node deployments
+  where ephemeral queryability is sufficient. Use `clustor` for multi-node
+  production clusters where execution state must survive leader failure. The
+  `lattice` provider connects to an external Lattice cluster when you need
+  execution state queryable through standard etcd/Redis protocols.
+- **Retention sizing**: `retention` controls how long completed executions remain
+  queryable. For the `memory` provider, retention directly affects heap usage —
+  size it based on expected execution rate and average slot size. For `clustor`,
+  retention governs log compaction eligibility.
+- **Clustor peer configuration**: Configure `peer_addrs` using the
+  `node_id@host:port` format. A 3-node cluster tolerates 1 failure; 5 nodes
+  tolerate 2. All nodes must share the same CA bundle (`tls_ca`) and trust
+  domain. WAL data is stored in `data_dir`; ensure the directory has adequate
+  disk space for the retention window.
+- **Zero-retention default**: With `retention: 0s` (the default), no execution
+  state is retained, the `/executions` endpoint returns `501`, and there is no
+  overhead on the dispatch path.
+
 ## 3. Connector Handling
 - **HTTP clients** reuse a single `reqwest::Client` per connector; set CA and
   optional client cert/key paths relative to the integration file.
@@ -84,6 +103,8 @@ and `docs/guides/security.md` for telemetry and hardening details.
   `chronicle_limits_enforced_total{policy}`, `chronicle_shed_total{route}`, and
   `connector_paused{connector}` to understand when Chronicle is backpressuring.
   Sustained growth means add replicas or widen the relevant `app.limits` knobs.
+  Track `chronicle_execution_active{chronicle}` to monitor in-flight executions
+  and `chronicle_execution_store_errors_total{provider}` for store health.
 - **Plan for failure**: Chronicle treats missing jaq inputs as fatal. Use the
   readiness graph to identify which connectors gate each chronicle and pre-stage
   manual overrides for maintenance. Track `chronicle_half_open_probe_concurrency{endpoint}`
@@ -91,7 +112,9 @@ and `docs/guides/security.md` for telemetry and hardening details.
   probing within budget instead of endlessly flapping.
 - **Management surface**: `/live` only reports process health; `/ready` and
   `/status` mirror the readiness controller with caching to avoid flapping.
-  Refer to `docs/guides/observability.md` for payload schemas before wiring probes.
+  `/executions` exposes retained execution state when `app.state.retention` is
+  non-zero. Refer to `docs/guides/observability.md` for payload schemas before
+  wiring probes.
 - **Runbooks**: Keep per-connector recovery steps handy (broker restarts, flag
   rollbacks, replay scripts). Each should reference the canonical chronicle IDs
   and connector names from the integration file.

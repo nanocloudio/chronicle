@@ -42,7 +42,7 @@ domain model above. Keep the scenarios aligned with these “golden” examples:
 
 | File | Scenario | Highlights |
 | --- | --- | --- |
-| `examples/http_to_kafka.yaml` | HTTP ingest → summary transform → Kafka publish + HTTP response | Demonstrates request handling, slot projection, producer warm-up, and response shaping. |
+| `examples/http_to_kafka.yaml` | HTTP ingest → summary transform → Kafka publish + HTTP response | Demonstrates request handling, slot projection, producer warm-up, response shaping, and execution state retention (`state.provider: memory`, `retention: 5m`). |
 | `examples/http_to_grpc.yaml` | HTTP ingest → envelope shaping → gRPC ingest call | Shows how to normalize the neutral record schema and push it to a remote gRPC service with trace propagation. |
 | `examples/kafka_to_email.yaml` | Kafka summaries → alert email fan-out | Shows Kafka consumer triggers, text+HTML email payload construction, and SMTP delivery. |
 | `examples/grpc_enrichment.yaml` | HTTP ingest → gRPC enrichment → ACK | Covers calling external RPC services with metadata propagation before acknowledging the request. |
@@ -59,6 +59,20 @@ remains reproducible.
   when absolutely necessary.
 - When adding a new example, reference it here with a one-line description and
   update the relevant spec section if new behavior is showcased.
+
+### Querying execution state
+When execution state retention is enabled, use these CLI helpers to inspect
+active and completed executions:
+```sh
+# List recent executions for a chronicle
+curl -s localhost:9090/executions?chronicle=collect_record&limit=10 | jq
+
+# Inspect a specific execution by ID
+curl -s localhost:9090/executions/01912b4c-... | jq
+
+# Filter by status
+curl -s localhost:9090/executions?status=failed | jq '.executions[].execution_id'
+```
 
 ## 5. Contribution Checklist
 1. Copy `examples/spec_connectors.yaml` or another existing file as a starting
