@@ -225,6 +225,7 @@ fn metrics_body(state: &AppState, readiness: Option<&ReadinessSnapshot>) -> Stri
     append_route_queue_depth(&mut output, &connector_metrics);
     append_limit_enforcements(&mut output, &connector_metrics);
     append_route_shed(&mut output, &connector_metrics);
+    append_execution_outcomes(&mut output, &connector_metrics);
 
     output
 }
@@ -595,6 +596,28 @@ fn append_route_shed(output: &mut String, connector_metrics: &RuntimeCountersSna
         output.push_str(&format!(
             "chronicle_shed_total{{route=\"{}\"}} {}\n",
             route, entry.total
+        ));
+    }
+}
+
+fn append_execution_outcomes(output: &mut String, connector_metrics: &RuntimeCountersSnapshot) {
+    if connector_metrics.execution_outcomes.is_empty() {
+        return;
+    }
+
+    output.push_str(
+        "# HELP chronicle_execution_completed_total Completed executions per chronicle and status\n",
+    );
+    output.push_str("# TYPE chronicle_execution_completed_total counter\n");
+    for entry in &connector_metrics.execution_outcomes {
+        let chronicle = bounded_label(&entry.chronicle);
+        output.push_str(&format!(
+            "chronicle_execution_completed_total{{chronicle=\"{}\",status=\"succeeded\"}} {}\n",
+            chronicle, entry.succeeded
+        ));
+        output.push_str(&format!(
+            "chronicle_execution_completed_total{{chronicle=\"{}\",status=\"failed\"}} {}\n",
+            chronicle, entry.failed
         ));
     }
 }

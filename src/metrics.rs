@@ -114,6 +114,10 @@ impl MetricsCollector {
     pub fn record_route_shed(&self, route: &str) {
         self.counters.record_route_shed(route);
     }
+
+    pub fn record_execution_completed(&self, chronicle: &str, succeeded: bool) {
+        self.counters.record_execution_completed(chronicle, succeeded);
+    }
 }
 
 /// Returns the shared `MetricsCollector` instance.

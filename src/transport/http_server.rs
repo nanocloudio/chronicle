@@ -27,6 +27,7 @@ use chronicle_core::chronicle::engine::{
 };
 use chronicle_core::config::integration::AppConfig;
 use chronicle_core::integration::factory::ConnectorFactoryRegistry;
+use chronicle_core::metrics::metrics;
 use chronicle_core::retry::retry_after_seconds_from_budget;
 use chrono::Utc;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -414,11 +415,15 @@ async fn handle_http_trigger(
                 .dispatch(&route.chronicle, &execution.actions, delivery_ctx)
                 .await
             {
-                Ok(()) => {}
+                Ok(_outcomes) => {
+                    metrics().record_execution_completed(&route.chronicle, true);
+                }
                 Err(ActionDispatchError::RetryBudgetExhausted { .. }) => {
+                    metrics().record_execution_completed(&route.chronicle, false);
                     return Ok(build_budget_exhausted_response(&route.chronicle));
                 }
                 Err(err) => {
+                    metrics().record_execution_completed(&route.chronicle, false);
                     error!(
                         chronicle = %route.chronicle,
                         error = %err,

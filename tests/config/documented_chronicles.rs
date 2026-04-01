@@ -138,6 +138,7 @@ impl DocumentedChronicleHarness {
         self.dispatcher
             .dispatch(&execution.name, &execution.actions, context)
             .await
+            .map(|_outcomes| ())
             .map_err(|err| anyhow!("dispatch failed: {err:?}"))
     }
 }

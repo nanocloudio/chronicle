@@ -25,6 +25,7 @@
 //! - Handle circuit breaker patterns for connector health
 
 use crate::chronicle::engine::ChronicleAction;
+use crate::chronicle::state::{ActionOutcome, ActionStatus};
 use crate::chronicle_event;
 #[cfg(feature = "http-out")]
 use crate::codec::http::{
@@ -1032,7 +1033,7 @@ impl ActionDispatcher {
         route: &str,
         actions: &[ChronicleAction],
         context: DeliveryContext<'_>,
-    ) -> Result<(), ActionDispatchError> {
+    ) -> Result<Vec<ActionOutcome>, ActionDispatchError> {
         self.dispatch_with_fallback(route, actions, context).await
     }
 
@@ -1041,7 +1042,9 @@ impl ActionDispatcher {
         route: &str,
         actions: &[ChronicleAction],
         context: DeliveryContext<'_>,
-    ) -> Result<(), ActionDispatchError> {
+    ) -> Result<Vec<ActionOutcome>, ActionDispatchError> {
+        let mut outcomes = Vec::with_capacity(actions.len());
+
         for (index, action) in actions.iter().enumerate() {
             let kind = action_kind(action);
             let connector_name = action_connector(action).map(|name| name.to_string());
@@ -1053,6 +1056,12 @@ impl ActionDispatcher {
                 match self.dispatch_action(route, action).await {
                     Ok(()) => {
                         record_dependency_success(self, connector_name.as_deref()).await;
+                        outcomes.push(ActionOutcome {
+                            action_index: index,
+                            status: ActionStatus::Succeeded,
+                            duration: attempt_window.elapsed(),
+                            error: None,
+                        });
                         break;
                     }
                     Err(source) => {
@@ -1109,6 +1118,12 @@ impl ActionDispatcher {
                                                 error = %err,
                                                 "fallback dispatch failed"
                                             );
+                                            outcomes.push(ActionOutcome {
+                                                action_index: index,
+                                                status: ActionStatus::Failed,
+                                                duration: attempt_window.elapsed(),
+                                                error: Some(err.to_string()),
+                                            });
                                             return Err(err);
                                         }
                                     }
@@ -1124,8 +1139,22 @@ impl ActionDispatcher {
                         }
 
                         if handled_by_fallback {
+                            outcomes.push(ActionOutcome {
+                                action_index: index,
+                                status: ActionStatus::Succeeded,
+                                duration: attempt_window.elapsed(),
+                                error: None,
+                            });
                             break;
                         }
+
+                        let error_msg = source.to_string();
+                        outcomes.push(ActionOutcome {
+                            action_index: index,
+                            status: ActionStatus::Failed,
+                            duration: attempt_window.elapsed(),
+                            error: Some(error_msg),
+                        });
 
                         if !record_retry_failure(self, route).await {
                             return Err(ActionDispatchError::RetryBudgetExhausted {
@@ -1145,7 +1174,7 @@ impl ActionDispatcher {
             }
         }
 
-        Ok(())
+        Ok(outcomes)
     }
 
     async fn dispatch_without_fallback(

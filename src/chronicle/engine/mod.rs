@@ -30,6 +30,7 @@ mod loader;
 use loader::{build_serialize_plan, clone_object, take_string, SerializePhasePlan};
 
 use crate::chronicle::context::{ContextError, ExecutionContext, ExecutionObservability};
+use crate::chronicle::state::ExecutionId;
 use crate::config::integration::{
     AppConfig, ChronicleDefinition, ChroniclePhase, ChroniclePolicy, DeliveryPolicy,
     HalfOpenPolicy, IntegrationConfig, OptionMap, OverflowPolicy, PhaseKind, RetryBudget,
@@ -96,6 +97,9 @@ impl ChronicleEngine {
 
         let _inflight_guard = plan.concurrency().acquire(&plan.name)?;
 
+        let execution_id = ExecutionId::new();
+        let created_at = std::time::Instant::now();
+
         let mut context = ExecutionContext::new();
         context.insert_slot(0, trigger_payload);
 
@@ -108,6 +112,7 @@ impl ChronicleEngine {
             target: "chronicle::engine",
             "chronicle",
             chronicle = %plan.name,
+            execution_id = %execution_id,
             trace_id = trace_field,
             record_id = record_field
         );
@@ -117,6 +122,7 @@ impl ChronicleEngine {
             target: "chronicle::engine",
             event = "chronicle_started",
             chronicle = %plan.name,
+            execution_id = %execution_id,
             trigger = plan.trigger_kind(),
             phases = plan.phases.len(),
             trace_id = trace_field,
@@ -201,7 +207,9 @@ impl ChronicleEngine {
             target: "chronicle::engine",
             event = "chronicle_completed",
             chronicle = %plan.name,
+            execution_id = %execution_id,
             phases = plan.phases.len(),
+            actions = actions.len(),
             response = response
                 .as_ref()
                 .map(|resp| resp.status)
@@ -211,6 +219,8 @@ impl ChronicleEngine {
         );
 
         Ok(ChronicleExecution {
+            execution_id,
+            created_at,
             name: plan.name,
             actions,
             context: context_snapshot,
@@ -1715,6 +1725,8 @@ fn map_context_error(
 
 #[derive(Clone, Debug)]
 pub struct ChronicleExecution {
+    pub execution_id: ExecutionId,
+    pub created_at: std::time::Instant,
     pub name: String,
     pub actions: Vec<ChronicleAction>,
     pub context: Vec<JsonValue>,

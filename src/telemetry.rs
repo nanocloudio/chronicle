@@ -189,6 +189,7 @@ pub struct RuntimeCounters {
     route_queue_depth: RouteQueueDepthRegistry,
     limit_enforcements: LimitEnforcementRegistry,
     route_shed: RouteShedRegistry,
+    execution_outcomes: ExecutionOutcomeRegistry,
     http_requests: HttpRequestMetrics,
 }
 
@@ -207,6 +208,7 @@ pub struct RuntimeCountersSnapshot {
     pub route_queue_depth: Vec<RouteQueueDepthSnapshot>,
     pub limit_enforcements: Vec<LimitEnforcementSnapshot>,
     pub route_shed: Vec<RouteShedSnapshot>,
+    pub execution_outcomes: Vec<ExecutionOutcomeSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -272,6 +274,13 @@ pub struct LimitEnforcementSnapshot {
 pub struct RouteShedSnapshot {
     pub route: String,
     pub total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionOutcomeSnapshot {
+    pub chronicle: String,
+    pub succeeded: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,6 +457,7 @@ impl RuntimeCounters {
             route_queue_depth: self.route_queue_depth.snapshot(),
             limit_enforcements: self.limit_enforcements.snapshot(),
             route_shed: self.route_shed.snapshot(),
+            execution_outcomes: self.execution_outcomes.snapshot(),
         }
     }
 
@@ -494,6 +504,10 @@ impl RuntimeCounters {
 
     pub fn record_route_shed(&self, route: &str) {
         self.route_shed.record(route);
+    }
+
+    pub fn record_execution_completed(&self, chronicle: &str, succeeded: bool) {
+        self.execution_outcomes.record(chronicle, succeeded);
     }
 }
 
@@ -710,6 +724,45 @@ impl RouteShedRegistry {
             .collect()
     }
 }
+#[derive(Default)]
+struct ExecutionOutcomeRegistry {
+    inner: Mutex<BTreeMap<String, ExecutionOutcomeEntry>>,
+}
+
+#[derive(Default)]
+struct ExecutionOutcomeEntry {
+    succeeded: u64,
+    failed: u64,
+}
+
+impl ExecutionOutcomeRegistry {
+    fn record(&self, chronicle: &str, succeeded: bool) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        let entry = guard.entry(chronicle.to_string()).or_default();
+        if succeeded {
+            entry.succeeded = entry.succeeded.saturating_add(1);
+        } else {
+            entry.failed = entry.failed.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ExecutionOutcomeSnapshot> {
+        let Ok(guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .map(|(chronicle, entry)| ExecutionOutcomeSnapshot {
+                chronicle: chronicle.clone(),
+                succeeded: entry.succeeded,
+                failed: entry.failed,
+            })
+            .collect()
+    }
+}
+
 fn encode_field_value(value: &str) -> String {
     let needs_quotes = value.chars().any(|c| {
         c.is_whitespace()
