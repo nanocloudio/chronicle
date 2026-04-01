@@ -79,6 +79,7 @@ management:
 | `retry_budget.max_attempts` | integer | `5` | Global retry ceiling; intersected with connector/route/phase budgets using the most conservative value. |
 | `retry_budget.base_backoff` / `max_backoff` | duration | `50ms` / `5s` | Bounds exponential backoff windows; `max_backoff` must be ≤ `max_elapsed`. |
 | `retry_budget.jitter` | `none`\|`equal`\|`full` | `full` | Default jitter applied to any retry plan lacking an explicit jitter selection. |
+| `state` | object | `{ provider: memory, retention: 0s }` | Execution state retention configuration. See §1.10. |
 
 `docs/reference/chronicle.schema.json` enumerates every nested field and default shown above so schema-aware tooling can validate configs without reverse-engineering this document.
 
@@ -125,6 +126,9 @@ app:
   half_open_counts_as_ready: route
   warmup_timeout: 30s
   readiness_cache: 250ms
+  state:
+    provider: memory
+    retention: 1h
   limits:
     routes:
       max_inflight: 1024
@@ -234,7 +238,7 @@ management:
 ```
 This sample demonstrates how warm-up, circuit breakers, and route policy combine with chronicles to drive readiness.
 
-### 1.3 Schema Versioning and Compatibility
+### 1.4 Schema Versioning and Compatibility
 - `api_version` is required and currently accepts `v1`. Configuration loading fails if the file omits the field or advertises an unsupported version.
 - Version bumps are monotonic and communicate breaking or additive changes. Operators should stage upgrades by validating configs against the new schema before rolling out binaries.
 - Feature gates are exposed through `app.feature_flags` to permit opt-in previews while keeping the base schema stable. Unknown gates trigger validation errors. Chronicle currently recognises `rabbitmq`, `mqtt`, `mongodb`, `redis`, `parallel_phase`, and `serialize_phase`; the first four enable their corresponding connector families while the latter two guard the experimental phase executors. Validation fails when a gated connector or phase is configured without the matching feature flag.
@@ -270,7 +274,7 @@ This sample demonstrates how warm-up, circuit breakers, and route policy combine
 - The JSON Schema also encodes cross-scope comparisons (`policy.limits ≤ app.limits`, `max_backoff ≤ max_elapsed`, connector role separation, etc.) and is exercised by regression fixtures under `tests/fixtures/*`. Add a fixture whenever you introduce a new validation rule so CI catches drift early.
 - `api_version: v1.1` is reserved for the next wave of additive features (streaming/serialization improvements). New behaviour should be hidden behind feature flags until the version bump is declared so upgrades remain predictable.
 
-### 1.4 Limits and Flow Control
+### 1.5 Limits and Flow Control
 - `app.limits.routes.max_inflight` caps concurrent executions per route. Work beyond the threshold follows `overflow_policy` (`reject`, `queue`, or `shed`). `queue` uses an in-memory bounded queue governed by `max_queue_depth`. Operators are expected to set the field explicitly (the recommended starting value is `1024`). Selecting `overflow_policy: queue` without providing `max_queue_depth` is a validation error that reminds operators of the recommended starting point: `limits.routes.max_queue_depth must be set (default 1024) when overflow_policy=queue`.
 - **Overflow semantics**
   - `reject`: surplus work is denied immediately. HTTP triggers respond with `429 Too Many Requests` (and `Retry-After`) when the rejection is purely due to concurrency/queue pressure, or `503 Service Unavailable` when readiness is already `NOT_READY`. Async triggers (Kafka, RabbitMQ, MQTT) do not acknowledge or commit the event; it remains in the source system for later re-processing.
@@ -283,7 +287,7 @@ This sample demonstrates how warm-up, circuit breakers, and route policy combine
 - All numeric limits must be greater than zero. Selecting `overflow_policy: queue` (globally or per-route) requires `max_queue_depth` so the in-memory buffer remains bounded.
 - **Limit precedence:** Connector-specific ceilings (e.g., `kafka.max_inflight_per_partition`, DB pool sizes) are enforced first, followed by route-level overrides, then application-wide defaults. Route limits may only lower the effective ceiling; they cannot raise a connector/app limit. Validation enforces `policy.limits.max_inflight ≤ app.limits.routes.max_inflight` and similar per-transport rules (`policy.limits.http.max_concurrency` cannot exceed `app.limits.http.max_concurrency`, etc.). If operators need a higher ceiling for a subset of routes, they must raise the app-level default (or declare a dedicated connector) first.
 
-### 1.5 Retry Budgets
+### 1.6 Retry Budgets
 - `app.retry_budget` defines the global retry envelope applied when routes or connectors omit explicit overrides. Budgets combine attempt counts, elapsed time ceilings, exponential backoff, and jitter (`none`, `equal`, or `full`).
 - Routes may override budgets inside `policy.retry_budget`. Connector-level budgets can further tighten retries for specific external systems; when provided, the effective policy is the intersection of application, route, and connector budgets.
 - Circuit breakers honour budgets by failing fast when the remaining elapsed budget cannot accommodate another attempt. Budget exhaustion transitions the route to `NOT_READY` and increments breaker failure metrics.
@@ -325,13 +329,13 @@ fn effective_retry_budget(scopes: &[RetryBudget]) -> RetryBudget {
 `most_conservative` resolves to `none < equal < full`, mirroring the precedence rules above: the runtime deliberately applies the jitter configuration that introduces the most randomness to avoid synchronized retries when any scope opts in to additional jitter.
 This helper assumes `RetryBudget: Clone`, which matches the concrete implementation in the runtime.
 
-### 1.6 Half-Open Readiness Policy
+### 1.7 Half-Open Readiness Policy
 - `app.half_open_counts_as_ready` controls whether endpoints or routes in `CB_HALF_OPEN` state count toward readiness gates. Accepted values are `never`, `endpoint`, and `route`. `route` (the default) allows half-open endpoints to contribute to route readiness but still logs a degraded warning; `never` enforces a stricter posture.
 - Overrides can be set per route via `policy.half_open_counts_as_ready`, enabling critical flows to demand proven recovery while less critical paths resume sooner.
 - The controller permits at most two concurrent probes per endpoint while it is half-open. This cap is a compile-time constant (currently fixed at two probes with no configuration knob) so operators can reason about probe load. Each probe consumes from the same retry budget that governs steady-state delivery, so repeated probe failures both delay recovery and emit `chronicle_half_open_probe_concurrency{endpoint}` and `chronicle_retry_budget_exhausted_total` metrics. When the budget cannot cover another probe (attempt count or elapsed ceiling), the breaker remains `CB_OPEN` until the global budget is refreshed.
 - The retry envelope is shared: when the global/app-level budget refreshes, both steady-state delivery attempts and half-open probes regain eligibility at the same time; there is no separate half-open pool. This keeps breaker healing and production traffic aligned while preventing hidden extra retries.
 
-### 1.7 Duration and Clock Semantics
+### 1.8 Duration and Clock Semantics
 - All durations use Go-style strings (`1s`, `150ms`, `2m30s`). Numeric millisecond suffixes are deprecated and rejected in `api_version: v1`. Warm-up, drain, and retry/backoff durations must be greater than zero; zero-valued windows are rejected during validation.
 - `Retry-After` headers and management timestamps derive from the monotonic-clock-backed system time. Chronicle tolerates ±2 s skew when comparing client-provided timestamps; larger differences emit warnings.
 - Warm-up, retry, and readiness timers rely on monotonic sources where available to prevent retrograde time jumps from unblocking gates prematurely.
@@ -357,9 +361,52 @@ This helper assumes `RetryBudget: Clone`, which matches the concrete implementat
 | Readiness cache (`app.readiness_cache`) | ≥50 ms, default 250 ms |
 - These tolerances are currently fixed; if your environment requires looser settings, adjust host-level NTP rather than Chronicle's configuration.
 
-### 1.8 Lifecycle Controls
+### 1.9 Lifecycle Controls
 - `app.drain_timeout` (default `30s`) bounds graceful shutdown. The controller enforces a hard stop five seconds after the deadline to avoid hung drains.
 - Chronicle currently requires a process restart to pick up new configuration. Hot reload endpoints are not available in this release.
+
+### 1.10 Execution State
+Every chronicle execution is assigned a unique `execution_id` (UUIDv7, time-ordered), a `created_at` timestamp, and outcome tracking for each dispatched action. Where execution state is retained is a deployment decision controlled by `app.state`.
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `state.provider` | `memory` \| `lattice` \| `clustor` | `memory` | Where execution state is stored. |
+| `state.retention` | duration | `0s` | How long completed executions are retained. `0s` disables retention entirely. |
+| `state.endpoint` | string | — | Required when `provider` is `lattice`. Lattice gRPC endpoint (etcd v3 protocol). |
+| `state.prefix` | string | `/chronicle/exec/` | Key prefix for the Lattice keyspace. |
+| `state.node_id` | string | — | Required when `provider` is `clustor`. Unique identifier for this Raft node. |
+| `state.peer_addrs` | list | — | Required when `provider` is `clustor`. Raft peer addresses in `node_id@host:port` format. |
+| `state.data_dir` | string | — | Required when `provider` is `clustor`. Directory for WAL and snapshot data. |
+| `state.raft_bind` | string | — | Required when `provider` is `clustor`. Address for the Raft RPC listener. |
+| `state.tls_cert` | string | — | Required when `provider` is `clustor`. Path to the TLS certificate chain. |
+| `state.tls_key` | string | — | Required when `provider` is `clustor`. Path to the TLS private key. |
+| `state.tls_ca` | string | — | Required when `provider` is `clustor`. Path to the CA bundle for peer verification. |
+| `state.trust_domain` | string | — | Required when `provider` is `clustor`. mTLS trust domain for peer validation. |
+
+**Providers:**
+
+- **`memory`** (default): In-process `BTreeMap` with lazy TTL eviction. No external dependencies. When `retention` is `0s`, no state is retained and the `/executions` management endpoint returns `501 Not Implemented`.
+- **`lattice`**: Chronicle connects to an external Lattice cluster as a client using the etcd v3 gRPC protocol. Execution state is durable, revision-tracked, and queryable through standard etcd/Redis/Memcached clients.
+- **`clustor`**: Chronicle embeds a Clustor Raft group (Execution Raft Group, ERG). Execution state is replicated across Chronicle peers via mTLS-authenticated Raft consensus. No external state service required.
+
+**Execution lifecycle:**
+
+Each execution progresses through a status derived from its action outcomes:
+
+| Status | Condition |
+| --- | --- |
+| `running` | Execution has been retained but dispatch has not completed. |
+| `succeeded` | All actions completed successfully. |
+| `failed` | One or more actions failed and `allow_partial_delivery` is not set. |
+| `partial_success` | Some actions succeeded, some failed, and `allow_partial_delivery` is set. |
+
+**Normative rules:**
+
+- Execution state retention MUST NOT affect delivery semantics. A store failure MUST NOT prevent action dispatch. The store is observational.
+- `retention` follows the duration rules in §1.8. `0s` is the only accepted zero-valued duration; it disables retention rather than being rejected as an error.
+- When `provider` is `clustor`, all TLS fields (`tls_cert`, `tls_key`, `tls_ca`, `trust_domain`) are required. Omitting any is a validation error.
+- When `provider` is `lattice`, `endpoint` is required. Omitting it is a validation error.
+- Unknown keys within `app.state` are rejected (`deny_unknown_fields`).
 
 ## 2. Connectors
 
@@ -1353,6 +1400,7 @@ management:
   ready: { path: /ready }
   metrics: { path: /metrics }
   status: { path: /status }
+  executions: { path: /executions }
 ```
 - `port` is required when management block exists.
 - `live` enables the liveness probe endpoint (default `/live`).
@@ -1360,6 +1408,7 @@ management:
 - `metrics` enables `/metrics` endpoint.
 - If both `live` and `ready` are omitted, the management server still starts but only exposes the endpoints that are configured.
 - `status` exposes a JSON payload summarising application, route, and endpoint state; defaults to `/status` when present.
+- `executions` enables the execution state query endpoint (default `/executions`). Returns `501 Not Implemented` when `app.state.retention` is `0s`. Automatically enabled when retention is configured.
 - Configuration reloads via HTTP are not supported; restart the process to pick up a new integration file.
 
 ### 9.1 Health Endpoints
@@ -1389,6 +1438,57 @@ management:
 - Timestamps use RFC3339 format for easy machine parsing.
 - Sensitive connector fields (passwords, tokens, private keys) are redacted to `"<redacted>"` before serialization. File paths remain visible for audit.
 - Snapshots are atomic: during restarts every `/status` response reflects either the pre-restart or post-restart dependency graph in full, never a mix of partially swapped endpoints.
+
+### 9.3 Executions Endpoint
+The `/executions` endpoint exposes retained execution state. It is available only when `app.state.retention` is non-zero; otherwise both paths return `501 Not Implemented`.
+
+**`GET /executions/{id}`** returns a single execution snapshot:
+```json
+{
+  "execution_id": "01912b4c-...",
+  "chronicle": "fleet_update",
+  "trace_id": "abc-123",
+  "record_id": "rec-456",
+  "status": "succeeded",
+  "created_at": "2026-03-31T14:22:01Z",
+  "completed_at": "2026-03-31T14:22:01.142Z",
+  "slots": [ { "..." : "..." } ],
+  "outcomes": [
+    { "action_index": 0, "status": "succeeded", "duration": 42, "error": null },
+    { "action_index": 1, "status": "succeeded", "duration": 108, "error": null }
+  ]
+}
+```
+- `200 OK` when the execution exists.
+- `404 Not Found` with `{"error":"execution \`<id>\` not found"}` when the ID is unknown or has been evicted.
+- `501 Not Implemented` when retention is disabled.
+- Duration values in `outcomes` are milliseconds.
+
+**`GET /executions`** lists executions matching optional query parameters:
+
+| Parameter | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `chronicle` | string | — | Filter by chronicle name. |
+| `status` | `running` \| `succeeded` \| `failed` \| `partial_success` | — | Filter by execution status. |
+| `limit` | integer | `100` | Maximum number of results. |
+
+Response:
+```json
+{
+  "executions": [
+    {
+      "execution_id": "01912b4c-...",
+      "chronicle": "fleet_update",
+      "status": "succeeded",
+      "created_at": "2026-03-31T14:22:01Z",
+      "action_count": 2,
+      "succeeded_count": 2,
+      "failed_count": 0
+    }
+  ]
+}
+```
+Results are ordered by `execution_id` descending (most recent first).
 
 ---
 
@@ -1460,12 +1560,15 @@ See `docs/design/rabbitmq_trigger_state_machine.md` for the lower-level RabbitMQ
 6. On trigger activation:
    - Consult readiness cache; reject early if the route is not ready.
    - Capture the inbound payload as structured JSON in slot `.[0]`.
+   - Assign a unique `execution_id` (UUIDv7) and record `created_at`.
+   - If execution state is retained (`app.state.retention > 0s`), persist the initial execution snapshot to the configured provider.
    - Execute each phase in order:
      - Resolve required jaq expressions.
      - Execute the phase operation (pure transforms first, endpoint interactions last).
      - Persist the resulting JSON into the next slot.
-   - On success, return or commit result.
-   - On failure, apply delivery policy (retries, breaker accounting) and record telemetry before aborting or retrying as configured.
+   - On success, return or commit result. Record action outcomes and execution status.
+   - On failure, apply delivery policy (retries, breaker accounting) and record telemetry before aborting or retrying as configured. Record partial action outcomes.
+   - If execution state is retained, persist the completed execution snapshot with outcomes and final status. Provider failure is logged but does not affect delivery.
 
 ### 10.5 Graceful Shutdown
 - Enter `DRAINING` upon receiving termination signals.
@@ -1499,6 +1602,11 @@ All Chronicle-specific metrics emitted via `/metrics` share the `chronicle_` pre
 - `chronicle_retry_attempts_total{route,endpoint,reason}` counts actual retry attempts, differentiating warm-up probes, half-open probes, and steady-state delivery.
 - `chronicle_half_open_probe_concurrency{endpoint}` gauge reports how many concurrent probes are active per endpoint while breakers are `CB_HALF_OPEN`.
 - `chronicle_parallel_children_total{route,phase,status}` tracks the final outcome of each child inside parallel phases without exposing per-child names as labels.
+- `chronicle_execution_completed_total{chronicle,status}` counter for completed executions, labelled by chronicle name and outcome (`succeeded`, `failed`).
+- `chronicle_execution_active{chronicle}` gauge reports the number of in-flight executions per chronicle (incremented on retain, decremented on complete).
+- `chronicle_execution_retained_total{chronicle}` counter for executions retained in the execution store.
+- `chronicle_execution_store_errors_total{provider}` counter for store operation failures; incremented silently without affecting dispatch.
+- `chronicle_execution_duration_seconds{chronicle}` histogram tracking end-to-end execution time from trigger to dispatch completion.
 - Histogram series currently omit exemplars/span links; exporters MAY add them in the future once tracing IDs are stable.
 - Example emit for the HTTP → Kafka sample route:
   ```text
@@ -1511,13 +1619,13 @@ All Chronicle-specific metrics emitted via `/metrics` share the `chronicle_` pre
 - All duration-bearing series terminate in `_seconds` to follow Prometheus conventions; consumers should not expect millisecond-scale units.
 
 ### 11.2 Logs
-- Structured logs include `route`, `endpoint`, `state_from`, `state_to`, `reason`, `correlation_id`, and `trace_id`.
+- Structured logs include `route`, `endpoint`, `state_from`, `state_to`, `reason`, `correlation_id`, `trace_id`, and `execution_id`.
 - Warm-up events, circuit breaker transitions, retries, and readiness changes emit explicit log entries for audit.
 - Connector components should log pause/resume actions with partition/topic details to ease Kafka debugging.
-- `/status.ts` and log timestamps are both emitted in UTC using the same monotonic-backed system clock, so correlating readiness events with log lines requires no skew adjustment beyond the ±2 s tolerance described in Section 1.7.
+- `/status.ts` and log timestamps are both emitted in UTC using the same monotonic-backed system clock, so correlating readiness events with log lines requires no skew adjustment beyond the ±2 s tolerance described in §1.8.
 
 ### 11.3 Tracing
-- Spans cover the entire flow from connector receive → transforms → endpoint interactions.
+- Spans cover the entire flow from connector receive → transforms → endpoint interactions. The `chronicle` span includes `execution_id`, `trace_id`, and `record_id` fields.
 - Circuit breaker and warm-up details are tagged on spans (`cb_state`, `warmup=true/false`).
 - Trace contexts adhere to the W3C `traceparent`/`tracestate` format. HTTP triggers read and forward these headers; Kafka, RabbitMQ, and MQTT transports map them to message headers/properties so downstream systems can stitch timelines together.
 
@@ -1547,6 +1655,7 @@ All Chronicle-specific metrics emitted via `/metrics` share the `chronicle_` pre
 13. **Integration tests**: validate warm-up gating, readiness transitions, chaos cases (broker flaps, TLS expiry, slowloris HTTP), and jaq/dependency inference fixtures.
 14. **Validation CLI**: keep the `chronicle validate` command wired to the runtime loader so CI/lint hooks enforce the same schema (role inference, limit inequalities, feature flags) that production binaries expect.
 15. **Constraint fixtures**: add regression YAMLs covering cross-scope constraints (budget intersections, `policy.limits ≤ app.limits`, kafka idempotence requirements) so schema or code changes cannot loosen guarantees silently.
+16. **Execution state**: assign execution identity (UUIDv7), collect action outcomes, persist to configured provider, expose via `/executions` management endpoint.
 
 ### 12.1 Runtime isolation and thread-safety
 - Chronicle runs on Tokio; every connector handle must be `Send + Sync` so routes can share pools across worker tasks without cloning transports per request.
@@ -1582,6 +1691,7 @@ All Chronicle-specific metrics emitted via `/metrics` share the `chronicle_` pre
 4. **Recovery:** Endpoints attempt reconnection with exponential backoff and jitter. Successful probes transition circuit breakers Half-Open → Closed, restore route readiness, and resume Kafka consumption or HTTP acceptance.
 5. **Isolation:** Failures in one Route's Endpoint do not block unrelated Routes unless required by `app.min_ready_routes`. Circuit breaker state is per endpoint instance.
 6. **Observability:** Metrics, logs, and `/status` entries exist for every state transition, circuit breaker change, and warm-up event to support troubleshooting.
+7. **Execution State:** With `app.state.retention` set to a non-zero duration, every execution is queryable via `/executions/{id}` with correct slots, outcomes, and status. With retention at `0s`, the endpoint returns `501` and dispatch behaviour is unchanged.
 
 ---
 
@@ -1594,6 +1704,7 @@ All Chronicle-specific metrics emitted via `/metrics` share the `chronicle_` pre
 | Kafka produce & consume | `kafka_phase_duration_seconds`, `kafka_poll_duration_seconds` | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1 |
 | Database phases (Postgres, MariaDB, MongoDB) | `db_phase_duration_seconds` | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
 | Cache & queue clients (Redis, RabbitMQ, MQTT) | `cache_phase_duration_seconds` | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 |
+| Execution lifecycle | `chronicle_execution_duration_seconds` | 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 |
 
 Buckets are immutable per transport to avoid scrape churn. Custom transports must either reuse one of the tables above or contribute an addition to this appendix before merging.
 
@@ -1601,9 +1712,19 @@ Buckets are immutable per transport to avoid scrape churn. Custom transports mus
 
 | Path | Description | Section |
 | --- | --- | --- |
-| `app.retry_budget.*` | Global retry defaults (attempts, elapsed, backoff, jitter). | §1.5 |
-| `app.limits.routes.*` | Application-wide concurrency/overflow defaults. | §1.4 |
-| `app.feature_flags[]` | Enables connector/phase families guarded by feature gates. | §1.3 |
+| `app.retry_budget.*` | Global retry defaults (attempts, elapsed, backoff, jitter). | §1.6 |
+| `app.limits.routes.*` | Application-wide concurrency/overflow defaults. | §1.5 |
+| `app.feature_flags[]` | Enables connector/phase families guarded by feature gates. | §1.4 |
+| `app.state.provider` | Execution state provider (`memory`, `lattice`, `clustor`). | §1.10 |
+| `app.state.retention` | How long completed executions are retained. | §1.10 |
+| `app.state.endpoint` | Lattice gRPC endpoint (required for lattice provider). | §1.10 |
+| `app.state.prefix` | Lattice key prefix. | §1.10 |
+| `app.state.node_id` | Clustor Raft node identifier (required for clustor provider). | §1.10 |
+| `app.state.peer_addrs` | Clustor Raft peer addresses (required for clustor provider). | §1.10 |
+| `app.state.data_dir` | Clustor WAL/snapshot directory (required for clustor provider). | §1.10 |
+| `app.state.raft_bind` | Clustor Raft RPC bind address (required for clustor provider). | §1.10 |
+| `app.state.tls_cert`, `.tls_key`, `.tls_ca` | Clustor TLS credentials (required for clustor provider). | §1.10 |
+| `app.state.trust_domain` | Clustor mTLS trust domain (required for clustor provider). | §1.10 |
 | `connectors[].warmup`, `.cb.*`, `.limits.*`, `.retry_budget.*` | Cross-cutting connector knobs applied per endpoint. | §2.1 |
 | `chronicles[].policy.delivery.*` | Route-level delivery policy inherited by outbound phases. | §3.3 |
 | `chronicles[].policy.retry_budget.*` | Route-specific retry intersection overrides. | §3.3 |
@@ -1611,3 +1732,4 @@ Buckets are immutable per transport to avoid scrape churn. Custom transports mus
 | `phases[].timeout` | Per-phase execution bound for outbound work. | §4.1 |
 | `phases[].options.connector` | Reference to connector/endpoint used by the phase. | §5.* |
 | `management.ready.path`, `.status.path` | Custom management endpoint routing. | §9 |
+| `management.executions.path` | Execution state query endpoint. | §9.3 |

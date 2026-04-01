@@ -3,6 +3,9 @@ api_version: v1
 app:
   min_ready_routes: all
   readiness_cache: 250ms
+  state:
+    provider: memory
+    retention: 1h
 
 connectors:
 
@@ -168,3 +171,5 @@ management:
     path: /health
   metrics:
     path: /metrics
+  executions:
+    path: /executions

@@ -102,8 +102,53 @@
         },
         "retry_budget": {
           "$ref": "#/$defs/retry_budget"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
         }
       }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["memory", "lattice", "clustor"],
+          "default": "memory"
+        },
+        "retention": {
+          "type": "string",
+          "pattern": "^(0s|(?=.*[1-9])[0-9]+(ns|us|µs|ms|s|m|h|d)([0-9]+(ns|us|µs|ms|s|m|h|d))*)$",
+          "default": "0s",
+          "description": "Duration for which completed executions are retained. 0s disables retention."
+        },
+        "endpoint": { "type": "string", "description": "Lattice gRPC endpoint (required for lattice provider)." },
+        "prefix": { "type": "string", "default": "/chronicle/exec/" },
+        "node_id": { "type": "string", "description": "Raft node identifier (required for clustor provider)." },
+        "peer_addrs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Raft peer addresses in node_id@host:port format (required for clustor provider)."
+        },
+        "data_dir": { "type": "string", "description": "WAL and snapshot directory (required for clustor provider)." },
+        "raft_bind": { "type": "string", "description": "Raft RPC bind address (required for clustor provider)." },
+        "tls_cert": { "type": "string", "description": "TLS certificate chain path (required for clustor provider)." },
+        "tls_key": { "type": "string", "description": "TLS private key path (required for clustor provider)." },
+        "tls_ca": { "type": "string", "description": "CA bundle path for peer verification (required for clustor provider)." },
+        "trust_domain": { "type": "string", "description": "mTLS trust domain (required for clustor provider)." }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "provider": { "const": "lattice" } } },
+          "then": { "required": ["endpoint"] }
+        },
+        {
+          "if": { "properties": { "provider": { "const": "clustor" } } },
+          "then": { "required": ["node_id", "peer_addrs", "data_dir", "raft_bind", "tls_cert", "tls_key", "tls_ca", "trust_domain"] }
+        }
+      ]
     },
     "retry_budget": {
       "type": "object",
@@ -125,7 +170,8 @@
         "live": {"$ref": "#/$defs/path"},
         "ready": {"$ref": "#/$defs/path"},
         "metrics": {"$ref": "#/$defs/path"},
-        "status": {"$ref": "#/$defs/path"}
+        "status": {"$ref": "#/$defs/path"},
+        "executions": {"$ref": "#/$defs/path"}
       },
       "additionalProperties": false
     },
