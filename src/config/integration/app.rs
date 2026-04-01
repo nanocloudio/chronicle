@@ -104,8 +104,14 @@ pub enum StateProvider {
         prefix: String,
     },
     Clustor {
+        node_id: String,
         peer_addrs: Vec<String>,
         data_dir: PathBuf,
+        raft_bind: String,
+        tls_cert: PathBuf,
+        tls_key: PathBuf,
+        tls_ca: PathBuf,
+        trust_domain: String,
     },
 }
 
@@ -217,9 +223,21 @@ pub(crate) struct RawStateSection {
     #[serde(default)]
     pub(crate) prefix: Option<String>,
     #[serde(default)]
+    pub(crate) node_id: Option<String>,
+    #[serde(default)]
     pub(crate) peer_addrs: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) data_dir: Option<String>,
+    #[serde(default)]
+    pub(crate) raft_bind: Option<String>,
+    #[serde(default)]
+    pub(crate) tls_cert: Option<String>,
+    #[serde(default)]
+    pub(crate) tls_key: Option<String>,
+    #[serde(default)]
+    pub(crate) tls_ca: Option<String>,
+    #[serde(default)]
+    pub(crate) trust_domain: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -627,6 +645,23 @@ fn parse_state_config(raw: Option<RawStateSection>, errors: &mut Vec<String>) ->
             StateProvider::Lattice { endpoint, prefix }
         }
         Some("clustor") => {
+            let mut require_field = |field: Option<String>, name: &str| -> String {
+                match field {
+                    Some(v) if !v.trim().is_empty() => v,
+                    _ => {
+                        errors.push(format!(
+                            "app.state.{name} is required when provider is `clustor`"
+                        ));
+                        String::new()
+                    }
+                }
+            };
+            let node_id = require_field(raw.node_id, "node_id");
+            let raft_bind = require_field(raw.raft_bind, "raft_bind");
+            let tls_cert = PathBuf::from(require_field(raw.tls_cert, "tls_cert"));
+            let tls_key = PathBuf::from(require_field(raw.tls_key, "tls_key"));
+            let tls_ca = PathBuf::from(require_field(raw.tls_ca, "tls_ca"));
+            let trust_domain = require_field(raw.trust_domain, "trust_domain");
             let peer_addrs = match raw.peer_addrs {
                 Some(addrs) if !addrs.is_empty() => addrs,
                 _ => {
@@ -646,8 +681,14 @@ fn parse_state_config(raw: Option<RawStateSection>, errors: &mut Vec<String>) ->
                 }
             };
             StateProvider::Clustor {
+                node_id,
                 peer_addrs,
                 data_dir,
+                raft_bind,
+                tls_cert,
+                tls_key,
+                tls_ca,
+                trust_domain,
             }
         }
         Some(other) => {

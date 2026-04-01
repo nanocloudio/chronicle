@@ -2,6 +2,7 @@ use crate::app_state::AppState;
 use crate::backpressure::BackpressureManager;
 use crate::chronicle::engine::ChronicleEngine;
 use crate::chronicle::phase::PhaseExecutor;
+use crate::chronicle::state::clustor::{ClustorConfig, ClustorExecutionStore, PeerAddr};
 use crate::chronicle::state::memory::MemoryExecutionStore;
 use crate::chronicle::state::ExecutionStore;
 use crate::config::integration::{AppConfig, StateProvider};
@@ -90,6 +91,58 @@ pub fn should_start_redis_runtime(flags: &ConnectorFlags, registry: &ConnectorRe
 #[cfg(not(feature = "db-redis"))]
 pub fn should_start_redis_runtime(_: &ConnectorFlags, _: &ConnectorRegistry) -> bool {
     false
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_clustor_store(
+    node_id: &str,
+    peer_addrs: &[String],
+    data_dir: &std::path::Path,
+    raft_bind: &str,
+    tls_cert: &std::path::Path,
+    tls_key: &std::path::Path,
+    tls_ca: &std::path::Path,
+    trust_domain: &str,
+    retention: Duration,
+) -> Result<ClustorExecutionStore> {
+    use clustor::net::{load_identity_from_pem, load_trust_store_from_pem};
+
+    let tls_identity = load_identity_from_pem(tls_cert, tls_key, std::time::Instant::now())
+        .map_err(|e| crate::err!("load TLS identity from {} / {}: {e}", tls_cert.display(), tls_key.display()))?;
+    let trust_store = load_trust_store_from_pem(tls_ca)
+        .map_err(|e| crate::err!("load TLS CA from {}: {e}", tls_ca.display()))?;
+    let bind_addr: std::net::SocketAddr = raft_bind.parse()
+        .with_context(|| format!("parse raft_bind address `{raft_bind}`"))?;
+
+    let peers: Vec<PeerAddr> = peer_addrs
+        .iter()
+        .filter_map(|addr_str| {
+            // Format: "node_id@host:port"
+            let (id, hostport) = addr_str.split_once('@')?;
+            let (host, port_str) = hostport.rsplit_once(':')?;
+            let port = port_str.parse().ok()?;
+            Some(PeerAddr {
+                id: id.to_string(),
+                host: host.to_string(),
+                port,
+            })
+        })
+        .collect();
+
+    let config = ClustorConfig {
+        node_id: node_id.to_string(),
+        peer_addrs: peers,
+        data_dir: data_dir.to_path_buf(),
+        retention,
+        raft_bind: bind_addr,
+        tls_identity,
+        trust_store,
+        trust_domain: trust_domain.to_string(),
+    };
+
+    ClustorExecutionStore::start(config)
+        .await
+        .map_err(|e| crate::err!("clustor execution store: {e}"))
 }
 
 fn has_kafka_triggers(config: &IntegrationConfig) -> bool {
@@ -188,9 +241,38 @@ impl ChronicleApp {
                         tracing::warn!("lattice execution store provider is not yet available; falling back to no retention");
                         None
                     }
-                    StateProvider::Clustor { .. } => {
-                        tracing::warn!("clustor execution store provider is not yet available; falling back to no retention");
-                        None
+                    StateProvider::Clustor {
+                        ref node_id,
+                        ref peer_addrs,
+                        ref data_dir,
+                        ref raft_bind,
+                        ref tls_cert,
+                        ref tls_key,
+                        ref tls_ca,
+                        ref trust_domain,
+                    } => {
+                        match build_clustor_store(
+                            node_id,
+                            peer_addrs,
+                            data_dir,
+                            raft_bind,
+                            tls_cert,
+                            tls_key,
+                            tls_ca,
+                            trust_domain,
+                            app_policy.state.retention,
+                        )
+                        .await
+                        {
+                            Ok(store) => Some(Arc::new(store) as Arc<dyn ExecutionStore>),
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "clustor execution store failed to start; falling back to no retention"
+                                );
+                                None
+                            }
+                        }
                     }
                 };
 

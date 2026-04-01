@@ -9,6 +9,7 @@
 //! Providers (memory, clustor) implement this trait to control where execution
 //! state is persisted and how it is queried.
 
+pub mod clustor;
 pub mod memory;
 
 use serde::{Deserialize, Serialize};
