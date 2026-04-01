@@ -136,7 +136,7 @@ smtp = ["dep:lettre"]
 anyhow = { version = "1.0.100", default-features = false }
 apache-avro = "0.20.0"
 async-trait = { version = "0.1.89", default-features = false }
-axum = { version = "0.8.6", default-features = false, features = ["http1", "tokio", "macros", "json"] }
+axum = { version = "0.8.6", default-features = false, features = ["http1", "tokio", "macros", "json", "query"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 config = "0.15.18"

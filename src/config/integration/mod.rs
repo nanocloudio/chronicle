@@ -14,7 +14,7 @@ use thiserror::Error;
 
 pub use app::{
     known_feature_flags, AppConfig, AppLimits, HalfOpenPolicy, HttpLimits, JitterMode, KafkaLimits,
-    MinReadyRoutes, OverflowPolicy, RetryBudget, RouteLimits,
+    MinReadyRoutes, OverflowPolicy, RetryBudget, RouteLimits, StateConfig, StateProvider,
 };
 pub use chronicles::{
     BackoffPolicy, ChronicleDefinition, ChroniclePhase, ChroniclePolicy, ChronicleTrigger,

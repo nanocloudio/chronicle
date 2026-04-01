@@ -25,6 +25,7 @@ use chronicle_core::chronicle::dispatcher::{
 use chronicle_core::chronicle::engine::{
     ChronicleAction, ChronicleEngineError, ChronicleExecution,
 };
+use chronicle_core::chronicle::state::{ExecutionSnapshot, ExecutionStatus};
 use chronicle_core::config::integration::AppConfig;
 use chronicle_core::integration::factory::ConnectorFactoryRegistry;
 use chronicle_core::metrics::metrics;
@@ -66,6 +67,7 @@ struct HttpServerState {
     max_payload_bytes: usize,
     limit_cache: RwLock<HashMap<String, CachedLimitResponse>>,
     limit_cache_ttl: Duration,
+    execution_store: Option<Arc<dyn chronicle_core::chronicle::state::ExecutionStore>>,
 }
 
 struct CachedLimitResponse {
@@ -124,6 +126,7 @@ impl HttpTriggerRuntime {
         dependency_health: Option<DependencyHealth>,
         backpressure: BackpressureManager,
         app_policy: AppConfig,
+        execution_store: Option<Arc<dyn chronicle_core::chronicle::state::ExecutionStore>>,
     ) -> Result<Self> {
         let mut servers: HashMap<SocketAddr, ServerBindings> = HashMap::new();
         let mut processed_connectors: HashSet<String> = HashSet::new();
@@ -239,6 +242,7 @@ impl HttpTriggerRuntime {
                     max_payload_bytes,
                     limit_cache: RwLock::new(HashMap::new()),
                     limit_cache_ttl: app_policy.readiness_cache,
+                    execution_store: execution_store.clone(),
                 };
                 HttpServerInstance {
                     addr,
@@ -402,6 +406,27 @@ async fn handle_http_trigger(
 
     match state.engine.execute(&route.chronicle, payload) {
         Ok(execution) => {
+            if let Some(store) = &state.execution_store {
+                let snapshot = ExecutionSnapshot {
+                    execution_id: execution.execution_id.clone(),
+                    chronicle: execution.name.clone(),
+                    trace_id: execution.trace_id.clone(),
+                    record_id: execution.record_id.clone(),
+                    status: ExecutionStatus::Running,
+                    created_at: std::time::SystemTime::now(),
+                    completed_at: None,
+                    slots: execution.context.clone(),
+                    outcomes: Vec::new(),
+                };
+                if let Err(err) = store.retain(snapshot).await {
+                    tracing::warn!(
+                        execution_id = %execution.execution_id,
+                        error = %err,
+                        "failed to retain execution state"
+                    );
+                }
+            }
+
             let delivery_ctx = DeliveryContext {
                 policy: execution.delivery.as_ref(),
                 fallback: execution.fallback.as_ref(),
@@ -410,26 +435,44 @@ async fn handle_http_trigger(
                 retry_budget: execution.retry_budget.as_ref(),
             };
 
-            match state
+            let dispatch_result = state
                 .dispatcher
                 .dispatch(&route.chronicle, &execution.actions, delivery_ctx)
-                .await
-            {
-                Ok(_outcomes) => {
-                    metrics().record_execution_completed(&route.chronicle, true);
-                }
-                Err(ActionDispatchError::RetryBudgetExhausted { .. }) => {
-                    metrics().record_execution_completed(&route.chronicle, false);
-                    return Ok(build_budget_exhausted_response(&route.chronicle));
-                }
+                .await;
+
+            let (outcomes, dispatch_err) = match dispatch_result {
+                Ok(outcomes) => (outcomes, None),
                 Err(err) => {
-                    metrics().record_execution_completed(&route.chronicle, false);
-                    error!(
-                        chronicle = %route.chronicle,
-                        error = %err,
-                        "failed to dispatch chronicle actions"
-                    );
-                    return Err(StatusCode::BAD_GATEWAY);
+                    let outcomes = err.outcomes().to_vec();
+                    (outcomes, Some(err))
+                }
+            };
+
+            metrics().record_execution_completed(&route.chronicle, dispatch_err.is_none());
+
+            if let Some(store) = &state.execution_store {
+                let _ = store
+                    .complete(
+                        &execution.execution_id,
+                        outcomes,
+                        execution.allow_partial_delivery,
+                    )
+                    .await;
+            }
+
+            if let Some(err) = dispatch_err {
+                match err {
+                    ActionDispatchError::RetryBudgetExhausted { .. } => {
+                        return Ok(build_budget_exhausted_response(&route.chronicle));
+                    }
+                    _ => {
+                        error!(
+                            chronicle = %route.chronicle,
+                            error = %err,
+                            "failed to dispatch chronicle actions"
+                        );
+                        return Err(StatusCode::BAD_GATEWAY);
+                    }
                 }
             }
 

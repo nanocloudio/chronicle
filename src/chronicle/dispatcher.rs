@@ -1161,6 +1161,7 @@ impl ActionDispatcher {
                                 route: route.to_string(),
                                 index,
                                 kind,
+                                outcomes,
                             });
                         }
 
@@ -1168,6 +1169,7 @@ impl ActionDispatcher {
                             index,
                             kind,
                             source: Box::new(source),
+                            outcomes,
                         });
                     }
                 }
@@ -1214,6 +1216,7 @@ impl ActionDispatcher {
                                 route: route.to_string(),
                                 index,
                                 kind,
+                                outcomes: Vec::new(),
                             });
                         }
 
@@ -1221,6 +1224,7 @@ impl ActionDispatcher {
                             index,
                             kind,
                             source: Box::new(source),
+                            outcomes: Vec::new(),
                         });
                     }
                 }
@@ -1757,13 +1761,33 @@ pub enum ActionDispatchError {
         kind: &'static str,
         #[source]
         source: Box<ActionError>,
+        outcomes: Vec<ActionOutcome>,
     },
     #[error("route `{route}` exhausted retry budget while dispatching action {index} ({kind})")]
     RetryBudgetExhausted {
         route: String,
         index: usize,
         kind: &'static str,
+        outcomes: Vec<ActionOutcome>,
     },
+}
+
+impl ActionDispatchError {
+    /// Extract the partial action outcomes collected before the error.
+    pub fn outcomes(&self) -> &[ActionOutcome] {
+        match self {
+            Self::ActionFailed { outcomes, .. } => outcomes,
+            Self::RetryBudgetExhausted { outcomes, .. } => outcomes,
+        }
+    }
+
+    /// Take ownership of the partial action outcomes.
+    pub fn into_outcomes(self) -> Vec<ActionOutcome> {
+        match self {
+            Self::ActionFailed { outcomes, .. } => outcomes,
+            Self::RetryBudgetExhausted { outcomes, .. } => outcomes,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

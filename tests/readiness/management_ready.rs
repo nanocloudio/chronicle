@@ -85,6 +85,7 @@ fn build_app_state(config: &IntegrationConfig, controller: ReadinessController) 
         app_policy: config.app.clone(),
         readiness: Some(controller),
         dependency_health: None,
+        execution_store: None,
     }
 }
 

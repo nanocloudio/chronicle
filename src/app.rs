@@ -2,7 +2,9 @@ use crate::app_state::AppState;
 use crate::backpressure::BackpressureManager;
 use crate::chronicle::engine::ChronicleEngine;
 use crate::chronicle::phase::PhaseExecutor;
-use crate::config::integration::AppConfig;
+use crate::chronicle::state::memory::MemoryExecutionStore;
+use crate::chronicle::state::ExecutionStore;
+use crate::config::integration::{AppConfig, StateProvider};
 use crate::config::{ChronicleConfig, ConnectorFlags, IntegrationConfig};
 #[cfg(feature = "kafka")]
 use crate::connectors::kafka::KafkaConsumerLoop;
@@ -39,6 +41,7 @@ fn build_http_runtime(
     dependency_health: Option<DependencyHealth>,
     backpressure: BackpressureManager,
     app_policy: &AppConfig,
+    execution_store: Option<Arc<dyn ExecutionStore>>,
 ) -> Result<HttpTriggerRuntime> {
     HttpTriggerRuntime::build(
         Arc::clone(config),
@@ -48,6 +51,7 @@ fn build_http_runtime(
         dependency_health,
         backpressure,
         app_policy.clone(),
+        execution_store,
     )
 }
 
@@ -110,6 +114,7 @@ impl ChronicleApp {
         let _ = &transports;
         let mut app_policy = AppConfig::default();
         let mut pending_backpressure: Option<BackpressureManager> = None;
+        let mut execution_store: Option<Arc<dyn ExecutionStore>> = None;
 
         match config.integration_config_path.as_deref() {
             Some(path) if !path.trim().is_empty() => {
@@ -174,6 +179,21 @@ impl ChronicleApp {
                 let backpressure_manager =
                     BackpressureManager::new(&config.backpressure, Some(&app_policy));
 
+                execution_store = match &app_policy.state.provider {
+                    StateProvider::Memory if app_policy.state.retention.is_zero() => None,
+                    StateProvider::Memory => Some(Arc::new(MemoryExecutionStore::new(
+                        app_policy.state.retention,
+                    )) as Arc<dyn ExecutionStore>),
+                    StateProvider::Lattice { .. } => {
+                        tracing::warn!("lattice execution store provider is not yet available; falling back to no retention");
+                        None
+                    }
+                    StateProvider::Clustor { .. } => {
+                        tracing::warn!("clustor execution store provider is not yet available; falling back to no retention");
+                        None
+                    }
+                };
+
                 #[cfg(feature = "http-in")]
                 {
                     let runtime = build_http_runtime(
@@ -184,6 +204,7 @@ impl ChronicleApp {
                         dependency_health.clone(),
                         backpressure_manager.clone(),
                         &app_policy,
+                        execution_store.clone(),
                     )
                     .context("failed to construct http trigger runtime")?;
                     transports.push(Box::new(runtime));
@@ -442,6 +463,7 @@ impl ChronicleApp {
                 app_policy,
                 readiness,
                 dependency_health,
+                execution_store,
             },
             management: management_server,
             #[cfg(feature = "kafka")]

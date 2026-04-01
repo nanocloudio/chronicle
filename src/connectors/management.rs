@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::backpressure::ControllerSnapshot;
+use crate::chronicle::state::{ExecutionFilter, ExecutionId, ExecutionStatus};
 use crate::codec::http::{
     application_state_label, readiness_endpoints_payload, readiness_routes_payload,
 };
@@ -14,6 +15,7 @@ use crate::readiness::{
     ReadinessSnapshot, RouteState as ReadinessRouteState,
 };
 use axum::body::Body;
+use axum::extract::{Path, Query};
 use axum::http::{
     header::{CONTENT_TYPE, RETRY_AFTER},
     StatusCode,
@@ -22,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -85,6 +88,12 @@ impl ManagementServer {
 
         if let Some(endpoint) = &self.metrics {
             router = router.route(endpoint.path.as_str(), get(metrics));
+        }
+
+        if state.execution_store.is_some() {
+            router = router
+                .route("/executions", get(list_executions))
+                .route("/executions/:id", get(get_execution));
         }
 
         router = router.layer(Extension(state));
@@ -199,6 +208,83 @@ async fn metrics(Extension(state): Extension<AppState>) -> Result<Response<Body>
         .header(CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutionListParams {
+    chronicle: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn get_execution(
+    Extension(state): Extension<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(store) = &state.execution_store else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "execution state not retained",
+                "hint": "set app.state.retention"
+            })),
+        )
+            .into_response();
+    };
+
+    let execution_id = ExecutionId::from_string(id.clone());
+    match store.get(&execution_id).await {
+        Ok(Some(snapshot)) => (StatusCode::OK, Json(json!(snapshot))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("execution `{id}` not found") })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_executions(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<ExecutionListParams>,
+) -> impl IntoResponse {
+    let Some(store) = &state.execution_store else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "execution state not retained",
+                "hint": "set app.state.retention"
+            })),
+        )
+            .into_response();
+    };
+
+    let status = params.status.and_then(|s: String| match s.as_str() {
+        "running" => Some(ExecutionStatus::Running),
+        "succeeded" => Some(ExecutionStatus::Succeeded),
+        "failed" => Some(ExecutionStatus::Failed),
+        "partial_success" => Some(ExecutionStatus::PartialSuccess),
+        _ => None,
+    });
+
+    let filter = ExecutionFilter {
+        chronicle: params.chronicle,
+        status,
+        limit: params.limit,
+    };
+
+    match store.list(&filter).await {
+        Ok(executions) => (StatusCode::OK, Json(json!({ "executions": executions }))).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 fn metrics_body(state: &AppState, readiness: Option<&ReadinessSnapshot>) -> String {

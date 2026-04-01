@@ -1,6 +1,7 @@
 use crate::backpressure::BackpressureManager;
 use crate::chronicle::engine::ChronicleEngine;
 use crate::chronicle::phase::PhaseExecutor;
+use crate::chronicle::state::ExecutionStore;
 use crate::config::integration::AppConfig;
 use crate::config::IntegrationConfig;
 use crate::connectors::database::Database;
@@ -20,4 +21,5 @@ pub struct AppState {
     pub app_policy: AppConfig,
     pub readiness: Option<ReadinessController>,
     pub dependency_health: Option<DependencyHealth>,
+    pub execution_store: Option<Arc<dyn ExecutionStore>>,
 }

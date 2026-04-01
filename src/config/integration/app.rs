@@ -1,6 +1,7 @@
 use humantime::parse_duration;
 use serde::Deserialize;
 use serde_yaml::Value as YamlValue;
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub(crate) const KNOWN_FEATURE_FLAGS: &[&str] = &[
@@ -61,6 +62,7 @@ pub struct AppConfig {
     pub limits: AppLimits,
     pub retry_budget: Option<RetryBudget>,
     pub feature_flags: Vec<String>,
+    pub state: StateConfig,
 }
 
 impl Default for AppConfig {
@@ -74,8 +76,37 @@ impl Default for AppConfig {
             limits: AppLimits::default(),
             retry_budget: Some(default_app_retry_budget()),
             feature_flags: Vec::new(),
+            state: StateConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StateConfig {
+    pub provider: StateProvider,
+    pub retention: Duration,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            provider: StateProvider::Memory,
+            retention: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum StateProvider {
+    Memory,
+    Lattice {
+        endpoint: String,
+        prefix: String,
+    },
+    Clustor {
+        peer_addrs: Vec<String>,
+        data_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -170,6 +201,25 @@ pub(crate) struct RawAppSection {
     pub(crate) retry_budget: Option<RawRetryBudget>,
     #[serde(default)]
     pub(crate) feature_flags: Vec<String>,
+    #[serde(default)]
+    pub(crate) state: Option<RawStateSection>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawStateSection {
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    #[serde(default)]
+    pub(crate) retention: Option<String>,
+    #[serde(default)]
+    pub(crate) endpoint: Option<String>,
+    #[serde(default)]
+    pub(crate) prefix: Option<String>,
+    #[serde(default)]
+    pub(crate) peer_addrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) data_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -289,6 +339,8 @@ pub(crate) fn parse_app_config(raw: Option<RawAppSection>, errors: &mut Vec<Stri
         .filter(|flag| !flag.is_empty())
         .collect();
     validate_feature_flags(&config.feature_flags, errors);
+
+    config.state = parse_state_config(raw.state, errors);
 
     config
 }
@@ -549,6 +601,69 @@ fn parse_min_ready_routes(value: YamlValue) -> Result<MinReadyRoutes, String> {
             "app.min_ready_routes must be `all` or a positive integer (got `{}`)",
             value_to_string(&other)
         )),
+    }
+}
+
+fn parse_state_config(raw: Option<RawStateSection>, errors: &mut Vec<String>) -> StateConfig {
+    let Some(raw) = raw else {
+        return StateConfig::default();
+    };
+
+    let provider = match raw.provider.as_deref() {
+        None | Some("memory") => StateProvider::Memory,
+        Some("lattice") => {
+            let endpoint = match raw.endpoint {
+                Some(ep) if !ep.trim().is_empty() => ep,
+                _ => {
+                    errors.push(
+                        "app.state.endpoint is required when provider is `lattice`".to_string(),
+                    );
+                    String::new()
+                }
+            };
+            let prefix = raw
+                .prefix
+                .unwrap_or_else(|| "/chronicle/exec/".to_string());
+            StateProvider::Lattice { endpoint, prefix }
+        }
+        Some("clustor") => {
+            let peer_addrs = match raw.peer_addrs {
+                Some(addrs) if !addrs.is_empty() => addrs,
+                _ => {
+                    errors.push(
+                        "app.state.peer_addrs is required when provider is `clustor`".to_string(),
+                    );
+                    Vec::new()
+                }
+            };
+            let data_dir = match raw.data_dir {
+                Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+                _ => {
+                    errors.push(
+                        "app.state.data_dir is required when provider is `clustor`".to_string(),
+                    );
+                    PathBuf::new()
+                }
+            };
+            StateProvider::Clustor {
+                peer_addrs,
+                data_dir,
+            }
+        }
+        Some(other) => {
+            errors.push(format!(
+                "app.state.provider must be one of `memory`, `lattice`, or `clustor` (got `{other}`)"
+            ));
+            StateProvider::Memory
+        }
+    };
+
+    let retention = parse_duration_optional("app.state.retention", raw.retention, errors)
+        .unwrap_or(Duration::ZERO);
+
+    StateConfig {
+        provider,
+        retention,
     }
 }
 
