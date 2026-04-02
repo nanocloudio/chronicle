@@ -238,7 +238,7 @@ impl ChronicleApp {
                         app_policy.state.retention,
                     )) as Arc<dyn ExecutionStore>),
                     StateProvider::Lattice { .. } => {
-                        tracing::warn!("lattice execution store provider is not yet available; falling back to no retention");
+                        tracing::warn!("lattice execution store provider requires an external Lattice cluster; falling back to no retention");
                         None
                     }
                     StateProvider::Clustor {

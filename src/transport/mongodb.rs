@@ -17,7 +17,7 @@ use mongodb::change_stream::event::{
     ChangeNamespace, ChangeStreamEvent, OperationType, ResumeToken,
 };
 use mongodb::change_stream::ChangeStream;
-use mongodb::options::{ChangeStreamOptions, ClientOptions, Tls, TlsOptions};
+use mongodb::options::{ClientOptions, Tls, TlsOptions};
 use mongodb::Client;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::marker::PhantomData;
@@ -389,31 +389,28 @@ impl MongodbChangeStreamDriver {
         let database = self.client.database(&self.config.connector.database);
         let pipeline = self.config.pipeline.clone();
 
-        let mut options = ChangeStreamOptions::default();
-        if let Some(token) = self.resume_from.clone() {
-            options.resume_after = Some(token);
-        }
-
         let stream = if let Some(collection) = &self.config.collection {
             let collection_handle = database.collection::<Document>(collection);
             let collection_name = collection_handle.name().to_string();
-            collection_handle
-                .watch(pipeline.clone(), Some(options.clone()))
-                .await
-                .map_err(|err| {
-                    MongodbChangeStreamError::new(format!(
-                        "failed to open change stream on collection `{collection_name}`: {err}"
-                    ))
-                })?
+            let mut watch = collection_handle.watch().pipeline(pipeline.clone());
+            if let Some(token) = self.resume_from.clone() {
+                watch = watch.resume_after(token);
+            }
+            watch.await.map_err(|err| {
+                MongodbChangeStreamError::new(format!(
+                    "failed to open change stream on collection `{collection_name}`: {err}"
+                ))
+            })?
         } else {
-            database
-                .watch(pipeline.clone(), Some(options.clone()))
-                .await
-                .map_err(|err| {
-                    MongodbChangeStreamError::new(format!(
-                        "failed to open database change stream: {err}"
-                    ))
-                })?
+            let mut watch = database.watch().pipeline(pipeline.clone());
+            if let Some(token) = self.resume_from.clone() {
+                watch = watch.resume_after(token);
+            }
+            watch.await.map_err(|err| {
+                MongodbChangeStreamError::new(format!(
+                    "failed to open database change stream: {err}"
+                ))
+            })?
         };
 
         self.stream = Some(stream);

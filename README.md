@@ -121,7 +121,7 @@ phases can reference `.[]` paths deterministically.
 cargo run -- --config tests/fixtures/chronicle-integration.yaml
 ```
 
-1. Chronicle loads `ChronicleConfig` (environment + `config/*.toml`).
+1. Chronicle loads `ChronicleConfig` (environment + `config/local.toml`).
 2. The integration YAML is parsed into connectors and chronicles.
 3. Connector registries spin up HTTP servers, Kafka/MQTT/RabbitMQ consumers,
    database pools, and outbound clients.

@@ -22,9 +22,10 @@ pub enum Error {
     #[error("JSON error: {0}")]
     SerdeJson(#[from] serde_json::Error),
     #[error("invalid URI: {0}")]
-    InvalidUri(#[from] http::uri::InvalidUri),
+    InvalidUri(#[from] axum::http::uri::InvalidUri),
     #[error("HTTP error: {0}")]
-    Http(#[from] http::Error),
+    Http(#[from] axum::http::Error),
+    #[cfg(any(feature = "db-postgres", feature = "db-mariadb"))]
     #[error("SQL error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("integration config error: {0}")]
@@ -112,6 +113,7 @@ impl Error {
 
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         match self {
+            #[cfg(any(feature = "db-postgres", feature = "db-mariadb"))]
             Error::Sqlx(err) => (err as &dyn Any).downcast_ref(),
             Error::Context { source, .. } => source.downcast_ref(),
             _ => None,

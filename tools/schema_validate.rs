@@ -5,29 +5,27 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use jsonschema::{Draft, JSONSchema};
+use jsonschema::{Draft, Validator};
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as YamlValue;
 
-fn load_schema(path: &Path) -> Result<JSONSchema> {
+fn load_schema(path: &Path) -> Result<Validator> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read JSON schema at {}", path.display()))?;
     let schema_json: JsonValue = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON schema {}", path.display()))?;
-    let leaked_schema: &'static JsonValue = Box::leak(Box::new(schema_json));
-    JSONSchema::options()
+    jsonschema::options()
         .with_draft(Draft::Draft202012)
-        .compile(leaked_schema)
+        .build(&schema_json)
         .with_context(|| format!("failed to compile JSON schema {}", path.display()))
 }
 
-fn validate_file(compiled: &JSONSchema, config_path: &Path) -> Result<()> {
+fn validate_file(compiled: &Validator, config_path: &Path) -> Result<()> {
     let raw = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config {}", config_path.display()))?;
-    let yaml: YamlValue = serde_yaml::from_str(&raw)
+    let json: JsonValue = serde_saphyr::from_str(&raw)
         .with_context(|| format!("{} is not valid YAML", config_path.display()))?;
-    let json = serde_json::to_value(yaml).context("failed to convert YAML to JSON")?;
-    if let Err(errors) = compiled.validate(&json) {
+    let errors = compiled.iter_errors(&json).collect::<Vec<_>>();
+    if !errors.is_empty() {
         let mut message = String::new();
         for error in errors {
             use std::fmt::Write as _;

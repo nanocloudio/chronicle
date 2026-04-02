@@ -6,9 +6,8 @@
 use anyhow::{anyhow, Context};
 use chronicle::config::{integration::known_feature_flags, ChronicleConfig, IntegrationConfig};
 use chronicle::telemetry;
-use jsonschema::{Draft, JSONSchema};
+use jsonschema::{Draft, Validator};
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as YamlValue;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -211,7 +210,7 @@ fn run_validate_command(
     }
 }
 
-fn compile_json_schema(override_path: Option<&str>) -> anyhow::Result<JSONSchema> {
+fn compile_json_schema(override_path: Option<&str>) -> anyhow::Result<Validator> {
     if let Some(path) = override_path {
         return load_schema_from_path(Path::new(path));
     }
@@ -230,13 +229,13 @@ fn compile_json_schema(override_path: Option<&str>) -> anyhow::Result<JSONSchema
     }
 }
 
-fn compile_embedded_schema() -> anyhow::Result<JSONSchema> {
+fn compile_embedded_schema() -> anyhow::Result<Validator> {
     let parsed: JsonValue =
         serde_json::from_str(EMBEDDED_SCHEMA).context("embedded JSON schema is invalid JSON")?;
     compile_schema_from_json(parsed, "embedded schema")
 }
 
-fn load_schema_from_path(path: &Path) -> anyhow::Result<JSONSchema> {
+fn load_schema_from_path(path: &Path) -> anyhow::Result<Validator> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read JSON schema at {}", path.display()))?;
     let parsed: JsonValue = serde_json::from_str(&raw)
@@ -244,23 +243,21 @@ fn load_schema_from_path(path: &Path) -> anyhow::Result<JSONSchema> {
     compile_schema_from_json(parsed, &path.display().to_string())
 }
 
-fn compile_schema_from_json(value: JsonValue, label: &str) -> anyhow::Result<JSONSchema> {
-    let leaked: &'static JsonValue = Box::leak(Box::new(value));
-    JSONSchema::options()
+fn compile_schema_from_json(value: JsonValue, label: &str) -> anyhow::Result<Validator> {
+    jsonschema::options()
         .with_draft(Draft::Draft202012)
-        .compile(leaked)
+        .build(&value)
         .with_context(|| format!("failed to compile JSON schema {label}"))
 }
 
-fn validate_with_schema(schema: &JSONSchema, path: &Path) -> anyhow::Result<()> {
+fn validate_with_schema(schema: &Validator, path: &Path) -> anyhow::Result<()> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let yaml: YamlValue = serde_yaml::from_str(&raw)
+    let json: JsonValue = serde_saphyr::from_str(&raw)
         .with_context(|| format!("{} is not valid YAML", path.display()))?;
-    let json =
-        serde_json::to_value(yaml).context("failed to convert YAML configuration to JSON")?;
 
-    if let Err(errors) = schema.validate(&json) {
+    let errors = schema.iter_errors(&json).collect::<Vec<_>>();
+    if !errors.is_empty() {
         let mut message = String::new();
         for error in errors {
             use std::fmt::Write as _;

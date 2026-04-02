@@ -1,5 +1,5 @@
 use crate::config::integration::{DeliveryPolicy, JitterMode, RetryBudget};
-use rand::Rng;
+use rand::RngExt;
 use std::cmp::{max, min};
 use std::time::Duration;
 
@@ -194,10 +194,10 @@ pub fn jitter_between(min: Duration, max: Duration) -> Duration {
     if max <= min {
         return min;
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let min_secs = min.as_secs_f64();
     let span = max.as_secs_f64() - min_secs;
-    let sample = rng.gen::<f64>() * span + min_secs;
+    let sample = rng.random::<f64>() * span + min_secs;
     Duration::from_secs_f64(sample)
 }
 

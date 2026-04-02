@@ -41,7 +41,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tower::make::Shared;
 use tracing::{error, info, warn};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
@@ -293,11 +292,9 @@ fn spawn_http_server(instance: HttpServerInstance, shutdown: CancellationToken) 
         match TcpListener::bind(addr).await {
             Ok(listener) => {
                 info!(address = %addr, "http trigger runtime listening");
-                let make_service = Shared::new(router.into_service::<axum::body::Body>());
-                let server =
-                    axum::serve(listener, make_service).with_graceful_shutdown(async move {
-                        shutdown.cancelled().await;
-                    });
+                let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+                    shutdown.cancelled().await;
+                });
 
                 if let Err(err) = server.await {
                     error!(address = %addr, %err, "http trigger runtime terminated with error");

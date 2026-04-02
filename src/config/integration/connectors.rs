@@ -1,12 +1,11 @@
 use super::app::{
-    ensure_positive_duration, parse_duration_value, parse_retry_budget, value_to_string,
-    RetryBudget,
+    ensure_positive_duration, parse_duration_value, parse_retry_budget, RetryBudget,
 };
 use humantime::parse_duration;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use serde_yaml::Value as YamlValue;
+type YamlValue = JsonValue;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Duration;
@@ -462,12 +461,9 @@ fn insert_nested_json(target: &mut JsonValue, raw_key: &str, value: JsonValue) {
 }
 
 fn flatten_value(target: &mut OptionMap, prefix: &str, value: YamlValue, errors: &mut Vec<String>) {
-    let value = strip_tag(value);
-
     match value {
-        YamlValue::Mapping(map) => {
-            for (raw_key, raw_value) in map {
-                let key_fragment = value_to_string(&raw_key);
+        YamlValue::Object(map) => {
+            for (key_fragment, raw_value) in map {
                 let combined = if prefix.is_empty() {
                     key_fragment
                 } else {
@@ -477,7 +473,7 @@ fn flatten_value(target: &mut OptionMap, prefix: &str, value: YamlValue, errors:
                 flatten_value(target, &combined, raw_value, errors);
             }
         }
-        YamlValue::Sequence(sequence) => {
+        YamlValue::Array(sequence) => {
             for (index, item) in sequence.into_iter().enumerate() {
                 let combined = if prefix.is_empty() {
                     index.to_string()
@@ -487,9 +483,6 @@ fn flatten_value(target: &mut OptionMap, prefix: &str, value: YamlValue, errors:
 
                 flatten_value(target, &combined, item, errors);
             }
-        }
-        YamlValue::Tagged(tagged) => {
-            flatten_value(target, prefix, tagged.value, errors);
         }
         scalar => {
             let key = prefix.trim();
@@ -515,8 +508,6 @@ fn flatten_value(target: &mut OptionMap, prefix: &str, value: YamlValue, errors:
 }
 
 fn yaml_to_scalar(value: YamlValue, errors: &mut Vec<String>) -> Option<ScalarValue> {
-    let value = strip_tag(value);
-
     match value {
         YamlValue::Null => Some(ScalarValue::Null),
         YamlValue::Bool(inner) => Some(ScalarValue::Bool(inner)),
@@ -542,21 +533,11 @@ fn yaml_to_scalar(value: YamlValue, errors: &mut Vec<String>) -> Option<ScalarVa
             }
         }
         YamlValue::String(inner) => Some(ScalarValue::String(inner)),
-        YamlValue::Sequence(_) | YamlValue::Mapping(_) => {
+        YamlValue::Array(_) | YamlValue::Object(_) => {
             errors.push("expected scalar but nested structure found".to_string());
             None
         }
-        YamlValue::Tagged(tagged) => yaml_to_scalar(tagged.value, errors),
     }
-}
-
-fn strip_tag(value: YamlValue) -> YamlValue {
-    let mut current = value;
-    while let YamlValue::Tagged(tagged) = current {
-        current = tagged.value;
-    }
-
-    current
 }
 
 fn ensure_object(value: &mut JsonValue) -> &mut JsonMap<String, JsonValue> {

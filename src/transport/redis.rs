@@ -17,8 +17,8 @@ use futures_util::StreamExt;
 use redis::aio::{ConnectionManager, PubSub};
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{
-    AsyncCommands, Client, ClientTlsConfig, ConnectionInfo, RedisError, TlsCertificates,
-    Value as RedisValueRaw,
+    AsyncCommands, Client, ClientTlsConfig, ConnectionInfo, RedisConnectionInfo, RedisError,
+    TlsCertificates, Value as RedisValueRaw,
 };
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::collections::HashMap;
@@ -645,7 +645,7 @@ impl RedisTriggerDriver for RedisDriver {
                     .arg(&stream_name)
                     .arg(&group_name)
                     .arg(&entry_id)
-                    .query_async::<_, i64>(connection)
+                    .query_async::<i64>(connection)
                     .await
                     .map_err(|err| RedisDriverError::Ack {
                         connector: self.config.connector.name.clone(),
@@ -731,21 +731,23 @@ fn build_redis_client(connector: &RedisConnector) -> StdResult<Client, RedisDriv
             err
         )))
     })?;
+    let mut redis_settings: RedisConnectionInfo = info.redis_settings().clone();
 
     if let Some(username) = connector
         .extra
         .get("username")
         .and_then(|value| value.as_str())
     {
-        info.redis.username = Some(username.to_string());
+        redis_settings = redis_settings.set_username(username);
     }
     if let Some(password) = connector
         .extra
         .get("password")
         .and_then(|value| value.as_str())
     {
-        info.redis.password = Some(password.to_string());
+        redis_settings = redis_settings.set_password(password);
     }
+    info = info.set_redis_settings(redis_settings);
 
     if let Some(tls) = &connector.tls {
         let certs = load_connector_tls(tls)?;
@@ -772,14 +774,13 @@ async fn build_pubsub(
     connector: &RedisConnector,
     channels: &[String],
 ) -> StdResult<PubSub, RedisDriverError> {
-    let connection = client.get_async_connection().await.map_err(|err| {
+    let mut pubsub = client.get_async_pubsub().await.map_err(|err| {
         RedisDriverError::Connect(Box::new(crate::err!(
             "failed to open redis connection for `{}`: {}",
             connector.name,
             err
         )))
     })?;
-    let mut pubsub = connection.into_pubsub();
     for channel in channels {
         pubsub
             .subscribe(channel)
@@ -921,15 +922,51 @@ fn metadata_with_timestamp(ts: i64) -> JsonMap<String, JsonValue> {
 
 fn redis_value_to_bytes(value: &RedisValueRaw) -> Vec<u8> {
     match value {
-        RedisValueRaw::Data(bytes) => bytes.clone(),
-        RedisValueRaw::Bulk(values) => values
+        RedisValueRaw::BulkString(bytes) => bytes.clone(),
+        RedisValueRaw::Array(values) => values
             .iter()
             .flat_map(redis_value_to_bytes)
             .collect::<Vec<_>>(),
         RedisValueRaw::Int(number) => number.to_string().into_bytes(),
-        RedisValueRaw::Status(text) => text.as_bytes().to_vec(),
+        RedisValueRaw::SimpleString(text) => text.as_bytes().to_vec(),
         RedisValueRaw::Okay => b"OK".to_vec(),
         RedisValueRaw::Nil => Vec::new(),
+        RedisValueRaw::Map(values) => values
+            .iter()
+            .flat_map(|(key, value)| {
+                let mut bytes = redis_value_to_bytes(key);
+                bytes.extend(redis_value_to_bytes(value));
+                bytes
+            })
+            .collect::<Vec<_>>(),
+        RedisValueRaw::Attribute { data, attributes } => {
+            let mut bytes = redis_value_to_bytes(data);
+            for (key, value) in attributes {
+                bytes.extend(redis_value_to_bytes(key));
+                bytes.extend(redis_value_to_bytes(value));
+            }
+            bytes
+        }
+        RedisValueRaw::Set(values) => values
+            .iter()
+            .flat_map(redis_value_to_bytes)
+            .collect::<Vec<_>>(),
+        RedisValueRaw::Double(number) => number.to_string().into_bytes(),
+        RedisValueRaw::Boolean(flag) => {
+            if *flag {
+                b"true".to_vec()
+            } else {
+                b"false".to_vec()
+            }
+        }
+        RedisValueRaw::VerbatimString { text, .. } => text.as_bytes().to_vec(),
+        RedisValueRaw::BigNumber(number) => number.clone(),
+        RedisValueRaw::Push { data, .. } => data
+            .iter()
+            .flat_map(redis_value_to_bytes)
+            .collect::<Vec<_>>(),
+        RedisValueRaw::ServerError(error) => error.to_string().into_bytes(),
+        _ => Vec::new(),
     }
 }
 

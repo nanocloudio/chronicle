@@ -48,7 +48,6 @@ use clustor::replication::transport::raft::{RaftRpcHandler, RaftRpcServer};
 use clustor::security::MtlsIdentityManager;
 use clustor::{AckRecord, DurabilityLedger, IoMode};
 use parking_lot::Mutex as ParkingMutex;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -592,7 +591,7 @@ impl ClustorExecutionStore {
         let callbacks = Arc::new(ReplicaCallbacks::new(shared.clone(), clients.clone()));
         let controller = ElectionController::for_partition_profile(
             PartitionProfile::Latency,
-            rand::thread_rng().gen::<u64>(),
+            rand::random::<u64>(),
         );
         let heartbeat_interval = controller.heartbeat_interval().max(Duration::from_millis(50));
         let timers = RaftNodeScaffold::new(

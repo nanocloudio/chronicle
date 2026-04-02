@@ -361,7 +361,7 @@ async fn persist_record_writes_postgres_and_mongodb() -> Result<()> {
         .database("chronicle")
         .collection::<mongodb::bson::Document>("record_audit");
     audit_collection
-        .delete_many(doc! { "record_id": &record_id }, None)
+        .delete_many(doc! { "record_id": &record_id })
         .await?;
 
     let payload = json!({
@@ -417,7 +417,7 @@ async fn persist_record_writes_postgres_and_mongodb() -> Result<()> {
     );
 
     let audit_doc = audit_collection
-        .find_one(doc! { "record_id": &record_id }, None)
+        .find_one(doc! { "record_id": &record_id })
         .await?
         .context("mongodb audit document missing")?;
     let trace = audit_doc

@@ -338,7 +338,8 @@ impl RegistrySchemaSource {
     async fn fetch_schema_async(&self) -> Result<RegistryCachedSchema, String> {
         let endpoint = self.endpoint.trim_end_matches('/');
         let path_segment = self.version.path_segment();
-        let subject_encoded = urlencoding::encode(&self.subject);
+        let subject_encoded = url::form_urlencoded::byte_serialize(self.subject.as_bytes())
+            .collect::<String>();
         let url = format!(
             "{endpoint}/subjects/{subject}/versions/{version}",
             subject = subject_encoded,

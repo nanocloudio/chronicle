@@ -1,6 +1,6 @@
 use humantime::parse_duration;
 use serde::Deserialize;
-use serde_yaml::Value as YamlValue;
+use serde_json::Value as YamlValue;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -551,7 +551,7 @@ pub(crate) fn value_to_string(value: &YamlValue) -> String {
         YamlValue::Bool(inner) => inner.to_string(),
         YamlValue::Number(inner) => inner.to_string(),
         YamlValue::String(inner) => inner.clone(),
-        YamlValue::Sequence(items) => format!(
+        YamlValue::Array(items) => format!(
             "[{}]",
             items
                 .iter()
@@ -559,18 +559,13 @@ pub(crate) fn value_to_string(value: &YamlValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        YamlValue::Mapping(map) => format!(
+        YamlValue::Object(map) => format!(
             "{{{}}}",
             map.iter()
-                .map(|(key, val)| {
-                    let key_str = value_to_string(key);
-                    let val_str = value_to_string(val);
-                    format!("{key_str}: {val_str}")
-                })
+                .map(|(key, val)| format!("{key}: {}", value_to_string(val)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        YamlValue::Tagged(tagged) => value_to_string(&tagged.value),
     }
 }
 

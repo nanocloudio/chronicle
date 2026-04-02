@@ -11,7 +11,7 @@ use humantime::parse_duration;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use serde_yaml::Value as YamlValue;
+type YamlValue = JsonValue;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 

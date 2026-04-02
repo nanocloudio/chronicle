@@ -21,7 +21,9 @@ use crate::integration::registry::PostgresConnector;
 use crate::integration::registry::RabbitmqConnector;
 #[cfg(feature = "smtp")]
 use crate::integration::registry::SmtpConnector;
-use crate::integration::registry::{ConnectorRegistry, KafkaConnector};
+use crate::integration::registry::ConnectorRegistry;
+#[cfg(feature = "kafka")]
+use crate::integration::registry::KafkaConnector;
 #[cfg(feature = "kafka")]
 use crate::transport::kafka_context::{
     KafkaClientContext, KafkaClientRole, KafkaConnectivityState,
@@ -42,12 +44,41 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 #[cfg(feature = "db-postgres")]
 use sqlx::postgres::{PgPool, PgPoolOptions};
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
 use std::collections::HashMap;
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
 use std::fmt;
 #[cfg(any(feature = "http-out", feature = "grpc", feature = "mqtt"))]
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
+use std::sync::Mutex;
 #[cfg(any(
     feature = "http-out",
     feature = "rabbitmq",
@@ -90,10 +121,30 @@ use uuid::Uuid;
 
 /// Runtime factory that materialises connector instances (HTTP clients, Kafka producers,
 /// MariaDB pools) on demand while caching them for reuse.
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
 struct ConnectorCache<H> {
     inner: Mutex<HashMap<String, Arc<H>>>,
 }
 
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
 impl<H> ConnectorCache<H> {
     fn new() -> Self {
         Self {
@@ -115,6 +166,16 @@ impl<H> ConnectorCache<H> {
     }
 }
 
+#[cfg(any(
+    feature = "http-out",
+    feature = "grpc",
+    feature = "kafka",
+    feature = "db-mariadb",
+    feature = "db-postgres",
+    feature = "rabbitmq",
+    feature = "mqtt",
+    feature = "smtp"
+))]
 impl<H> fmt::Debug for ConnectorCache<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectorCache").finish()
@@ -132,7 +193,10 @@ pub struct ConnectorFactoryRegistry {
     grpc_clients: ConnectorCache<GrpcClientHandle>,
     #[cfg(not(feature = "grpc"))]
     _grpc_clients: (),
+    #[cfg(feature = "kafka")]
     kafka_producers: ConnectorCache<KafkaProducerHandle>,
+    #[cfg(not(feature = "kafka"))]
+    _kafka_producers: (),
     #[cfg(feature = "db-mariadb")]
     mariadb_pools: ConnectorCache<MariaDbPoolHandle>,
     #[cfg(feature = "db-postgres")]
@@ -163,7 +227,10 @@ impl ConnectorFactoryRegistry {
             grpc_clients: ConnectorCache::new(),
             #[cfg(not(feature = "grpc"))]
             _grpc_clients: (),
+            #[cfg(feature = "kafka")]
             kafka_producers: ConnectorCache::new(),
+            #[cfg(not(feature = "kafka"))]
+            _kafka_producers: (),
             #[cfg(feature = "db-mariadb")]
             mariadb_pools: ConnectorCache::new(),
             #[cfg(feature = "db-postgres")]
@@ -225,6 +292,7 @@ impl ConnectorFactoryRegistry {
         ))
     }
 
+    #[cfg(feature = "kafka")]
     pub fn kafka_producer(
         &self,
         name: &str,
@@ -232,6 +300,18 @@ impl ConnectorFactoryRegistry {
         let connector = self.require_connector(name, "kafka", ConnectorRegistry::kafka)?;
         self.kafka_producers
             .get_or_insert_with(name, move || build_kafka_handle(&connector))
+    }
+
+    #[cfg(not(feature = "kafka"))]
+    pub fn kafka_producer(
+        &self,
+        name: &str,
+    ) -> Result<Arc<KafkaProducerHandle>, ConnectorFactoryError> {
+        Err(ConnectorFactoryError::feature_unavailable(
+            name.to_string(),
+            "kafka",
+            "kafka",
+        ))
     }
 
     #[cfg(feature = "db-mariadb")]
@@ -495,19 +575,23 @@ impl GrpcClientHandle {
 #[derive(Debug, Clone)]
 pub struct GrpcClientHandle;
 
+#[cfg(feature = "kafka")]
 #[derive(Clone)]
 pub struct KafkaProducerHandle {
     name: String,
     brokers: Vec<String>,
     create_topics_if_missing: bool,
-    #[cfg(feature = "kafka")]
     producer: FutureProducer<KafkaClientContext>,
     timeouts: ConnectorTimeouts,
     extra: JsonMap<String, JsonValue>,
-    #[cfg(feature = "kafka")]
     monitor: CancellationToken,
 }
 
+#[cfg(not(feature = "kafka"))]
+#[derive(Debug, Clone)]
+pub struct KafkaProducerHandle;
+
+#[cfg(feature = "kafka")]
 impl KafkaProducerHandle {
     pub fn name(&self) -> &str {
         &self.name
@@ -521,7 +605,6 @@ impl KafkaProducerHandle {
         self.create_topics_if_missing
     }
 
-    #[cfg(feature = "kafka")]
     pub fn producer(&self) -> &FutureProducer<KafkaClientContext> {
         &self.producer
     }
@@ -542,6 +625,7 @@ impl Drop for KafkaProducerHandle {
     }
 }
 
+#[cfg(feature = "kafka")]
 impl std::fmt::Debug for KafkaProducerHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KafkaProducerHandle")
@@ -551,6 +635,37 @@ impl std::fmt::Debug for KafkaProducerHandle {
             .field("timeouts", &self.timeouts)
             .field("extra", &self.extra)
             .finish()
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+impl KafkaProducerHandle {
+    pub fn name(&self) -> &str {
+        "kafka"
+    }
+
+    pub fn brokers(&self) -> &[String] {
+        &[]
+    }
+
+    pub fn create_topics_if_missing(&self) -> bool {
+        false
+    }
+
+    pub fn timeouts(&self) -> &ConnectorTimeouts {
+        static DEFAULT_TIMEOUTS: ConnectorTimeouts = ConnectorTimeouts {
+            connect: None,
+            request: None,
+            read: None,
+            write: None,
+            query: None,
+        };
+        &DEFAULT_TIMEOUTS
+    }
+
+    pub fn extra(&self) -> &JsonMap<String, JsonValue> {
+        static EMPTY: std::sync::OnceLock<JsonMap<String, JsonValue>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(JsonMap::new)
     }
 }
 
@@ -1607,17 +1722,6 @@ fn build_kafka_handle(
         extra,
         monitor,
     })
-}
-
-#[cfg(not(feature = "kafka"))]
-fn build_kafka_handle(
-    connector: &KafkaConnector,
-) -> Result<KafkaProducerHandle, ConnectorFactoryError> {
-    Err(ConnectorFactoryError::feature_unavailable(
-        connector.name.clone(),
-        "kafka",
-        "kafka",
-    ))
 }
 
 #[cfg(feature = "kafka")]

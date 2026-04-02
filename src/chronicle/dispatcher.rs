@@ -49,8 +49,6 @@ use crate::retry::RetryPlan;
 use bytes::Bytes;
 #[cfg(feature = "grpc")]
 use bytes::{Buf, BufMut, Bytes};
-#[cfg(feature = "grpc")]
-use http::uri::PathAndQuery;
 #[cfg(feature = "http-out")]
 use humantime::parse_duration;
 #[cfg(feature = "smtp")]
@@ -97,6 +95,8 @@ use tokio::time::timeout;
 use tonic::client::Grpc;
 #[cfg(feature = "grpc")]
 use tonic::codec::{Codec, DecodeBuf, Decoder as TonicDecoder, EncodeBuf, Encoder as TonicEncoder};
+#[cfg(feature = "grpc")]
+use tonic::codegen::http::uri::PathAndQuery;
 #[cfg(feature = "grpc")]
 use tonic::metadata::{AsciiMetadataKey, MetadataValue};
 #[cfg(feature = "grpc")]
@@ -731,7 +731,7 @@ impl ActionDispatcher {
                 connector: connector_name.clone(),
                 service: service_name.clone(),
                 method: method_name.clone(),
-                source: ChronicleError::new(err),
+                source: ChronicleError::msg(format!("invalid gRPC path: {err}")),
             })?;
 
         let mut client = Grpc::new(handle.channel());
@@ -2039,6 +2039,7 @@ fn classify_chronicle_error(err: &ChronicleError) -> ConnectorFailureReason {
             }
         }
         ErrorKind::Io(inner) => classify_io_error(inner),
+        #[cfg(any(feature = "db-postgres", feature = "db-mariadb"))]
         ErrorKind::Sqlx(inner) => classify_sqlx_error(inner),
         #[cfg(feature = "kafka")]
         ErrorKind::Kafka(_) => ConnectorFailureReason::Protocol,
@@ -2067,6 +2068,7 @@ fn classify_io_error(err: &std::io::Error) -> ConnectorFailureReason {
     }
 }
 
+#[cfg(any(feature = "db-postgres", feature = "db-mariadb"))]
 fn classify_sqlx_error(err: &sqlx::Error) -> ConnectorFailureReason {
     match err {
         sqlx::Error::PoolTimedOut => ConnectorFailureReason::Timeout,

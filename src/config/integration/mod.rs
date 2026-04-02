@@ -3,9 +3,9 @@ mod chronicles;
 mod connectors;
 mod management;
 
-use serde::de::Error as _;
 use serde::Deserialize;
-use serde_yaml::{self, Value as YamlValue};
+use serde_json::Value as JsonValue;
+use serde_saphyr as yaml;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -57,29 +57,9 @@ impl IntegrationConfig {
     }
 
     fn from_yaml_str(contents: &str) -> Result<Self, IntegrationConfigError> {
-        let mut documents = serde_yaml::Deserializer::from_str(contents);
-        let mut parsed = None;
-        let mut extra_errors = Vec::new();
+        let raw = yaml::from_str::<RawIntegrationFile>(contents)?;
 
-        for (index, document) in documents.by_ref().enumerate() {
-            if index == 0 {
-                parsed = Some(RawIntegrationFile::deserialize(document)?);
-            } else {
-                let _: YamlValue = YamlValue::deserialize(document)?;
-                extra_errors
-                    .push("error[root]: multiple YAML documents are not supported".to_string());
-                break;
-            }
-        }
-
-        let Some(raw) = parsed else {
-            let err = serde_yaml::Error::custom(
-                "integration config must contain exactly one YAML document",
-            );
-            return Err(IntegrationConfigError::Parse(err));
-        };
-
-        Self::from_raw(raw, extra_errors).map_err(IntegrationConfigError::Invalid)
+        Self::from_raw(raw, Vec::new()).map_err(IntegrationConfigError::Invalid)
     }
 
     fn from_raw(
@@ -189,7 +169,7 @@ struct RawIntegrationFile {
     management: Option<management::RawManagementSection>,
     #[serde(default)]
     #[serde(flatten)]
-    extra_fields: BTreeMap<String, YamlValue>,
+    extra_fields: BTreeMap<String, JsonValue>,
 }
 
 #[derive(Debug, Error)]
@@ -197,7 +177,7 @@ pub enum IntegrationConfigError {
     #[error("failed to read integration config: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse integration config: {0}")]
-    Parse(#[from] serde_yaml::Error),
+    Parse(#[from] yaml::Error),
     #[error(transparent)]
     Invalid(IntegrationValidationError),
 }
