@@ -1,0 +1,33 @@
+# SMTP mail-submission connector against a live server. The smtp .fmod runs the
+# lockstep ESMTP conversation (220 -> EHLO/250 -> MAIL FROM/250 -> RCPT TO/250 ->
+# DATA/354 -> body.CRLF/250 -> QUIT/221) over the net transport and reports the
+# delivery result on status_out.
+#
+#   docker run -d --rm --name cu-smtp -p 11025:1025 -p 18025:8025 mailhog/mailhog
+#   fluxor run examples/smtp_sink/linux.yaml            # -> "smtp: delivered"
+#   curl -s localhost:18025/api/v2/messages | head      # the message in MailHog
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: smtp
+    params:
+      endpoint: "7f000001112b"          # 127.0.0.1:11025 ([ip:4][port:2 LE])
+      helo: "chronicle.local"
+      mail_from: "ops@chronicle.local"
+      rcpt_to: "inbox@example.com"
+      body: "Subject: hello from chronicle\r\nFrom: ops@chronicle.local\r\nTo: inbox@example.com\r\n\r\nDelivered by the fluxor-native smtp connector.\r\n"
+
+wiring:
+  - from: smtp.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: smtp.net_in
+  - from: smtp.status_out
+    to: cli_out.bytes_in

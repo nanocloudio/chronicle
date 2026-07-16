@@ -1,0 +1,40 @@
+# Run the PARAM-DRIVEN on-device Aggregation engine module under fluxor-linux.
+#
+# The aggregation definition is NOT baked — the `ir_def` param (hex) is a serialized
+# container carrying window/step/lateness/lanes/correction_horizon + the key/
+# event_time/emit programs + the operator set (sliding windows, out-of-order
+# events, and retractable corrections are all supported). One aggregation binary
+# runs any Aggregation, chosen by param — shipped as checked IR the engine
+# lowers at load (`lower_def`), re-deriving each program's cost rather than
+# trusting it. Regenerate:
+#   cargo test -p chronicle-authoring --test pack print_ir_example_params -- --nocapture
+# or author it entirely on device:
+#   fluxor exec chronicle -- agg 100 10 64 0 0 <key_ir> <time_ir> <emit_ir> 0: 1:<amount_ir>
+#
+# Feed a batch of concatenated typed event frames on stdin — each frame is
+# [count:u8]{[num:u8][ty:u8][len:u16 LE][payload]} with customer_id (bytes),
+# created_at (i64), amount (i64). Events (customer, created_at, amount):
+# (alice,10,100) (alice,20,200) (bob,30,50) (alice,150,999) (bob,260,5):
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00…' \
+#     | fluxor run examples/aggregation/linux.yaml | xxd
+# Expected emissions:
+#   alice [0,100)  count=2 sum=300
+#   bob   [0,100)  count=1 sum=50
+#   alice [100,200) count=1 sum=999
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: aggregation
+    params:
+      # Regenerate: cargo test -p chronicle-authoring --test pack print_ir_example_params -- --nocapture
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d000500010100000012010000000500020200000001000000120200000005000202000000020000001203000000050002030000000100000012040000000500020300000002000000120500000013020000000108000500010300000014"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

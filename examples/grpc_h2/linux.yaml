@@ -1,0 +1,42 @@
+# Composed HTTP/2 client — chronicle graph, fluxor's genuine http.fmod as the
+# H2 transport node. This is the fluxor-native answer to "an HTTP/2 connector":
+# NOT a reimplemented H2 stack in chronicle, but fluxor's foundation http module
+# (mode=1 client, protocol=1 h2c) composed as a graph node. It performs the real
+# HTTP/2 flow — connection preface, SETTINGS exchange + ACK, HPACK HEADERS, and
+# recv-window flow control (WINDOW_UPDATE) — that the stateless codec path fakes.
+#
+# The client auto-issues a GET / on stream 1 at startup; the response body is
+# forwarded on the module's out[1] (file_ctrl) channel, which we pipe to stdout.
+#
+# host_ip is the target IPv4 packed so that linux_net's CMD_CONNECT parse yields
+# the right address: the module sends host_ip.to_le_bytes(), the net provider
+# reads it back with from_le_bytes() and applies to_be() for sin_addr — so
+# host_ip must be the address in NATIVE integer order, 127.0.0.1 = 0x7F000001 =
+# 2130706433 (NOT the byte-reversed 0x0100007F).
+#
+# Verified live on bcm2712 against _h2c_server.yaml (fluxor http.fmod in server
+# mode). Client trace: connected (h2c) -> preface sent -> request sent -> headers
+# done -> transfer done bytes=21, and "Hello from Fluxor h2c" prints on stdout.
+#
+#   fluxor run examples/grpc_h2/_h2c_server.yaml &   # h2c server on :9082
+#   fluxor run examples/grpc_h2/linux.yaml           # -> Hello from Fluxor h2c
+target: linux
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+  net: {}
+modules:
+  - name: http
+    mode: 1          # client
+    protocol: 1      # HTTP/2 cleartext (h2c)
+    host_ip: 2130706433   # 127.0.0.1 (0x7F000001, native order)
+    port: 9082
+    path: "/"
+wiring:
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.file_ctrl
+    to: cli_out.bytes_in

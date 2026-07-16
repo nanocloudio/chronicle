@@ -1,0 +1,37 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+
+# Input: one typed record frame (see pipeline_core.rs). The decision evaluates
+# its first-hit rules over this record.
+# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
+# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so later variants can compose
+# subsets for constrained targets. `full` (default) carries all four and emits
+# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
+# build without a feature rejects that extension's programs FAIL-CLOSED at
+# runtime (BadBuiltin / BadOpcode), never silently.
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
+
+[[ports]]
+name         = "record_in"
+direction    = "input"
+content_type = "OctetStream"
+
+# Output: the selected outcome as a typed record frame — the first rule whose
+# `when` predicate holds constructs its outcome, else the default outcome.
+[[ports]]
+name         = "result_out"
+direction    = "output"
+content_type = "OctetStream"
+
+[observability]
+# Counters live in module state (the token_verify convention); `faulted`
+# is a 0/1 gauge set by a named configuration fault at init/reload.
+metrics = ["fired", "dropped", "errors", "errors_frame", "errors_encode", "faulted"]
+

@@ -1,0 +1,27 @@
+# Aggregation with an EXPLICIT CONTINUOUS trigger (per-event firing). The
+# def is the same customer-total IR def as examples/aggregation/ir.yaml, but with
+# a trailing trigger byte `01` (= Continuous) — lower_def passes it through, and
+# build_spec reads it. Instead of emitting only when the watermark closes a
+# window (the default OnClose), the module ALSO emits a window's RUNNING PARTIAL
+# state after every event folded into it. So three events in the same window
+# produce three early emits (running count 1, 2, 3) — low-latency incremental
+# results — plus the final on close. Explicit triggers, not a hardcoded policy.
+#
+#   # three alice events, all in window [0,100): three partial emits
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x14\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\xc8\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x1e\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x32\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/continuous.yaml | xxd
+#   # -> three CustomerTotal frames with running count 1, 2, 3 (sums 100, 300, 350)
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      # customer-total IR def with a trailing 01 byte = Continuous trigger
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d00050001010000001201000000050002020000000100000012020000000500020200000002000000120300000005000203000000010000001204000000050002030000000200000012050000001302000000010800050001030000001401"
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

@@ -1,0 +1,19 @@
+# On-device DECISION (spec artefact 4): first-hit routing over a record. The
+# decision param is the serialized [nrules][when,outcome][default] container the
+# compiler emits. This one routes amount>1000 -> {1:100}, else -> {1:0}.
+#
+#   printf '\x01\x01\x01\x08\x00\xd0\x07\x00\x00\x00\x00\x00\x00' | fluxor run examples/decision/linux.yaml | xxd  # 2000 -> 100
+#   printf '\x01\x01\x01\x08\x00\xf4\x01\x00\x00\x00\x00\x00\x00' | fluxor run examples/decision/linux.yaml | xxd  # 500 -> 0
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: decision
+    params:
+      decision: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+wiring:
+  - from: cli_in.stdin_out
+    to: decision.record_in
+  - from: decision.result_out
+    to: cli_out.bytes_in

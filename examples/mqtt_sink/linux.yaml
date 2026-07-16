@@ -1,0 +1,53 @@
+# Pipeline → COMPOSED quantum `mqtt_client` publish sink, end-to-end. MQTT is
+# QUANTUM's domain (masterplan: Quantum owns MQTT/Kafka/AMQP messaging), so
+# chronicle COMPOSES its client as a graph node rather than reimplementing it —
+# the same move as composing wave's `http` (gRPC/h2) and wave's `smtp`.
+# The pipeline doubles order.amount (a Transformation stage) then serializes the
+# `app_in` publish frame `[topic_len:u8][topic]<id>=<amount>` (a byte-
+# serialization `encode` stage); mqtt_client owns the CONNECT/CONNACK handshake,
+# the persistent broker connection, keepalive PINGREQ, and PUBLISHes each frame
+# QoS 0. Params are compiler-emitted (regenerate:
+# cargo test -p chronicle-authoring --test pack print_mqtt_sink_ir_params -- --nocapture).
+#
+# broker_ip is the broker IPv4 in native integer order (the module sends
+# broker_ip.to_le_bytes(), which linux_net reads back + to_be()s):
+# 127.0.0.1 = 0x7F000001 = 2130706433.
+#
+#   docker run -d --rm --name cu-mosq -p 11883:1883 eclipse-mosquitto:2 \
+#     mosquitto -c /mosquitto-no-auth.conf
+#   docker exec -d cu-mosq mosquitto_sub -t cu/orders -C 1 > /tmp/sub.txt  # subscriber
+#   printf '\x02\x01\x00\x05\x00ord-7\x02\x01\x08\x00\xfa\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/mqtt_sink/linux.yaml     # publishes cu/orders "ord-7=500"
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: pipeline
+    params:
+      # Regenerate: cargo test -p chronicle-authoring --test pack print_mqtt_sink_ir_params -- --nocapture
+      ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+      encode: "6001000960090063752f6f726465727301000201000000616001003d01000202000000616a"
+  - name: mqtt_client
+    params:
+      broker_ip: 2130706433    # 127.0.0.1
+      broker_port: 11883
+      client_id: "chronicle-sink"
+      # A publish-only sink still needs a subscription topic for the client's
+      # CONNECT/SUBSCRIBE sequence; nothing is wired to app_out.
+      subscribe_topic: "cu/orders"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: mqtt_client.app_in
+  - from: mqtt_client.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: mqtt_client.net_in

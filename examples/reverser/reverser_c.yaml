@@ -1,0 +1,114 @@
+# REVERSER pipeline C — query: GET /messages?max=N lists the newest reversed
+# messages as HTML.
+#
+#   client ─HTTP→ http (wave)
+#            │ req_out
+#            ↓
+#          dec_http   pipeline     rd: conn_id; assert "/messages?max=";
+#            ↓                     DECINT → max
+#          enc_sql    pipeline     ser: [conn_id:u32]SELECT … LIMIT <max>
+#            ↓ request_in
+#          pg_client  (lattice)    cid_len=4: reply = [conn_id][rows]
+#            ↓ reply_out           (first column of every row, \n-joined)
+#          dec_pg     pipeline     rd: [cid → conn_id][rest → body]
+#            ↓
+#          enc_http   pipeline     ser: 200 text/html, body wrapped in
+#            │ resp_in             <html><body><pre>…</pre></body></html>
+#            ↓
+#          http ─HTTP→ client
+#
+# ORDER BY ts DESC over reversed(ts BIGINT PRIMARY KEY) is replay order over
+# the store-minted commit timestamps — "the last up-to-max messages" without
+# any client-side sequence. A result set that would overflow pg_client's
+# reply buffer is REFUSED whole (never truncated); the request then times out
+# at wave rather than silently showing a prefix as if it were everything.
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: ${REV_C_PORT:-15102}
+    host_tcp: 1
+    max_body_kib: 16
+    routes:
+      - path: "/"
+        app: true
+
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_query — the two-field identity.
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # [conn|stream] as ONE u32 → f1 (see the A graph: wave requires the
+      # response to echo its per-request stream generation); SKIP to the
+      # path; assert "/messages?max="; DECINT stops at the first non-digit
+      # (the header block), so the number needs no terminator of its own.
+      decode: "7504014001000000700800710e002f6d657373616765733f6d61783d76400200000041"
+
+  - name: enc_sql
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # [conn_id:u32] SELECT msg FROM reversed ORDER BY ts DESC LIMIT <max>
+      encode: "0100020100000062040160300053454c454354206d73672046524f4d207265766572736564204f524445522042592074732044455343204c494d49542001000202000000616a"
+
+  - name: pg_client
+    params:
+      endpoint: "${REV_PG_ENDPOINT:-7f000001483c}"
+      user: "lattice"
+      database: "lattice"
+      cid_len: 4
+
+  - name: dec_pg
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # [cid:u32 → conn_id][rest → body]. Zero rows = empty body = an empty
+      # (valid) page.
+      decode: "750401400100000078400200000041"
+
+  - name: enc_http
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # HttpResponse: [conn|stream] (f1's u32 = the echoed request
+      # generation), 200, flags=0, ct_len=9, hdr_len=0, body_len =
+      # LEN(body) + 37 (the fixed wrapper), "text/html",
+      # "<html><body><pre>" body "</pre></body></html>".
+      encode: "01000201000000620401600600c80000090000010002020000006410250000000000000050620201600900746578742f68746d6c6011003c68746d6c3e3c626f64793e3c7072653e01000202000000616014003c2f7072653e3c2f626f64793e3c2f68746d6c3e6a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+
+  - from: dec_http.result_out
+    to: enc_sql.record_in
+  - from: enc_sql.result_out
+    to: pg_client.request_in
+    buffer_group: 2
+
+  - from: pg_client.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: pg_client.net_in
+
+  - from: pg_client.reply_out
+    to: dec_pg.record_in
+    buffer_group: 3
+  - from: dec_pg.result_out
+    to: enc_http.record_in
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 4

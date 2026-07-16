@@ -1,0 +1,481 @@
+# THE WHOLE REVERSER ON ONE BOARD — bare-metal Pi 5, one graph, port 80.
+#
+#   browser ─HTTP:80─▶ wave http ─┬▶ A: dec → enc_sql → pg_client ┐
+#                          ▲      └▶ C: dec → enc_sql → pg_client ┤ 127.0.0.1
+#                          │  (tee; each dec LIT-asserts its path) │  :5432
+#            enc_http ◀── dec_pg ◀──────── reply (cid echo) ◀─────┤
+#                                                                  ▼
+#     lattice: pg_edge_anchor → executor → router → consensus → WAL/NVMe
+#                                             │ committed puts (table 1)
+#                                             ▼
+#                     cdc_pump ──publish──┬─▶ loopback_sink (owns the acks)
+#                                         └─▶ B: dec_evt → keep_puts → flip
+#                                                → enc_sql → pg_client ──┘
+#
+# The SAME application as run.sh's distributed shape — identical uproc
+# containers, identical codec programs where the wire is identical — with
+# two deployment substitutions and zero logic changes:
+#   - the MQTT broker leg becomes an in-graph TEE of the pump's publish
+#     channel (loopback_sink still consumes it and answers the ordered_ack
+#     protocol; pipeline B reads the same frames passively), and
+#   - the pg_client connections ride the ip module's LOCAL-DELIVERY
+#     fastpath (fluxor ip: a connect to 127.0.0.1 binds a conn pair
+#     against the local listener — no TCP, no ARP), which is what makes a
+#     client module composable against its own board's listener.
+#
+# Storage half assembled from the PROVEN pi5 configs (relational front from
+# bare-metal-pi5-relational.yaml, state_store worker + deadlines from
+# bare-metal-pi5-disk.yaml, allocator/pump from the linux tier). Modules
+# resolve from the store by CHRONICLE's pins (lattice + clustor + wave).
+target: pi5
+# 2000, not the bench rigs' 1000: the step-deadline ceiling is 16 x tick_us,
+# and this graph IDLES FOR HOURS with cdc_pump checkpointing — each ~384
+# checkpoint puts trigger a whole-memtable flush to FAT32, whose latency
+# grows as run files accumulate. At tick 1000 a late flush crossed 16 ms and
+# the kernel TERMINATED kv_state_worker ("storage unavailable" while the
+# front half still accepts). A pump scan page costs ~8-18 ms on this
+# FAT32/NVMe stack (cursor positioning dominates); tick 2000 gives the
+# 32 ms burst ceiling that clears it, 500 drain-commands/s of queue
+# throughput, and the store's merge-at-3-runs bounds run growth. The
+# real fix is chunking the version-scan drain (lattice task #24).
+tick_us: 2000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  # ── Bare-metal storage stack (the FS contract WAL + LSM use) ────
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    path: /
+    # Demo clean-slate: truncate the root dir and reclaim orphaned .WAL/.LSM
+    # spans from prior runs, so every boot measures the same system AND the
+    # catalog allocator starts at table id 1 (the pump's keyrange depends on
+    # `inbound` being the first CREATE — see lattice_reverser.yaml).
+    clean_root: 1
+    init_free_hint: 20000
+    clear_free_region: 4096
+
+  # ── Relational front ────────────────────────────────────────────
+  - name: pg_edge_anchor
+    params:
+      listen_port: 5432
+  - name: relational_executor
+
+  # ── Lattice KV core ─────────────────────────────────────────────
+  - name: kv_request_router
+    params:
+      replicated: 1
+  - name: kv_state_worker
+    params:
+      # Ordered disk state-store; 8.3 names at the FAT32 root (no mkdir in
+      # the bare-metal FS contract).
+      state_store: 1
+      root_path: 1
+    # REQUIRED for state_store: 1 (default 2 ms deadline kills the module on
+    # its first flush — bare-metal-pi5-disk.yaml has that autopsy). 24/32 ms,
+    # not that config's 12/16: the CDC pump's SCAN_VERSIONS drain reads
+    # spilled run files in ONE step, and this rig MEASURED a 17.6 ms drain
+    # (n=1 spill=1 blocks=31 reads=93) terminating the worker at the 16 ms
+    # ceiling — "storage unavailable" with a healthy front half. 32 ms is
+    # this tick's validator ceiling (16 x tick_us); the pump's page_limit
+    # below bounds the drain from the other side. The REAL fix is chunking
+    # the drain like the flush — a lattice substrate follow-on.
+    step_deadline_us: 24000
+    step_deadline_burst_us: 32000
+    fault_policy: skip
+  - name: lattice_apply_bridge
+
+  # ── MVCC timestamp authority (commit_ts IS the reverser's sequence) ─
+  - name: timestamp_allocator
+    params:
+      allocator_id: 1
+      auto_grant_to: 1
+      auto_grant_interval_steps: 100
+      propose_wrap: 1
+
+  # ── Clustor client-proposal pipeline ────────────────────────────
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: 9090
+      peer0_port: 9090
+  - name: gateway
+    params:
+      self_id: 0
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+      heartbeat_interval_ms: 150
+  - name: durability
+    # Async durable-write path + fail-closed deadline, tuned on this rig —
+    # bare-metal-pi5-relational.yaml carries the measurements.
+    step_deadline_us: 12000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+    params:
+      fsync_mode: 1
+      group_window_ms: 0
+      group_max_pending: 8
+      fence_depth: 8
+      # FAT32 root, 8.3 segment names; fresh WAL each boot (demo rig — the
+      # crash-recovery scenarios are elsewhere and must NOT skip replay).
+      root_path: 1
+      skip_replay: 1
+      segment_bytes: 4194304
+      self_id: 0
+      voter_count: 1
+      partition_id: 0
+
+  # ── CDC egress: pump + quantum's MQTT QoS-1 producer ────────────
+  - name: cdc_pump
+    params:
+      feed_id: 1
+      table_id: 1
+      # [KS_RELATIONAL_TABLE = 0x80000002][table_id = 1], hex.
+      prefix: "8000000200000001"
+      proto: 1              # PROTO_ETCD — matches the wired pair
+      # 5000, not the linux tier's 500: every checkpoint is a KV put, and on
+      # this FAT32/NVMe stack the puts are what drive the memtable flush
+      # cadence (see tick_us above). A demo feed does not need 500 ms
+      # checkpoint granularity; it needs the graph alive tomorrow.
+      checkpoint_interval_ms: 5000
+      resolved_interval_ms: 5000
+      claim_interval_ms: 5000
+      retention_budget_ms: 60000
+      # A PATIENT pump. Each scan page costs the worker one ~8-18 ms drain
+      # step (cursor positioning dominates, so SMALL pages only multiply
+      # the fixed cost — page_limit stays at the default 16). Under an
+      # insert burst a page reply queues behind SQL commands; the default
+      # 2 s stall grace then RE-ISSUED the page, and the retries starved
+      # the executor into a livelock (telemetry: the identical 7.9 ms
+      # drain repeating forever, SQL timing out behind it — the rig
+      # soak's "storage dead at burst 3"). 15 s lets a burst drain.
+      stall_grace_ms: 15000
+  - name: loopback_sink
+
+
+  # ═══ THE APPLICATION — wave http + the three chronicle pipelines ═══
+  # NOTE (2026-08-18): the four wave-facing codecs read/echo
+  # [conn:u16][stream:u16] as ONE opaque u32 in field 1 — wave now mints a
+  # per-request stream GENERATION and drops (silently, uncounted) any
+  # response that does not echo it, so a literal stream=0 answered only the
+  # first request since boot. The token doubles as the 4-byte pg cid, so
+  # nothing between wave and wave changed. Annotated fully in
+  # reverser_a.yaml / reverser_c.yaml, whose programs these mirror.
+  # Containers compiled from reverser.uproc; codecs annotated in the
+  # linux graphs (reverser_a/b/c.yaml) — identical bytes where the wire
+  # is identical. The one new codec is dec_evt's: it reads the pump's
+  # raw SinkPublish channel frames instead of MQTT subscriber frames.
+  - name: http
+    # The `app` variant: h1 + the HANDLER_APP fan-out and nothing else
+    # (−84 KB vs full). The netboot path has an empirical ~3.6 MB image
+    # ceiling — images crossing it boot silent-dead with the payload
+    # unreadable — and this image lives just under it. See also the
+    # observability trim below.
+    variant: app
+    port: 80
+    routes:
+      # EXACT static routes first: a browser fires /favicon.ico (and bare /)
+      # on the SAME keep-alive connection as the app requests, and a path
+      # neither pipeline claims would otherwise ride the app fan-out into a
+      # counted drop — holding the connection for wave's full 30 s app
+      # timeout and hanging every queued request behind it ("died after
+      # 3 messages" in a browser, while curl one-shots never noticed).
+      # Exact matches dispatch before the catch-all, so the noise answers
+      # instantly and never reaches the pipelines.
+      - path: "/favicon.ico"
+        content_type: "image/x-icon"
+        body: " "
+      - path: "/"
+        content_type: "text/html"
+        body: "<html><body><h1>reverser</h1><p><a href=\"/messages?max=10\">/messages?max=10</a> — newest reversed messages</p><p>/reverse?msg=hello — insert</p></body></html>"
+      # The HANDLER_APP catch-all: the path (query included) forwards
+      # verbatim; each pipeline's dec LIT-asserts its own prefix, so the
+      # tee below is the router and an unclaimed path is a counted decode
+      # drop (30 s timeout — only reachable for paths beyond the two the
+      # app serves and the static noise above).
+      - path: "/"
+        app: true
+
+  # ── A: GET /reverse?msg=… → INSERT INTO inbound ─────────────────
+  - name: dec_http_a
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      decode: "7504014001000000700200750201100d0000000000000051700400710d002f726576657273653f6d73673d74400200000041"
+  - name: enc_sql_a
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      encode: "01000201000000620401602e00494e53455254204f52205245504c41434520494e544f20696e626f756e6420286d7367292056414c554553202827010002020000006160020027296a"
+  - name: pg_a
+    type: pg_client
+    params:
+      endpoint: "7f0000013815" # 127.0.0.1:5432 — the ip loopback fastpath
+      user: "lattice"
+      database: "lattice"
+      cid_len: 4
+  - name: dec_pg_a
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      decode: "750401400100000078400200000041"
+  - name: enc_http_a
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      encode: "01000201000000620401600800c800000a00000300600a00746578742f706c61696e6003006f6b0a6a"
+
+  # ── B: CDC put → keep_puts → reverse() → INSERT INTO reversed ───
+  - name: dec_evt
+    type: pipeline
+    params:
+      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      # [0xED][len][corr:u64][flags][klen:u16][plen:u16][msg_key] then the
+      # cdc_wire envelope. Every kind decodes cleanly; keep_puts filters.
+      decode: "710100ed70020070090075020170020074400400000071020001007501014003000000700d00750201744002000000750801400100000041"
+  - name: keep_puts
+    type: decision
+    params:
+      decision: "0105000000120001000203000000100100000000000000200012000000390001000201000000400100000001000202000000100900000000000000010002020000005301001002000000000000005153090040020000004101000000010041"
+  - name: flip
+    type: pipeline
+    params:
+      ir_stages: "01ff1c0005000101000000120100000005000102000000150b00120200000013"
+  - name: enc_sql_b
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      encode: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"
+  - name: pg_b
+    type: pg_client
+    params:
+      endpoint: "7f0000013815"
+      user: "lattice"
+      database: "lattice"
+
+  # ── C: GET /messages?max=… → SELECT → HTML ──────────────────────
+  - name: dec_http_c
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      decode: "7504014001000000700800710e002f6d657373616765733f6d61783d76400200000041"
+  - name: enc_sql_c
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      encode: "0100020100000062040160300053454c454354206d73672046524f4d207265766572736564204f524445522042592074732044455343204c494d49542001000202000000616a"
+  - name: pg_c
+    type: pg_client
+    params:
+      endpoint: "7f0000013815"
+      user: "lattice"
+      database: "lattice"
+      cid_len: 4
+  - name: dec_pg_c
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      decode: "750401400100000078400200000041"
+  - name: enc_http_c
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      encode: "01000201000000620401600600c80000090000010002020000006410250000000000000050620201600900746578742f68746d6c6011003c68746d6c3e3c626f64793e3c7072653e01000202000000616014003c2f7072653e3c2f626f64793e3c2f68746d6c3e6a"
+
+  # (Observability fan-in trimmed: the netboot image ceiling is ~3.6 MB
+  # and operations/adapter_metrics/compaction_coordinator bought the room.
+  # UDP telemetry — debug.to: net — still carries every module heartbeat.)
+
+wiring:
+  # ── nvme block device ↔ fat32 filesystem ────────────────────────
+  - from: nvme.blocks
+    to: fat32.blocks
+
+  # ── Edge ↔ ip (bare-metal TCP) ──────────────────────────────────
+  - from: ip.net_out
+    to: pg_edge_anchor.net_in
+  - from: pg_edge_anchor.net_out
+    to: ip.net_in
+
+  # ── Connector ↔ executor ────────────────────────────────────────
+  - from: pg_edge_anchor.sql_out
+    to: relational_executor.pg_in
+  - from: relational_executor.pg_out
+    to: pg_edge_anchor.sql_in
+
+  # ── Executor ↔ router (PROTO_INTERNAL_SQL pair) ─────────────────
+  - from: relational_executor.kv_out
+    to: kv_request_router.internal_sql_in
+  - from: kv_request_router.compute_out
+    to: relational_executor.kv_in
+
+  # ── Proposal ingress: router → gateway → consensus ─────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # ── Apply path: committed entries → KV worker → response ───────
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.records_out
+    to: timestamp_allocator.committed_state
+  - from: timestamp_allocator.propose_out
+    to: gateway.client_requests
+  - from: kv_state_worker.lease_request
+    to: timestamp_allocator.lease_request
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in
+
+  # ── Clustor persistence (WAL → fat32 → nvme via FS contract) ────
+  - from: consensus.log_append
+    to: durability.entries
+    rate: transaction
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: consensus.wal_compact
+    to: durability.compact_before
+  - from: durability.quorum_durable
+    to: consensus.durable
+  # App state-machine snapshot bodies (required with state_store: 1).
+  - from: durability.app_snapshot_ctl
+    to: kv_state_worker.snapshot_import
+    rate: transaction
+  - from: kv_state_worker.snapshot_export
+    to: durability.app_snapshot_body
+    rate: transaction
+
+  # ── CDC wiring: pump ⇄ router (etcd pair), pump ⇄ sink ─────────
+  - from: cdc_pump.kv_out
+    to: kv_request_router.etcd_in
+  - from: kv_request_router.etcd_out
+    to: cdc_pump.kv_in
+  # The publish channel is TEED: the sink consumes + acks (the ordered_ack
+  # contract), pipeline B reads the SAME frames passively. buffer_group =
+  # mailbox mode so each SinkPublish frame arrives whole.
+  - from: cdc_pump.publish_out
+    to: loopback_sink.publish_in
+    buffer_group: 5
+    buffer_bytes: 16384
+  # B's tee leg gets REAL headroom. The tee blocks when ANY leg is full,
+  # and B consumes one event per step while its own INSERTs contend with
+  # the pump's scans for the store — without this buffer a burst fills
+  # the leg, the tee stalls, the sink stops ACKING, and the pump replays
+  # its window forever (measured: 5000+ scans opened, SQL starved dead).
+  # 64 KiB absorbs ~600 queued envelopes; the sink leg stays snappy and
+  # the ack stream never couples to B's pace.
+  - from: cdc_pump.publish_out
+    to: dec_evt.record_in
+    buffer_group: 6
+    buffer_bytes: 65536
+  - from: loopback_sink.ack_out
+    to: cdc_pump.ack_in
+
+  # ── Observability fan-in → operations → HTTP /metrics ───────────
+
+  # ═══ Application wiring ═══
+  - from: ip.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: ip.net_in
+
+  # One req_out, TWO consumers (tee): each dec asserts its own path.
+  - from: http.req_out
+    to: dec_http_a.record_in
+    buffer_group: 10
+  - from: http.req_out
+    to: dec_http_c.record_in
+    buffer_group: 11
+
+  # A
+  - from: dec_http_a.result_out
+    to: enc_sql_a.record_in
+  - from: enc_sql_a.result_out
+    to: pg_a.request_in
+    buffer_group: 12
+  - from: pg_a.net_out
+    to: ip.net_in
+  - from: ip.net_out
+    to: pg_a.net_in
+  - from: pg_a.reply_out
+    to: dec_pg_a.record_in
+    buffer_group: 13
+  - from: dec_pg_a.result_out
+    to: enc_http_a.record_in
+  - from: enc_http_a.result_out
+    to: http.resp_in
+    buffer_group: 14
+
+  # B (dec_evt.record_in is fed by the publish tee above)
+  - from: dec_evt.result_out
+    to: keep_puts.record_in
+  - from: keep_puts.result_out
+    to: flip.record_in
+  - from: flip.result_out
+    to: enc_sql_b.record_in
+  - from: enc_sql_b.result_out
+    to: pg_b.request_in
+    buffer_group: 15
+  - from: pg_b.net_out
+    to: ip.net_in
+  - from: ip.net_out
+    to: pg_b.net_in
+
+  # C
+  - from: dec_http_c.result_out
+    to: enc_sql_c.record_in
+  - from: enc_sql_c.result_out
+    to: pg_c.request_in
+    buffer_group: 16
+  - from: pg_c.net_out
+    to: ip.net_in
+  - from: ip.net_out
+    to: pg_c.net_in
+  - from: pg_c.reply_out
+    to: dec_pg_c.record_in
+    buffer_group: 17
+  - from: dec_pg_c.result_out
+    to: enc_http_c.record_in
+  - from: enc_http_c.result_out
+    to: http.resp_in
+    buffer_group: 18

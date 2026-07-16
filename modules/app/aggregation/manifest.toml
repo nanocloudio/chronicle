@@ -1,0 +1,84 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+
+# Input: one or more typed event record frames (see agg_core.rs). Each frame is
+# [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload]; the event
+# carries {1: customer_id(str), 2: created_at(i64), 3: amount(i64)}. Multiple
+# frames may arrive concatenated in one read; the module processes each in turn.
+# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
+# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so later variants can compose
+# subsets for constrained targets. `full` (default) carries all four and emits
+# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
+# build without a feature rejects that extension's programs FAIL-CLOSED at
+# runtime (BadBuiltin / BadOpcode), never silently.
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
+
+[[ports]]
+name         = "record_in"
+direction    = "input"
+content_type = "OctetStream"
+
+# Output: one typed record frame per finalized window (a CustomerTotal), emitted
+# when the event-time watermark closes the window.
+[[ports]]
+name         = "result_out"
+direction    = "output"
+content_type = "OctetStream"
+
+# Optional distributed activation barrier (in[1]): commit horizons from Clustor's
+# `consensus.committed_entries` (MSG_COMMITTED_ENTRY: [term:u64 LE][index:u64 LE]
+# [body…]; the bare-batch and 16-byte forms are also accepted).
+# When a `barrier` param names the (term, index) the restored `state` checkpoint
+# was committed at, the module STAGES that state — processes no events, emits
+# nothing — until a horizon here proves the log durable past that index at the
+# matching term (log-index, term-fenced). Unwired ⇒ no barrier gating.
+[[ports]]
+name         = "barrier_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+
+# Optional checkpoint stream (out[1]): the raw AggState::snapshot bytes, emitted
+# every `checkpoint_every` events when that param is set. A downstream sink
+# persists them; on restart the last snapshot is fed back via the `state` param
+# (hex) to resume the windowed state — durable deterministic state.
+[[ports]]
+name         = "checkpoint_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+
+# Producer half of the Clustor binding (raft-propose mode). Wiring proposal_out
+# (out[2]) enables it: the module submits its checkpoint snapshot to
+# consensus.proposals_tagged as MSG_CLIENT_PROPOSAL [0x10][corr:u64][snapshot],
+# learns the assigned log index on assigned_in (in[2], MSG_PROPOSAL_ASSIGNED) and
+# the current term on leader_in (in[3], MSG_LEADER_HINT), and stages itself until
+# barrier_in's commit horizon crosses that index. Unwired ⇒ no raft producer.
+[[ports]]
+name         = "proposal_out"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name         = "assigned_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name         = "leader_in"
+index        = 3
+direction    = "input"
+content_type = "OctetStream"
+
+[observability]
+exempt = "on-device aggregation executor demo — throughput is observed at real pipeline edges (connector modules), not this stateful transform"
+

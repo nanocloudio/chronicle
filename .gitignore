@@ -1,3 +1,14 @@
-Cargo.lock
-target
+/target
+out.bin
+run.err
+.fluxor.lock.lock
 .context
+.claude
+
+# Generated fluxor graphs (emitted by chronicle_authoring::deploy from .uproc)
+examples/authoring/generated/
+
+# Shadow-tracked (standards/test-tracking.md) — versioned in .git-shadow/,
+# never pushed to this repo's GitHub-facing remote.
+/tests/
+/.git-shadow/

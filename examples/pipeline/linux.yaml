@@ -1,0 +1,25 @@
+# Run the param-driven Pipeline executor under fluxor-linux. Ships `ir_stages`
+# (each stage a checked IR — the only format the authoring path emits); the
+# pipeline .fmod transcodes it to the bytecode-stages container at load with
+# lower_stages, re-deriving each stage's cost. Two stages: normalize
+# (Norm{id,amount}) then enrich (Enr{id,amount,doubled: amount*2}).
+# Regenerate: cargo test -p chronicle-authoring --test pack print_ir_example_params -- --nocapture
+#
+# Record frame: [count:u8] then per field [num:u8][type:u8][len:u16 LE][value],
+# type 0=bytes, 1=i64. Input {1:"o-1", 2:"cust-9", 3:250}:
+#   printf '\x03\x01\x00\x03\x00o-1\x02\x00\x06\x00cust-9\x03\x01\x08\x00\xfa\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/pipeline/linux.yaml | xxd
+#   # emits {1:"o-1", 2:250 (fa..), 3:500 (f401..)} — enrich doubled amount.
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: pipeline
+    params:
+      ir_stages: "02ff190005000101000000120100000005000103000000120200000013ff2f000500010100000012010000000500010200000012020000000500010200000001020000000000000011120300000013"
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

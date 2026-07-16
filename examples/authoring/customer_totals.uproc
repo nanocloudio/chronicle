@@ -1,0 +1,31 @@
+// The spec's commerce.customer_totals aggregation, authored in the .uproc DSL.
+// Lowers to chronicle-aggregation::build_aggregation: a pane-aligned event-time
+// window with monoid operators, a watermark, bounded lanes, and a typed emit.
+module commerce.metrics {
+
+  message commerce.Money { units: int = 1; }
+  message commerce.Order {
+    customer_id: string = 1;
+    total: commerce.Money = 2;
+    created_at: int = 3;
+  }
+  message commerce.CustomerTotal {
+    customer_id: string = 1;
+    order_count: int = 2;
+    gross_total: int = 3;
+    window_start: int = 4;
+    window_end: int = 5;
+  }
+
+  aggregation customer_totals(order: commerce.Order) -> commerce.CustomerTotal {
+    key order.customer_id;
+    event_time order.created_at;
+    window tumbling 100;
+    lateness 2000;
+    guard 200;
+    lanes 64;
+    operator order_count = count;
+    operator gross_total = sum(order.total.units);
+    emit commerce.CustomerTotal { customer_id: ctx.key, order_count: ctx.state.order_count, gross_total: ctx.state.gross_total, window_start: ctx.window.start, window_end: ctx.window.end };
+  }
+}

@@ -1,0 +1,32 @@
+# Reverser rig verification (examples/reverser): boots the bare-metal storage
+# tier — relational front + replicated disk back half + CDC pump + quantum
+# mqtt_sink — on the DUT and holds the capture window open while the host
+# side runs `examples/reverser/rig-verify.sh`, which owns the verdict
+# (rig.md §5 diag pattern — the pass rule deliberately never matches).
+#
+# Host-side flow, driven by rig-verify.sh (NOT by hand):
+#   1. quantum broker on 0.0.0.0:9090 (the DUT's mqtt_sink dials
+#      192.168.1.10:9090 — driver host and DUT are different machines)
+#   2. this scenario, backgrounded (build → netboot → power cycle)
+#   3. DDL at 192.168.1.9:5432 once the CDC feed proves live
+#   4. chronicle graphs A/B/C on the host, pg_client pointed at the DUT
+#   5. curl /reverse?msg=… then poll /messages for the reversed echo
+
+name = "reverser_pi5_diag"
+target = "pi5"
+config = "../../examples/reverser/reverser_pi5.yaml"
+
+requires_tags = ["nvme"]
+
+requires = [
+    "deploy.netboot_tftp",
+    "power.cycle",
+    "observe.netboot_fetch",
+    "telemetry.monitor_udp",
+]
+
+timeout_s = 600
+
+[[pass]]
+source = "telemetry.monitor_udp"
+regex = "NEVER_MATCHES_DIAG_CAPTURE_FULL_WINDOW"

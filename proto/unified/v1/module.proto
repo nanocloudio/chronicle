@@ -1,0 +1,82 @@
+// Artefact 7: MODULE — immutable deployment, validation and compatibility unit.
+// Normative basis: OCI artefact distribution. The Module message is the
+// canonical manifest; the packed OCI artefact (fluxor media types) carries this
+// manifest plus the referenced artefact/descriptor/bytecode blobs by digest.
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+import "unified/v1/resource.proto";
+
+message Module {
+  ArtefactHeader header = 1;  // kind = ARTEFACT_KIND_MODULE
+
+  // Content of the module, referenced by digest (content-addressed).
+  repeated ArtefactRef schemas = 2;         // descriptor bundles
+  repeated ArtefactRef expressions = 3;     // checked CEL ASTs / bytecode
+  repeated ArtefactRef transformations = 4;
+  repeated ArtefactRef decisions = 5;
+  repeated ArtefactRef aggregations = 6;
+  repeated ArtefactRef pipelines = 7;
+
+  // Resource contracts and bindings (or binding requirements left to deploy).
+  repeated ArtefactRef resource_contracts = 8;
+  repeated ResourceBindingRequirement binding_requirements = 9;
+
+  // Dependencies on other Modules by digest.
+  repeated ArtefactRef dependencies = 10;
+
+  // Capabilities required/optional of the runtime (spec: CAPABILITY MODEL).
+  repeated CapabilityRequirement capabilities = 11;
+
+  // Entry points: pipelines exposed as the module's activatable surfaces.
+  repeated EntryPoint entry_points = 12;
+
+  // Provenance + signatures (detached, verified at activation).
+  Provenance provenance = 13;
+  repeated Signature signatures = 14;
+}
+
+message ResourceBindingRequirement {
+  QualifiedName contract = 1;
+  bool required = 2;  // if true, activation fails unless a binding is supplied
+}
+
+message EntryPoint {
+  string name = 1;
+  ArtefactRef pipeline = 2;
+}
+
+message Provenance {
+  string source_revision = 1;        // git sha
+  string build_toolchain = 2;
+  ProvenanceClass provenance_class = 3;
+}
+
+enum ProvenanceClass {
+  PROVENANCE_CLASS_UNSPECIFIED = 0;
+  PROVENANCE_CLASS_LOCAL_BUILD = 1;  // io.fluxor.provenance = local-build
+  PROVENANCE_CLASS_PUBLISHED = 2;    // io.fluxor.provenance = published
+}
+
+message Signature {
+  string algorithm = 1;   // e.g. "ed25519"
+  bytes signature = 2;    // over the module's content_digest
+  bytes signer = 3;       // signer fingerprint / public key id
+}
+
+// Activation is a sequence, not a message, but the resolved plan is recorded for
+// audit/rollback (spec §7 Module activation): fetch by digest -> verify digest
+// and signatures -> resolve dependencies -> load descriptors -> validate checked
+// CEL -> validate artefact references -> resolve capabilities -> bind resources
+// -> prepare state -> cross activation barrier -> atomically activate -> drain
+// prior digest.
+message ActivationPlan {
+  Digest module = 1;
+  repeated Digest resolved_dependencies = 2;
+  repeated string satisfied_capabilities = 3;
+  repeated ResourceBinding bindings = 4;
+  Digest supersedes = 5;   // prior active module digest to drain
+  uint64 activation_barrier_index = 6; // log-index barrier (Clustor)
+}

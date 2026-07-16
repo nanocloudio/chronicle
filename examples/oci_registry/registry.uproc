@@ -1,0 +1,64 @@
+// The OCI registry's dispatch. README.md has the rationale. Under 2 KB:
+// `chronicle author` decodes a document into a 2048-byte buffer.
+module oci.registry {
+
+  // wave's HttpRequest, projected. conn_id/stream_id ride through: the
+  // gateway correlates its answer by them.
+  message oci.Request {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    path: string = 4;
+  }
+
+  // What storage is asked. `key` is the path verbatim — an object key is
+  // opaque bytes, so no parsing is needed.
+  message oci.S3Call {
+    conn_id: int = 1;
+    op: int = 2;
+    key: string = 3;
+  }
+
+  // Its answer; conn_id returns via the connector's correlation id.
+  message oci.S3Reply {
+    conn_id: int = 1;
+    status: int = 2;
+    body: string = 3;
+  }
+
+  enum GET = 1;      // wave's wire/method.rs
+  enum S3_GET = 80;  // 0x50, loam's s3_wire
+  enum S3_HEAD = 82; // 0x52
+
+  // Method → storage op. Every path is a key, `/v2/` included: discovery is
+  // a seeded object, not a branch, so the chain never forks.
+  decision to_s3(req: oci.Request) -> oci.S3Call {
+    when req.method == GET ->
+      oci.S3Call { conn_id: req.conn_id, op: S3_GET, key: req.path };
+    default ->
+      oci.S3Call { conn_id: req.conn_id, op: S3_HEAD, key: req.path };
+  }
+
+  // Identity stages: a codec-only node has no program and fails closed with
+  // VERSION_UNAVAILABLE. `pass_call`'s program serves the S3Reply nodes too.
+  transformation pass_req(r: oci.Request) -> oci.Request {
+    oci.Request {
+      conn_id: r.conn_id, stream_id: r.stream_id,
+      method: r.method, path: r.path
+    }
+  }
+
+  transformation pass_call(c: oci.S3Call) -> oci.S3Call {
+    oci.S3Call { conn_id: c.conn_id, op: c.op, key: c.key }
+  }
+
+  pipeline serve(req: oci.Request) -> oci.S3Call {
+    call decoded = pass_req(req);
+    call called = to_s3(decoded);
+    return called;
+  }
+
+  entry serve = serve;
+
+  provenance revision "oci-v2-read-path" toolchain "chronicle-authoring";
+}

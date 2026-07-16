@@ -1,0 +1,51 @@
+// Artefact 4: DECISION — evaluates ordered rules and selects deterministic
+// outcomes. Rules are CHILDREN of a Decision, not independent artefacts.
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message Decision {
+  ArtefactHeader header = 1;
+
+  TypeRef input = 2;
+  TypeRef output = 3;
+
+  HitPolicy hit_policy = 4;
+
+  // Ordered rules. `order` matters and is preserved in canonical form; higher
+  // `priority` breaks ties independent of order where the hit policy allows.
+  repeated Rule rules = 5;
+
+  // Default outcome when no rule matches (spec: defaults).
+  Outcome default = 6;
+
+  // Whether to emit a structured explanation of which rule(s) fired and why
+  // (spec: structured explanation output).
+  bool explain = 7;
+}
+
+// Deterministic conflict handling when multiple rules match (spec: hit policy,
+// multiple-match behavior, deterministic conflict handling).
+enum HitPolicy {
+  HIT_POLICY_UNSPECIFIED = 0;
+  HIT_POLICY_FIRST = 1;      // first matching rule in order wins
+  HIT_POLICY_PRIORITY = 2;   // highest priority wins, ties by order
+  HIT_POLICY_UNIQUE = 3;     // exactly one rule may match, else error
+  HIT_POLICY_COLLECT = 4;    // collect all matching outcomes (output is repeated)
+}
+
+message Rule {
+  string name = 1;
+  int32 priority = 2;
+  // `when` predicate: compiled expression over `input`, result type bool.
+  CompiledExpression when = 3;
+  Outcome outcome = 4;
+  Documentation documentation = 5;
+}
+
+message Outcome {
+  // Compiled expression constructing an `output` message.
+  CompiledExpression return_value = 1;
+}

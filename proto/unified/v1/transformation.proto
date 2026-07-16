@@ -1,0 +1,48 @@
+// Artefact 3: TRANSFORMATION — maps typed input values to typed output values.
+// Construction is a checked CEL expression (or a canonical mapping plan) that
+// builds the output message. Reuses the Expression evaluator at runtime.
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message Transformation {
+  ArtefactHeader header = 1;
+
+  TypeRef input = 2;
+  TypeRef output = 3;
+  Cardinality cardinality = 4;
+
+  // Exactly one construction strategy.
+  oneof construction {
+    // Compiled expression constructing an `output` message from `input`.
+    CompiledExpression compiled = 5;
+    // Canonical field-by-field mapping plan (declarative alternative to CEL).
+    MappingPlan plan = 6;
+  }
+
+  // Optional pre/post validation via Expression references returning bool.
+  repeated ArtefactRef validation = 7;
+
+  uint64 max_cost = 8;
+  StructuredError on_error = 9; // template for structured failure
+}
+
+enum Cardinality {
+  CARDINALITY_UNSPECIFIED = 0;
+  CARDINALITY_ONE = 1;        // one input -> one output
+  CARDINALITY_OPTIONAL = 2;   // one input -> zero or one output (filter)
+  CARDINALITY_MANY = 3;       // one input -> zero or more outputs (fan-out)
+}
+
+// A declarative mapping plan: each entry sets an output field from a checked
+// CEL expression over the input. Ordered for canonical representation.
+message MappingPlan {
+  repeated FieldMapping fields = 1;
+}
+
+message FieldMapping {
+  string output_field_path = 1;   // e.g. "customer_id" or "totals.gross"
+  CompiledExpression value = 2;   // compiled expression over `input`
+}

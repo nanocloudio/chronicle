@@ -1,0 +1,42 @@
+# MULTI-VERSION pipeline on device: one instance holds several versions of its
+# program at once, and each record picks one — default, or pinned by the
+# X-Module-Version selector (record field 255). An unknown/unloaded version fails
+# CLOSED. Blue-green is a live default flip over the control port (no restart, no
+# separate deployment). Params come from a ReleaseManifest (regenerate:
+#   cargo test -p chronicle-authoring --test release print_multi_version_demo_params -- --nocapture).
+#
+# Two versions are loaded: v1 (default) = pass-through amount, v2 = amount*2. The
+# `encode` renders the result field as text.
+#
+# Selection (no control message) — `fluxor run` works directly:
+#   printf '\x01\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00' | fluxor run examples/multi_version/linux.yaml   # -> 10 (default v1)
+#   printf '\x02\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\xff\x00\x02\x00v2' | fluxor run … # -> 20 (pinned v2)
+#   printf '…\xff\x00\x02\x00v9' | fluxor run …                                                    # -> VERSION_UNAVAILABLE
+#
+# Blue-green flip (hot reload): a control message on the `control` port flips the
+# default. In production the release controller sends the ReleaseManifest control
+# ops (release::set_default_msg etc.). Here the demo injects one via cli_in's
+# args_out — which needs the runtime's own argv, so run fluxor-linux directly:
+#   FL=target/aarch64-unknown-linux-gnu/release/fluxor-linux
+#   printf '' | fluxor run examples/multi_version/linux.yaml >/dev/null   # build the bundle
+#   printf '\x01\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00' \
+#     | $FL --config target/linux/linux/config.bin --modules target/linux/linux/modules.bin -- $'\x02\x02v2'
+#   # -> 20  (SET_DEFAULT(v2) applied live; default traffic now runs v2, no restart)
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+
+modules:
+  - name: pipeline
+    params:
+      versions: "0200a94c06d1373dc8c3027631150001ff040000000d0001000202000000400100000041f27e8a41225bf2110276321f0001ff0600000017000100020200000010020000000000000052400100000041"
+      encode: "01000201000000616001000a6a"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: cli_in.args_out
+    to: pipeline.control
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

@@ -1,0 +1,77 @@
+version          = "0.1.0"
+type             = "Cli"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+timer_class      = "agnostic"
+
+# The chronicle toolchain CLI as a fluxor cli-applet (rfc_cli_execution.md):
+# ONE PIC module dispatches chronicle subcommands over the cli host surface.
+# Run: `fluxor exec chronicle -- <cmd>`.
+#
+#   chronicle stages|decision|agg <ir_hex>… assemble a device param container
+#   chronicle check <ir_hex>                validate + lower an ir_stages container
+#   chronicle eval <ir_hex> <record_hex>    dry-run a record through the stages
+#   chronicle seal|seal-tf …                seal an Expression / Transformation
+#   chronicle seal-module …                 seal the deployment unit
+#   chronicle digest <hex>                  sha256 content digest (version identity)
+#   chronicle help
+#
+# The seal commands are what make a node SELF-HOSTING: an artefact's identity is
+# the sha256 of its canonical protobuf encoding, produced here by
+# `modules/common/{pb_core,artefact_core}.rs` with no allocator and no `prost`,
+# and proven equal to the host toolchain's digest
+# (`chronicle-canonical/tests/pb_differential.rs`). A device can therefore
+# author, identify and publish work without a Linux build host.
+#
+# Everything runs the SAME include!'d cores the on-device engines run
+# (modules/common/), so a `check` here proves exactly what a device proves at
+# load — same lowerer, same cost derivation.
+
+# argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
+# Sized for `seal-module`, the widest form: 4 fixed arguments plus a
+# <kind> <pkg.sym> <digest> triple per contained artefact.
+# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
+# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so later variants can compose
+# subsets for constrained targets. `full` (default) carries all four and emits
+# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
+# build without a feature rejects that extension's programs FAIL-CLOSED at
+# runtime (BadBuiltin / BadOpcode), never silently.
+[[variant]]
+name     = "full"
+features = ["strings", "math", "encoders", "bindings"]
+default  = true
+
+[[ports]]
+name         = "args"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# stdout → cli_out.bytes_in.
+[[ports]]
+name         = "stdout"
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 8192
+
+# exit code [i32 LE] → cli_out.exit_in.
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+# Content-addressed blob storage: `put`/`get` keep sealed artefacts under
+# `blobs/sha256/<hex>`, so a node that authors an artefact can also serve it.
+# Optional in practice — every other subcommand is pure compute and runs with no
+# provider wired; only put/get need this.
+[[resources]]
+requires_contract = "storage.object"
+access            = "write"
+
+[observability]
+exempt = "run-to-completion CLI applet; no steady-state throughput to observe"
+

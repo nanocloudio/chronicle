@@ -1,0 +1,133 @@
+// Common model shared by every artefact in the Unified Deterministic Processing
+// Specification. Protobuf is the canonical type system; these messages ARE the
+// canonical representation of the common model. Authoring syntax (the DSL) is
+// non-normative and compiles to these messages.
+//
+// Identity rule: an artefact's `content_digest` is computed over the canonical
+// serialization of the artefact message with the `content_digest` field itself
+// cleared. Canonical serialization uses deterministic protobuf encoding (fields
+// in tag order, no unknown fields, packed repeated scalars).
+syntax = "proto3";
+
+package unified.v1;
+
+// Content-addressed identity. Format mirrors OCI: `<algorithm>:<hex>`.
+message Digest {
+  string algorithm = 1;  // e.g. "sha256"
+  bytes value = 2;       // raw digest bytes
+}
+
+// Fully-qualified artefact name, e.g. "commerce.customer_key".
+// A named reference in the DSL is written `@commerce.customer_key`.
+message QualifiedName {
+  // Package path, dot-joined, e.g. "commerce" or "commerce.orders".
+  string package = 1;
+  // Terminal symbol, e.g. "customer_key".
+  string symbol = 2;
+}
+
+// The seven semantic artefacts plus the Resource contract. Resource is content-
+// addressed like an artefact but is explicitly NOT an eighth semantic artefact
+// (spec: RESOURCE MODEL) — it describes runtime realization.
+enum ArtefactKind {
+  ARTEFACT_KIND_UNSPECIFIED = 0;
+  ARTEFACT_KIND_SCHEMA = 1;
+  ARTEFACT_KIND_EXPRESSION = 2;
+  ARTEFACT_KIND_TRANSFORMATION = 3;
+  ARTEFACT_KIND_DECISION = 4;
+  ARTEFACT_KIND_AGGREGATION = 5;
+  ARTEFACT_KIND_PIPELINE = 6;
+  ARTEFACT_KIND_MODULE = 7;
+  ARTEFACT_KIND_RESOURCE = 8;
+}
+
+// Free-form documentation attached to any artefact or member.
+message Documentation {
+  string summary = 1;      // one line
+  string description = 2;  // long form, markdown permitted (non-normative)
+}
+
+// A typed key/value annotation. Keys are reverse-DNS to avoid collision,
+// e.g. "io.nanocloud.owner". Annotations never affect the content digest's
+// semantics but ARE part of the canonical representation.
+message Annotation {
+  string key = 1;
+  string value = 2;
+}
+
+// A capability the artefact requires of the runtime, e.g.
+// "expression.cel.strict.v1", "aggregation.event-time.sliding.v1".
+// Optional capabilities degrade gracefully; required ones are rejected at
+// activation if unsupported (spec: CAPABILITY MODEL).
+message CapabilityRequirement {
+  string capability = 1;
+  bool optional = 2;
+}
+
+// Compatibility metadata for semantic + structural diffing (spec: COMMON MODEL,
+// MODULE). Semver plus an optional predecessor digest establishing a lineage.
+message CompatibilityMetadata {
+  string semantic_version = 1;         // e.g. "1.4.0"
+  Digest predecessor = 2;              // prior version's content digest, if any
+  CompatibilityLevel level = 3;        // relationship to predecessor
+}
+
+enum CompatibilityLevel {
+  COMPATIBILITY_LEVEL_UNSPECIFIED = 0;
+  COMPATIBILITY_LEVEL_IDENTICAL = 1;   // same canonical bytes
+  COMPATIBILITY_LEVEL_COMPATIBLE = 2;  // backward-compatible change
+  COMPATIBILITY_LEVEL_BREAKING = 3;    // incompatible change
+}
+
+// Reference to a Protobuf type by fully-qualified protobuf name, resolved
+// within a Schema's descriptor closure (e.g. "commerce.Order").
+message TypeRef {
+  string message_name = 1;  // fully-qualified protobuf message or enum name
+  Digest schema = 2;        // digest of the Schema artefact providing the closure
+}
+
+// A `@qualified.name` reference to another artefact, optionally digest-pinned
+// for immutable resolution.
+message ArtefactRef {
+  QualifiedName name = 1;
+  ArtefactKind kind = 2;   // expected kind of the referent
+  Digest pinned = 3;       // optional: exact content digest to resolve
+}
+
+// Header carried by every artefact (spec: COMMON MODEL). Embedded as field 1 of
+// each artefact message so the shared identity/metadata surface is uniform.
+message ArtefactHeader {
+  QualifiedName name = 1;
+  ArtefactKind kind = 2;
+  Documentation documentation = 3;
+  repeated Annotation annotations = 4;
+  repeated CapabilityRequirement capabilities = 5;
+  CompatibilityMetadata compatibility = 6;
+  // Digest over the enclosing artefact's canonical representation with this
+  // field cleared. MUST be recomputable byte-for-byte from the artefact.
+  Digest content_digest = 7;
+}
+
+// A structured, deterministic error surface reused across artefacts. Errors are
+// values, never panics; the spec requires "structured errors" for
+// Transformation, Decision, Aggregation, and Pipeline.
+message StructuredError {
+  string code = 1;                 // stable machine code, e.g. "TYPE_MISMATCH"
+  string message = 2;              // human-readable, deterministic
+  repeated Annotation details = 3; // structured context
+}
+
+// A pure expression in its canonical, load-time-checked, execution-ready form.
+// Normative basis is Checked CEL; this message is what the runtime actually
+// consumes. `bytecode` is the bounded, no-alloc form the evaluator executes;
+// `source` is the non-normative authoring text kept for diagnostics/round-trip.
+// `checked_cel_ast` is reserved for the normative cel.expr.CheckedExpr, populated
+// once the real Checked-CEL front end lands (until then the compiler lowers
+// directly to bytecode). Reused by Expression, Transformation, Decision, and the
+// CEL slots of Aggregation.
+message CompiledExpression {
+  string source = 1;           // non-normative CEL authoring text
+  bytes bytecode = 2;          // bounded bytecode executed by the runtime
+  uint64 max_cost = 3;         // static execution-cost ceiling
+  bytes checked_cel_ast = 4;   // reserved: serialized cel.expr.CheckedExpr
+}

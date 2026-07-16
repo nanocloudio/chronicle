@@ -1,0 +1,29 @@
+# Aggregation via the IR-AT-LOAD path. Ships `ir_def` (a checked IR-def: key /
+# event-time / emit / op-selector programs each a flat checked IR) instead of
+# `def` (pre-lowered bytecode); the aggregation .fmod transcodes it to the
+# bytecode def at load with lower_def, re-deriving every program's cost.
+# Customer totals over a 100-tick tumbling window (Count + Sum(amount)). The
+# lowered def is byte-identical to examples/aggregation/linux.yaml's `def` (see
+# ir_def_container_lowers_at_load_into_the_bytecode_def), so it aggregates
+# identically. Regenerate: cargo test -p chronicle-authoring --test pack
+# print_ir_example_params -- --nocapture
+#
+# Event frame per record: [count][num][type:0=bytes/1=i64][len:u16][value] for
+# {customer_id, created_at, amount}. A window only EMITS once the watermark
+# passes its end, so a single stdin blob (one event) loads/lowers but won't emit
+# — the same as the bytecode example; a live emit needs a multi-event source.
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/ir.yaml    # loads + lowers the IR def
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d000500010100000012010000000500020200000001000000120200000005000202000000020000001203000000050002030000000100000012040000000500020300000002000000120500000013020000000108000500010300000014"
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

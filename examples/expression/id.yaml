@@ -1,0 +1,24 @@
+# Same param-driven expression `.fmod` as linux.yaml, but a DIFFERENT `program`
+# param — order.id (field 1) instead of order.customer_id (field 2). Proves one
+# evaluator binary runs any Expression, chosen purely by param (no rebuild).
+#
+#   printf '\x02\x01\x03\x00o-1\x02\x07\x00cust-42' \
+#     | fluxor run examples/expression/id.yaml > out.bin
+#   xxd out.bin   # -> o-1
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: expression
+    params:
+      program: "0100020100000000"   # order.id (field 1)
+      max_cost: 3
+
+wiring:
+  - from: cli_in.stdin_out
+    to: expression.record_in
+  - from: expression.result_out
+    to: cli_out.bytes_in

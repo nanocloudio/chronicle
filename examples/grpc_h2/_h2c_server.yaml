@@ -1,0 +1,19 @@
+# Local HTTP/2 cleartext (h2c) server — the LIVE target for the composed h2
+# client example (examples/grpc_h2/linux.yaml). Fluxor's own http.fmod in server
+# mode, serving a fixed body at "/". Used only to validate the client graph.
+target: linux
+scheduler:
+  accept_cycles: true
+platform:
+  net: {}
+modules:
+  - name: http
+    port: 9082
+    routes:
+      - path: "/"
+        body: "Hello from Fluxor h2c"
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in

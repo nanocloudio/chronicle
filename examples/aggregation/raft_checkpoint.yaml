@@ -1,0 +1,96 @@
+# FULL on-device Clustor binding (state.distributed.raft.v1), producer + gate.
+# One fluxor graph splicing chronicle's aggregation module into a single-node
+# Clustor commit pipeline (clustor's consensus + durability composites,
+# workspace-resolved). aggregation runs in raft-propose mode:
+#
+#   1. boot: aggregation STAGED (processes no events yet).
+#   2. consensus self-elects leader (voter_count=1) after election_timeout,
+#      emits leader_state -> aggregation learns the term.
+#   3. aggregation proposes its checkpoint snapshot on proposal_out ->
+#      consensus.proposals_tagged (MSG_CLIENT_PROPOSAL, corr=1).
+#   4. raft assigns a log index -> consensus.log_append -> durability.entries;
+#      the WAL fsync feeds the durability ledger (interior seam; single-node
+#      self-quorum, one voter) -> quorum_durable -> consensus.durable ->
+#      committed entry [term][index].
+#   5. proposal_assigned -> aggregation records (term, index) in the BarrierGate.
+#   6. consensus.committed_entries -> aggregation.barrier_in crosses the barrier
+#      (index >= append_index, term match) -> aggregation ACTIVATES.
+#   7. only now does it drain record_in and emit — so output appears ONLY after
+#      the checkpoint is durably committed through real raft.
+#
+# CROSS-PROJECT SETUP (aggregation lives here; consensus/durability live in the
+# sibling clustor project). `fluxor run` resolves a module's .fmod from
+# target/fluxor/<t>/modules and its port names from a source search path, so
+# stage both from clustor once:
+#   C=../clustor/modules/app; D=target/fluxor/bcm2712/modules; mkdir -p examples/modules
+#   for m in consensus durability; do \
+#     cp ../clustor/target/fluxor/bcm2712/modules/$m.fmod $D/; \
+#     ln -sfn "$(cd $C/$m && pwd)" examples/modules/$m; done
+#
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/raft_checkpoint.yaml
+#   # log: staged -> leader term -> proposed -> assigned -> barrier crossed:
+#   # activated, then the alice partial (count 1, sum 100) emits.
+target: linux
+tick_us: 1000
+scheduler:
+  accept_cycles: true   # raft feedback cycle (durability acks/proofs -> consensus)
+
+platform:
+  cli: {}
+
+modules:
+  - name: aggregation
+    params:
+      # customer-total IR def + trailing 01 = Continuous (emit a partial/event).
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d00050001010000001201000000050002020000000100000012020000000500020200000002000000120300000005000203000000010000001204000000050002030000000200000012050000001302000000010800050001030000001401"
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+  - name: durability
+
+wiring:
+  # ── events + output (gated by activation) ────────────────
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in
+
+  # ── aggregation -> raft (proposal) ───────────────────────
+  - from: aggregation.proposal_out
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: aggregation.assigned_in
+  - from: consensus.leader_state
+    to: aggregation.leader_in
+
+  # ── raft commit pipeline (single-node self-quorum) ───────
+  - from: consensus.log_append
+    to: durability.entries
+  # Dedicated boot handoff: raft resumes its index at the exact WAL replay
+  # high-water before proposal intake opens. Never multiplex this onto
+  # durability.flushed, which also fans out durability acknowledgements.
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  # Local fsync acks -> consensus stamps local_wal_durable_index. The
+  # single-replica ledger reaches quorum on the local fsync alone (interior
+  # seam) — no cross_durability_ack fan-in needed with one voter.
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── entry-body read-back (gap refetch for the apply pipeline) ──
+  - from: consensus.entry_request
+    to: durability.entry_request
+    rate: transaction
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+
+  # ── commit horizon -> aggregation barrier ────────────────
+  # Per-entry MSG_COMMITTED_ENTRY [term][index][body] stream; the barrier
+  # gate reads the (term, index) prefix.
+  - from: consensus.committed_entries
+    to: aggregation.barrier_in

@@ -1,0 +1,26 @@
+# Aggregation CHECKPOINT emit (durable state). The aggregation module
+# runs the customer-total agg (ir_def, lowered at load) and — with
+# `checkpoint_every: 1` — emits a raw AggState::snapshot on out[1]
+# (checkpoint_out) after every event, here wired to stdout so you can capture it.
+# A downstream sink would persist these bytes; on restart the last snapshot is
+# fed back via the `state` param (hex) to resume the windowed state. This closes
+# the checkpoint loop with examples/aggregation/ir.yaml's restore-at-load half.
+#
+#   # feed one event; the snapshot bytes appear on stdout after the build log:
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/checkpoint.yaml | xxd | tail
+#   # -> a snapshot: [ver=1][max_event_time=10][counters][nlanes=1][alice lane…]
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d000500010100000012010000000500020200000001000000120200000005000202000000020000001203000000050002030000000100000012040000000500020300000002000000120500000013020000000108000500010300000014"
+      checkpoint_every: 1
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.checkpoint_out
+    to: cli_out.bytes_in

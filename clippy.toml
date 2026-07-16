@@ -1,10 +1,26 @@
-# Clippy configuration for chronicle
-# Disallow broad allow attributes to prevent unnoticed dead code
-
-# Disallow allow_attributes - any #[allow(...)] must be justified
-allow-unwrap-in-tests = true
-
-# Threshold for clippy::enum-variant-size lint (default 200 bytes)
-# Large enum variants are acceptable for phase plans where boxing would
-# add unnecessary indirection.
-enum-variant-size-threshold = 512
+# Clippy configuration for the PIC module sources.
+#
+# `msrv` is the load-bearing key. `fluxor ci` clippies `modules/**` directly with
+# `clippy-driver` — there is no root manifest to lint instead, since the last
+# crate (`chronicle-canonical`) was retired on 2026-08-08 — and clippy-driver
+# reads THIS file, not a `Cargo.toml`. Without the key clippy assumes the
+# installed toolchain, which changes which lints fire in both directions: too low
+# and it rejects APIs the modules already use, too high and it demands newer ones.
+#
+# WHY 1.87 AND NOT THE 1.81 FLOOR IN ../standards/lints.md §0. That standard sets
+# a floor, and these modules are past it: `u64::is_multiple_of` (stable 1.87) is
+# used in `modules/common/hex_core.rs`, `agg_core.rs` and two places in
+# `modules/app/chronicle_cli/mod.rs`. Clippy itself asked for those — the
+# `manual_is_multiple_of` lint fired the first time module clippy ever ran, which
+# was the day the crate was removed and `fluxor ci` switched to linting the PIC
+# sources directly. Before that, nothing checked `modules/**` against any MSRV:
+# the retired `Cargo.toml` declared `rust-version = "1.81"` for the CARGO crates,
+# and modules are not cargo crates.
+#
+# So 1.87 is not a relaxation. It is the first honest statement of what these
+# modules require. Lowering it to 1.81 would mean rewriting working device code
+# to satisfy a number no build has ever enforced.
+#
+# Raise this only alongside a deliberate decision about which silicon toolchains
+# must still build Chronicle.
+msrv = "1.87"

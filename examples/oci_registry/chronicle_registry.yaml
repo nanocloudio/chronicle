@@ -1,0 +1,171 @@
+# TIER 2 of the OCI registry: chronicle, serving the registry protocol.
+#
+# No registry module exists, and none should. What runs is chronicle's GENERIC
+# engines carrying registry-shaped params, plus two connectors pinned from the
+# store. `registry.uproc` compiles to those params; nothing about `/v2/` is
+# baked into a `.fmod`.
+#
+#   client ─HTTP→ http (wave)              terminates HTTP
+#            │ req_out (HttpRequest)
+#            ↓
+#          dec_http   pipeline             rd bytecode: envelope → Request
+#            ↓
+#          route      decision             registry.uproc's `to_s3`
+#            ↓
+#          enc_s3     pipeline             ser bytecode: S3Call → S3Request
+#            ↓ request_in
+#          s3         (wave)               SigV4-signs and performs it
+#            ↓ response_out
+#          dec_s3     pipeline             rd bytecode: S3Response → S3Reply
+#            ↓
+#          enc_http   pipeline             ser bytecode: S3Reply → HttpResponse
+#            │ resp_in
+#            ↓
+#          http ─HTTP→ client
+#
+# ONE UNIFORM CHAIN, NO FORK. Every request path becomes an object key —
+# `/v2/` included, whose discovery body is a SEEDED OBJECT rather than a branch
+# in the graph. That is what lets a registry be a straight line: the expression
+# VM has no conditional, so a fork would need a second graph, and there is
+# nothing here worth forking for.
+#
+# The correlation survives the storage round trip because `conn_id` rides in the
+# connector's `cid` field and returns in the reply — the same trick
+# `(conn_id, stream_id)` plays across the HTTP fan-out.
+#
+# Run it with ./run.sh, which starts both tiers. See README.md.
+target: linux
+tick_us: 100
+
+# Two cycles — http↔linux_net and http↔engines — and both are request/response
+# pairs, which is what a cycle IS here.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  # ── wave: the HTTP server ────────────────────────────────────────────────
+  - name: http
+    # Ports follow the environment so two registries can run side by side, and
+    # so `run.sh` has ONE source of truth for each. Fluxor substitutes
+    # `${VAR:-default}` before the YAML is parsed, so the defaults are what a
+    # bare `fluxor build` uses.
+    port: ${REGISTRY_PORT:-15000}
+    # 1 = downstream is `linux_net`: the kernel owns TCP segmentation.
+    host_tcp: 1
+    max_body_kib: 64
+    routes:
+      # `app: true` = HANDLER_APP, the request/response fan-out. The trailing
+      # slash makes it a prefix route, so all of `/v2/...` arrives with its
+      # full path — a registry cannot key on a path it was not given.
+      - path: "/v2/"
+        app: true
+
+  # ── request path ─────────────────────────────────────────────────────────
+  #
+  # Every pipeline node carries BOTH a codec and an `ir_stages` program. The
+  # stage is not decoration: a codec-only node has no program and fails closed
+  # with a `{1:"VERSION_UNAVAILABLE"}` record, which downstream looks like an
+  # ordinary record and surfaces two hops away as a decision that will not fire.
+  #
+  # `ir_stages` values are `registry.uproc`'s identity transformations, via:
+  #   H=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' \
+  #        examples/oci_registry/registry.uproc)
+  #   fluxor exec chronicle -- graph "$H" serve linux
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_req — four fields
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # conn_id/stream_id/method as ints, then the path BYTES via TAKEN on the
+      # length the envelope already carries. The path is the object key, so it
+      # is taken whole rather than parsed — an S3 key is opaque bytes.
+      decode: "75020140010000007502014002000000750101400300000070010075020170040074400400000041"
+
+  - name: route
+    type: decision
+    params:
+      # registry.uproc's `to_s3`: method → storage op, conn_id and key through.
+      decision: "01050000001200010002030000001001000000000000002000090000002700010002010000004001000000105000000000000000400200000001000204000000400300000041090000002700010002010000004001000000105200000000000000400200000001000204000000400300000041"
+
+  - name: enc_s3
+    type: pipeline
+    params:
+      # pass_call — three fields
+      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      # S3Request: [op][cid u32][bucket_len u16][key_len u16][body_len u32]
+      # ["registry"][key]. `cid` carries conn_id across the round trip, and
+      # `key_len` is LEN of the key field, so the frame stays self-consistent
+      # with whatever path arrived.
+      encode: "01000202000000620101010002010000006204016002000800010002030000006462020160040000000000600800726567697374727901000203000000616a"
+
+  # ── loam: the storage connector ──────────────────────────────────────────
+  #
+  # Pinned from the store, not vendored. It signs each request with SigV4 —
+  # which is why storage is a compiled module and not bytecode: a codec cannot
+  # compute an HMAC. Points at tier 1.
+  - name: s3
+    params:
+      # `endpoint` is `[ip:4][port:2 LE]` packed as hex, so the port cannot be
+      # interpolated as a decimal — `run.sh` derives S3_ENDPOINT from S3_PORT
+      # and exports both, keeping S3_PORT the single knob.
+      endpoint: "${S3_ENDPOINT:-7f0000019c4a}"
+      host: "${S3_HOST:-127.0.0.1:19100}"
+      access_key: "minioadmin"
+      secret: "minioadmin"
+      region: "us-east-1"
+
+  # ── reply path ───────────────────────────────────────────────────────────
+  - name: dec_s3
+    type: pipeline
+    params:
+      # pass_call's program again — S3Reply is also three fields.
+      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      # S3Response: [op][cid u32][status u16][body_len u32][body]. `cid` becomes
+      # conn_id again, which is how the answer finds its connection.
+      decode: "7001007504014001000000750201400200000075040174400300000041"
+
+  - name: enc_http
+    type: pipeline
+    params:
+      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      # HttpResponse: conn_id, stream_id=0, the storage status VERBATIM, then
+      # `application/octet-stream` and the object bytes. The registry's status
+      # IS the store's — a 404 for a missing blob is loam's 404, not a guess.
+      encode: "010002010000006202016002000000010002020000006202016001000060010018600200000001000203000000646202016018006170706c69636174696f6e2f6f637465742d73747265616d01000203000000616a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  # The application fan-out. `buffer_group` is REQUIRED on both http edges: a
+  # non-zero group puts the channel in mailbox mode, one write = one whole
+  # envelope. The default is a byte FIFO, which fragments structured records.
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+
+  - from: dec_http.result_out
+    to: route.record_in
+  - from: route.result_out
+    to: enc_s3.record_in
+
+  # Into and out of the connector.
+  - from: enc_s3.result_out
+    to: s3.request_in
+  - from: s3.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: s3.net_in
+  - from: s3.response_out
+    to: dec_s3.record_in
+
+  - from: dec_s3.result_out
+    to: enc_http.record_in
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 2

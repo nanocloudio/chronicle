@@ -1,0 +1,17 @@
+# Workload source manifest for the `chronicle` CLI applet
+# (rfc_cli_execution.md §5). `fluxor install packaging/cli/workload.toml`
+# registers it so `fluxor exec chronicle -- <cmd>` dispatches to the
+# chronicle_cli PIC fmod. The graph (linux.yaml, beside this file) is the
+# cli-applet graph: cli_in → chronicle_cli → cli_out.
+[workload]
+name = "chronicle"
+version = "1.0.0"
+role = "cli"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
+
+[resources]
+state_bytes = 65536
+buffer_bytes = 16384

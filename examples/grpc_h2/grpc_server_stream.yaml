@@ -1,0 +1,43 @@
+# gRPC SERVER-STREAMING over the genuine composed HTTP/2 transport. Same shape
+# as grpc_unary.yaml (fluxor's http.fmod in gRPC client mode) but the method
+# streams MANY response messages: grpcbin's DummyServerStream echoes the request
+# 10 times. Each message arrives as its own HTTP/2 DATA frame carrying a gRPC
+# Length-Prefixed Message; the http module forwards them all on out[1] until the
+# server closes the stream with trailers (grpc-status). So out[1] carries the
+# concatenated stream `([compressed:1][len:4 BE][message]) × N`.
+#
+# This is the case the stateless codec path CANNOT do: tcp_client mode 5
+# completes on the first END_STREAM and has no HTTP/2 flow control, so a
+# multi-message (or large) stream would truncate or stall. The composed module
+# keeps the connection healthy — it ACKs the server's keepalive/BDP PING (which
+# a gRPC server requires before it will send the closing trailers) and issues
+# WINDOW_UPDATEs as the recv window drains.
+#
+#   docker run -d --rm --name cu-grpcbin -p 9000:9000 moul/grpcbin
+#   fluxor run examples/grpc_h2/grpc_server_stream.yaml | xxd | grep -c '0a02 6869'
+#     # -> 10  (ten echoed DummyMessage{f_string="hi"} in the stream)
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: http
+    mode: 1              # client
+    protocol: 1          # HTTP/2 cleartext (h2c)
+    grpc: 1              # content-type: application/grpc + te: trailers
+    host_ip: 2130706433  # 127.0.0.1
+    port: 9000
+    path: "/grpcbin.GRPCBin/DummyServerStream"
+    request_body: [0, 0, 0, 0, 4, 10, 2, 104, 105]  # LPM: [0][len=4][0a 02 "hi"]
+wiring:
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.file_ctrl
+    to: cli_out.bytes_in

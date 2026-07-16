@@ -1,0 +1,39 @@
+// A pipeline whose compute run is SPLIT by a decision — the shape that produces
+// more than one node of the same kind.
+//
+// The VM cannot branch, so a decision is always its own node and always breaks
+// the surrounding compute run. That yields `pipeline`, `decision`, `pipeline2`,
+// and `pipeline2`'s instance name no longer implies its module type. Emitting it
+// without an explicit `type:` produced a graph fluxor refused to load —
+// "Module 'pipeline2' (type 'pipeline2') not found" — which is why this document
+// exists as a fixture rather than only as a unit test.
+//
+// Effect-free, so `chronicle graph` can lower it with nothing supplied from
+// outside.
+module t.split {
+
+  message t.Item {
+    id: string = 1;
+    n: int = 2;
+  }
+
+  transformation bump(a: t.Item) -> t.Item {
+    t.Item { id: a.id, n: a.n + 1 }
+  }
+
+  decision classify(a: t.Item) -> t.Item {
+    when a.n >= 10 -> t.Item { id: a.id, n: 1 };
+    default -> t.Item { id: a.id, n: 0 };
+  }
+
+  pipeline process(a: t.Item) -> t.Item {
+    call first = bump(a);
+    call sorted = classify(a);
+    call second = bump(a);
+    return second;
+  }
+
+  entry process = process;
+
+  provenance revision "example" toolchain "chronicle-authoring";
+}

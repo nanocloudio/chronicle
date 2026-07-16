@@ -1,0 +1,67 @@
+// Artefact 2: EXPRESSION — pure deterministic scalar computation.
+// Normative basis: Checked CEL. The canonical representation carries the CEL
+// CHECKED AST (cel.expr.CheckedExpr), which is the type-checked, reference-
+// resolved form. The runtime never parses CEL source; it evaluates a bounded
+// bytecode lowered from this checked AST (see compiler/ and modules/app/expression).
+//
+// May: derive values, calculate keys, compare values, construct Protobuf
+// messages. May NOT: mutate state, perform I/O, read clocks, randomness,
+// process state, files, or networks. Determinism is structural.
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message Expression {
+  ArtefactHeader header = 1;
+
+  // Typed parameters. Names bind into the CEL activation; types resolve within
+  // the referenced Schema closures.
+  repeated Parameter parameters = 2;
+
+  // Declared result type.
+  TypeRef result = 3;
+
+  // The compiled expression: bounded bytecode (+ reserved checked-CEL AST),
+  // produced by the build-time compiler against the parameter types and the
+  // deterministic CEL environment. This is the artefact's semantic payload; its
+  // digest contributes to content identity.
+  CompiledExpression compiled = 4;
+
+  // The deterministic environment the checker/evaluator run under: which
+  // functions, extensions, and numeric/text profiles are permitted.
+  CelEnvironment environment = 5;
+
+  // Static execution-cost ceiling (spec: execution-cost limits). Evaluation
+  // that would exceed this is rejected at check time or aborted deterministically.
+  uint64 max_cost = 6;
+}
+
+message Parameter {
+  string name = 1;
+  TypeRef type = 2;
+}
+
+// The deterministic CEL environment (spec: permitted functions and extensions;
+// integer/decimal/float/timestamp/duration/Unicode profiles). No standard
+// function that reads a clock, randomness, or environment may be enabled.
+message CelEnvironment {
+  repeated string enabled_functions = 1;  // allow-list of function overloads
+  repeated string enabled_extensions = 2; // e.g. "cel.strings", "cel.math"
+  NumericProfile numeric = 3;
+  TextProfile text = 4;
+}
+
+enum NumericProfile {
+  NUMERIC_PROFILE_UNSPECIFIED = 0;
+  NUMERIC_PROFILE_INTEGER = 1;   // int/uint only
+  NUMERIC_PROFILE_DECIMAL = 2;   // fixed-point decimal, deterministic
+  NUMERIC_PROFILE_FLOAT = 3;     // IEEE-754 with defined rounding
+}
+
+enum TextProfile {
+  TEXT_PROFILE_UNSPECIFIED = 0;
+  TEXT_PROFILE_UNICODE_NFC = 1;  // normalize to NFC before comparison
+  TEXT_PROFILE_BYTES = 2;        // byte-exact, no normalization
+}

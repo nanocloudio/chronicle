@@ -1,0 +1,42 @@
+# Distributed ACTIVATION BARRIER (Clustor state.distributed.raft.v1), staging
+# half. The aggregation module is given a `barrier` param — the (term, index)
+# its state was committed at in the replicated log — so it STAGES: it processes
+# no events and emits nothing until a commit horizon on barrier_in (in[1], from
+# Clustor's consensus.committed_entries) proves the log durable past that index at
+# the matching term (log-index, term-fenced; the BarrierGate). This graph leaves
+# barrier_in UNWIRED, so the barrier is never met — a fail-closed demonstration:
+# events are fed but the module produces NOTHING, because no durability proof
+# ever arrives.
+#
+# The complementary ACTIVATION half (a real commit horizon crossing the barrier
+# and releasing the state) runs in the full Clustor graph:
+#   aggregation.barrier_in <- consensus.committed_entries
+# and the crossing logic itself is unit-proven (BarrierGate: horizon >= index at
+# matching term => Durable => activate; newer term => Superseded, stays staged).
+#
+#   # customer-total events, but the module is staged behind an unmet barrier:
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/barrier_staged.yaml | xxd
+#   # -> NO output frames; log shows "[aggregation] staged behind barrier".
+#   # CONTROL: delete the `barrier` param and the SAME input emits a partial at
+#   # once (Continuous), confirming the empty output above is the barrier, not
+#   # the trigger.
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      # customer-total IR def with a trailing 01 = Continuous trigger, so every
+      # event fires a partial immediately. This makes the staging conclusive: the
+      # SAME input emits at once without the barrier (see the control run below),
+      # yet emits NOTHING here because the module is staged.
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d00050001010000001201000000050002020000000100000012020000000500020200000002000000120300000005000203000000010000001204000000050002030000000200000012050000001302000000010800050001030000001401"
+      # Committed at term 1, index 1 (hex [term:u64 LE][index:u64 LE]).
+      barrier: "01000000000000000100000000000000"
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

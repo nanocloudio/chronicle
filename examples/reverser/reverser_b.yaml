@@ -1,0 +1,117 @@
+# REVERSER pipeline B — the asynchronous half: CDC events become reversed rows.
+#
+#   quantum broker ─MQTT→ mqtt_client (quantum)   subscribes lattice/cdc/feed1
+#                           │ app_out ([topic_len][topic][cdc envelope])
+#                           ↓
+#                         dec_evt    pipeline     rd bytecode: envelope → rev.Evt
+#                           ↓                     (kind, raw row key, commit_ts)
+#                         keep_puts  decision     puts → rev.Change (pk sliced
+#                           ↓                     out of the key); everything
+#                           ↓                     else → EMPTY message = DROP
+#                         flip       pipeline     msg.reverse() — the compute
+#                           ↓
+#                         enc_sql    pipeline     ser: INSERT INTO reversed…
+#                           ↓ request_in
+#                         pg_client  (lattice)    same store the row came from
+#
+# The load-bearing simplifications, both consequences of the schema:
+#   - inbound(msg TEXT PRIMARY KEY): the CDC event's KEY *is* the message, so
+#     no relational row-image decoding happens anywhere — dec_evt takes the
+#     key verbatim and the DECISION slices the pk text out of its framing
+#     ([keyspace:4][table:4][present:1]<text>[term:2]) with substring().
+#   - reversed(ts BIGINT PRIMARY KEY): the store-minted commit_ts IS the
+#     sequence — no client ever invents an id, and C's ORDER BY ts DESC is
+#     exactly Kafka-style replay order.
+#
+# kind ≠ put (resolved watermarks, deletes) constructs the empty message,
+# which the decision engine counts as `dropped` and routes nowhere — the
+# filter is POLICY in the decision table, not a special node.
+#
+# No reply path: an INSERT with no cid prefix produces no reply record, and
+# `reply_out` stays unwired. At-least-once delivery + INSERT of the same pk
+# = the duplicate collapses in the store (README).
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  # ── quantum: the MQTT subscriber ─────────────────────────────────────────
+  - name: mqtt_client
+    params:
+      broker_ip: ${REV_BROKER_IP:-2130706433} # u32 of 127.0.0.1
+      broker_port: ${REV_BROKER_PORT:-9090}
+      client_id: "reverser-b"
+      subscribe_topic: "lattice/cdc/feed1"
+
+  # ── the event path ───────────────────────────────────────────────────────
+  - name: dec_evt
+    type: pipeline
+    params:
+      # pass_evt — the three-field identity over rev.Evt.
+      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      # app_out frame: [topic_len=17]"lattice/cdc/feed1" then the cdc_wire
+      # envelope [format:u16][kind][flags][feed:u64][table:u32][key_len:u16]
+      # [key][commit_ts:u64]…  SKIP 18 (the fixed topic), LIT-assert format 1,
+      # kind → f3, whole key verbatim → f2 (empty for watermarks — fine),
+      # commit_ts → f1. Every envelope kind decodes cleanly; FILTERING is the
+      # decision's job, so the errors counter stays a real error counter.
+      decode: "70120071020001007501014003000000700d00750201744002000000750801400100000041"
+
+  - name: keep_puts
+    type: decision
+    params:
+      # reverser.uproc `keep_puts`: when kind == PUT construct rev.Change
+      # { ts, msg.substring(9, size-2) }; default constructs rev.Change {} —
+      # EMPTY, the counted drop.
+      decision: "0105000000120001000203000000100100000000000000200012000000390001000201000000400100000001000202000000100900000000000000010002020000005301001002000000000000005153090040020000004101000000010041"
+
+  - name: flip
+    type: pipeline
+    params:
+      # reverser.uproc `flip`: rev.Change { ts, msg.reverse() } — contains
+      # CALL REVERSE_STR, the pinned CEL strings extension.
+      ir_stages: "01ff1c0005000101000000120100000005000102000000150b00120200000013"
+
+  - name: enc_sql
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # INSERT INTO reversed (ts, msg) VALUES (<ts>, '<msg>')
+      encode: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"
+
+  # ── lattice: the SQL connector (no cid — nothing awaits this reply) ──────
+  - name: pg_client
+    params:
+      endpoint: "${REV_PG_ENDPOINT:-7f000001483c}"
+      user: "lattice"
+      database: "lattice"
+
+wiring:
+  - from: linux_net.net_out
+    to: mqtt_client.net_in
+  - from: mqtt_client.net_out
+    to: linux_net.net_in
+
+  - from: mqtt_client.app_out
+    to: dec_evt.record_in
+    buffer_group: 1
+
+  - from: dec_evt.result_out
+    to: keep_puts.record_in
+  - from: keep_puts.result_out
+    to: flip.record_in
+  - from: flip.result_out
+    to: enc_sql.record_in
+  - from: enc_sql.result_out
+    to: pg_client.request_in
+    buffer_group: 2
+
+  - from: pg_client.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: pg_client.net_in

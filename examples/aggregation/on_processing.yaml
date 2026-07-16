@@ -1,0 +1,34 @@
+# Aggregation with an EXPLICIT ONPROCESSING trigger (deterministic
+# processing-time timer). The def is the same customer-total IR def as
+# examples/aggregation/ir.yaml, but with trailing trigger bytes `03` `02000000`
+# (= OnProcessing, period=2 LE u32) — lower_def passes them through and
+# build_spec decodes them.
+#
+# Unlike Continuous (per event) or OnCount (per event PER PANE), OnProcessing is
+# GLOBAL: a logical processing clock ticks once per ingested event (NOT wall
+# clock — one tick per record, so it replays identically), and every `period`
+# ticks the operator flushes EVERY live pane's running partial, across every
+# key. That bounds emit latency regardless of how events are distributed over
+# keys. The clock is checkpointed (snapshot ver 3), so the cadence stays aligned
+# across a restart.
+#
+#   # four events, two keys interleaved, all in window [0,100):
+#   #   a(tick1) b(tick2*) a(tick3) b(tick4*)
+#   # flush at tick 2 -> {alice:count1, bob:count1}; at tick 4 -> {alice:2, bob:2}
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x03\x00bob\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x05\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x14\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\xc8\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x03\x00bob\x02\x01\x08\x00\x14\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x07\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/on_processing.yaml | xxd
+#   # -> 4 frames: alice/1, bob/1 (at tick 2), then alice/2, bob/2 (at tick 4)
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      # customer-total IR def with trailing 03 02000000 = OnProcessing(2) trigger
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d0005000101000000120100000005000202000000010000001202000000050002020000000200000012030000000500020300000001000000120400000005000203000000020000001205000000130200000001080005000103000000140302000000"
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

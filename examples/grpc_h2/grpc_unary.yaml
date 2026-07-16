@@ -1,0 +1,44 @@
+# gRPC unary over the GENUINE HTTP/2 transport — chronicle graph composing
+# fluxor's http.fmod in gRPC client mode (mode=1, protocol=1 h2c, grpc=1). Unlike
+# the codec path (examples/authoring/grpc_connector.uproc), which hand-rolls the
+# whole HTTP/2 request as encode bytecode over the stateless tcp_client, this uses
+# fluxor's real HTTP/2 connection state machine (preface, SETTINGS + ACK, HPACK,
+# DATA, flow control, trailers). The `grpc: 1` flag makes the client send
+# `content-type: application/grpc` + `te: trailers` and handle the grpc-status
+# trailers frame — the small fluxor-side change that turns the h2 transport into a
+# gRPC transport.
+#
+# REQUIRES: fluxor's http module with the `grpc` client param (param 9) and
+# trailing-HEADERS handling. Older http.fmods ignore `grpc:` and send
+# content-type application/octet-stream (grpcbin then rejects the call).
+#
+# Target: grpcbin (github.com/moul/grpcbin) DummyUnary, which echoes a
+# DummyMessage{ f_string = 1 }. The request_body is the gRPC Length-Prefixed
+# Message [compressed:0][len:4 BE=4][protobuf 0a 02 "hi"], passed as a raw byte
+# array (Str params accept byte arrays, so the null/length bytes survive). The
+# echoed response LPM is forwarded on out[1] to stdout.
+#
+#   docker run -d --rm --name cu-grpcbin -p 9000:9000 moul/grpcbin
+#   fluxor run examples/grpc_h2/grpc_unary.yaml | xxd   # -> ... 0a 02 68 69 ("hi")
+target: linux
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+  net: {}
+modules:
+  - name: http
+    mode: 1              # client
+    protocol: 1          # HTTP/2 cleartext (h2c)
+    grpc: 1              # content-type: application/grpc + te: trailers
+    host_ip: 2130706433  # 127.0.0.1
+    port: 9000
+    path: "/grpcbin.GRPCBin/DummyUnary"
+    request_body: [0, 0, 0, 0, 4, 10, 2, 104, 105]  # LPM: [0][len=4][0a 02 "hi"]
+wiring:
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.file_ctrl
+    to: cli_out.bytes_in

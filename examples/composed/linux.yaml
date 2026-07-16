@@ -1,0 +1,36 @@
+# A COMPOSED on-device dataplane under fluxor-linux: two param-driven `.fmod`
+# modules wired in one graph — a Pipeline transform feeding the Aggregation
+# engine, both running as real modules, both defined purely by param.
+#
+#   printf '<typed event frames>' | fluxor run examples/composed/linux.yaml > out.bin
+#   xxd out.bin
+#
+# cli_in -> pipeline(double amount) -> aggregation(sum per customer/window) -> cli_out.
+# Events (customer, created_at, amount): (alice,10,100)(alice,20,200)(bob,30,50)
+# (alice,150,999)(bob,260,5). The pipeline DOUBLES each amount, so the aggregate
+# sums are doubled vs. the standalone aggregation example:
+#   alice [0,100)   count=2 sum=600   (200+400)
+#   bob   [0,100)   count=1 sum=100
+#   alice [100,200) count=1 sum=1998
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: pipeline
+    params:
+      # Regenerate: cargo test -p chronicle-authoring --test pack print_composed_ir_params -- --nocapture
+      ir_stages: "01ff2f000500010100000012010000000500010200000012020000000500010300000001020000000000000011120300000013"
+  - name: aggregation
+    params:
+      def: "64000000000000000a000000000000004000000000000000000000000000000000000000030000000800010002010000000003000000080001000202000000001400000051000100020100000040010000000100020200000002010000004002000000010002020000000202000000400300000001000203000000020100000040040000000100020300000002020000004005000000410200000000000000010300000008000100020300000000"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

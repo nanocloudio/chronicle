@@ -1,0 +1,97 @@
+// RESOURCE MODEL — a logical runtime dependency. Content-addressed like an
+// artefact but explicitly NOT an eighth semantic artefact (spec). A Resource
+// CONTRACT describes portable identity (name/kind/typed operations/protocol +
+// security requirements/delivery guarantees/capability requirements). A Resource
+// BINDING maps the contract to an implementation and normally lives OUTSIDE
+// semantic module identity (addresses, ports, DNS, credentials, endpoints).
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message ResourceContract {
+  ArtefactHeader header = 1;  // kind = ARTEFACT_KIND_RESOURCE
+
+  ResourceKind kind = 2;
+
+  // Typed operations the resource exposes. Sources are consumed by a Pipeline
+  // input; targets are used by a Pipeline `effect` or output.
+  repeated ResourceOperation operations = 3;
+
+  ProtocolRequirement protocol = 4;
+  SecurityRequirement security = 5;
+  DeliveryGuarantee delivery = 6;
+
+  repeated CapabilityRequirement capabilities = 7;
+}
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_LISTENER = 1;       // Envoy Listener
+  RESOURCE_KIND_SUBSCRIPTION = 2;
+  RESOURCE_KIND_STREAM = 3;
+  RESOURCE_KIND_UPSTREAM = 4;       // Envoy Cluster
+  RESOURCE_KIND_PUBLISHER = 5;
+  RESOURCE_KIND_DATABASE = 6;
+  RESOURCE_KIND_STATE_BACKEND = 7;  // local checkpoint or distributed raft
+  RESOURCE_KIND_DISCOVERY = 8;      // endpoint discovery (EDS)
+  RESOURCE_KIND_IDENTITY = 9;       // SPIFFE identity provider
+  RESOURCE_KIND_SECRET = 10;        // SDS secret provider
+  RESOURCE_KIND_TELEMETRY = 11;     // OpenTelemetry exporter
+}
+
+message ResourceOperation {
+  string name = 1;
+  ResourceDirection direction = 2;
+  TypeRef request = 3;   // for targets / effects
+  TypeRef response = 4;  // for sources / effect results
+}
+
+enum ResourceDirection {
+  RESOURCE_DIRECTION_UNSPECIFIED = 0;
+  RESOURCE_DIRECTION_SOURCE = 1;  // bound to a Pipeline input
+  RESOURCE_DIRECTION_TARGET = 2;  // used by a Pipeline effect/output
+}
+
+message ProtocolRequirement {
+  string protocol = 1;   // e.g. "http", "grpc", "kafka", "mqtt", "sql.postgres"
+  repeated string versions = 2; // e.g. ["1.1","2","3"]
+}
+
+message SecurityRequirement {
+  bool tls_required = 1;
+  bool mutual_tls = 2;          // mTLS / SPIFFE
+  repeated string auth_schemes = 3;
+}
+
+enum DeliveryGuarantee {
+  DELIVERY_GUARANTEE_UNSPECIFIED = 0;
+  DELIVERY_GUARANTEE_AT_MOST_ONCE = 1;
+  DELIVERY_GUARANTEE_AT_LEAST_ONCE = 2;
+  DELIVERY_GUARANTEE_EXACTLY_ONCE = 3;
+}
+
+// A binding maps a contract to a concrete implementation. Deployment overlays
+// (addresses, credentials, discovered endpoints, health) are NOT part of
+// semantic module identity — they are supplied at bind time.
+message ResourceBinding {
+  QualifiedName contract = 1;     // which ResourceContract this satisfies
+  BindingKind kind = 2;
+  // Opaque, deployment-specific configuration (addresses, ports, DNS,
+  // namespaces, credential refs). Never digested into module identity.
+  map<string, string> deployment = 3;
+}
+
+enum BindingKind {
+  BINDING_KIND_UNSPECIFIED = 0;
+  BINDING_KIND_CHRONICLE_CONNECTOR = 1;
+  BINDING_KIND_ENVOY_LISTENER = 2;
+  BINDING_KIND_ENVOY_CLUSTER = 3;
+  BINDING_KIND_KUBERNETES_SERVICE = 4;
+  BINDING_KIND_KAFKA_TOPIC = 5;
+  BINDING_KIND_DATABASE_ENDPOINT = 6;
+  BINDING_KIND_SPIFFE_IDENTITY = 7;
+  BINDING_KIND_OTEL_EXPORTER = 8;
+  BINDING_KIND_CLUSTOR_RAFT = 9;   // distributed state backend
+}

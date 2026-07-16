@@ -1,0 +1,108 @@
+// Artefact 5: AGGREGATION — deterministic stateful temporal computation.
+// A pane-ring + watermark + checkpoint model. CEL is used
+// ONLY for keys, selectors, predicates, parameters, and final typed construction
+// (spec). Stateful operators are standardized aggregation operators (monoids).
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message Aggregation {
+  ArtefactHeader header = 1;
+
+  TypeRef input = 2;   // event message type
+  TypeRef state = 3;   // state message type
+  TypeRef output = 4;  // emitted message type
+
+  // Partition key: checked CEL over the input (spec example: @commerce.customer_key).
+  CompiledExpression key = 5;
+  // Event-time selector: checked CEL over the input yielding a timestamp.
+  CompiledExpression event_time = 6;
+
+  Window window = 7;
+  Watermark watermark = 8;
+
+  // Standardized operators composing the state (spec: initialise/add/merge/
+  // optional remove/finish; associativity/commutativity/idempotence/
+  // retractability/merge-safety are per-operator properties).
+  repeated Operator operators = 9;
+
+  // Final typed construction of the output from key + finished state + window.
+  CompiledExpression emit = 10;
+
+  // Bounded cardinality guard (keyed "lanes"): the maximum distinct
+  // label-combinations per partition, rejected before overflow.
+  BoundedCardinality cardinality = 11;
+}
+
+message Window {
+  oneof kind {
+    SlidingWindow sliding = 1;
+    TumblingWindow tumbling = 2;
+    SessionWindow session = 3;
+  }
+  // Explicit trigger model (not a hardcoded continuous-fire policy).
+  Trigger trigger = 10;
+  // Allowed lateness / correction horizon before a pane is finalized.
+  uint64 allowed_lateness_ms = 11;
+}
+
+message SlidingWindow { uint64 size_ms = 1; uint64 step_ms = 2; }
+message TumblingWindow { uint64 size_ms = 1; }
+message SessionWindow  { uint64 gap_ms = 1; }
+
+// When does a pane emit? (spec: windows, panes and triggers).
+message Trigger {
+  oneof kind {
+    bool on_watermark = 1;        // fire when watermark passes window end
+    uint64 every_count = 2;       // fire every N events (early firing)
+    uint64 every_processing_ms = 3; // periodic early firing
+  }
+  bool fire_on_close = 10;        // always fire a final pane at close
+  bool emit_retractions = 11;     // emit corrections for late data (retractable ops only)
+}
+
+message Watermark {
+  uint64 lateness_allowance_ms = 1; // default 2000
+  uint64 guard_ms = 2;              // default 200; monotone guard floor
+  // Per-metric override of lateness allowance, keyed by operator name.
+  map<string, uint64> overrides = 3;
+}
+
+// Standardized aggregation operator over a keyed lane. Each is a
+// monoid with declared algebraic properties.
+message Operator {
+  string name = 1;             // e.g. "gross_total"
+  OperatorKind kind = 2;
+  // Value selector: checked CEL over the input yielding the measured value.
+  CompiledExpression selector = 3;
+  // Optional filter predicate: only fold events where this is true.
+  CompiledExpression predicate = 4;
+  // Correction horizon: late events older than watermark - this are dropped
+  // (non-retractable) or applied (retractable).
+  uint64 correction_horizon_ms = 5;
+  // Operator parameter, captured in canonical identity: TOPK -> k;
+  // QUANTILE -> permille (0..=1000, e.g. 500 = median, 990 = p99). Zero for
+  // parameterless operators (SUM/COUNT/AVG/MIN/MAX/DISTINCT).
+  uint64 parameter = 6;
+}
+
+enum OperatorKind {
+  OPERATOR_KIND_UNSPECIFIED = 0;
+  // Retractable / merge-safe:
+  OPERATOR_KIND_SUM = 1;
+  OPERATOR_KIND_COUNT = 2;
+  OPERATOR_KIND_AVG = 3;
+  OPERATOR_KIND_MIN = 4;
+  OPERATOR_KIND_MAX = 5;
+  // Non-retractable (drop-and-audit past finalization):
+  OPERATOR_KIND_QUANTILE = 6;  // params carry quantile
+  OPERATOR_KIND_TOPK = 7;      // params carry k
+  OPERATOR_KIND_DISTINCT = 8;
+}
+
+message BoundedCardinality {
+  uint32 max_lanes_per_partition = 1;  // hard cap 64
+  uint32 warn_lanes_per_partition = 2; // warn 48
+}

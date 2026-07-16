@@ -1,0 +1,39 @@
+// Artefact 1: SCHEMA — portable types and structural compatibility.
+// Normative basis: Protocol Buffers descriptors. A Schema artefact carries a
+// COMPLETE descriptor closure (all transitively-referenced files) so type
+// resolution is hermetic and the canonical descriptor digest is stable.
+syntax = "proto3";
+
+package unified.v1;
+
+import "google/protobuf/descriptor.proto";
+import "unified/v1/common.proto";
+
+message Schema {
+  ArtefactHeader header = 1;
+
+  // Complete descriptor closure. MUST be self-contained: every type referenced
+  // by any file is present in this set. Files are sorted by name for canonical
+  // ordering before the descriptor digest is computed.
+  google.protobuf.FileDescriptorSet closure = 2;
+
+  // Canonical descriptor digest — computed over the deterministically-ordered
+  // closure independent of the surrounding ArtefactHeader. This is the identity
+  // used by TypeRef.schema and by structural-compatibility checks.
+  Digest descriptor_digest = 3;
+
+  // Portable validation constraints that go beyond descriptor options.
+  // Simple validation uses descriptor custom options directly (field 2);
+  // complex validation references named Expressions.
+  repeated ValidationConstraint constraints = 4;
+}
+
+// A named validation constraint bound to a message type. When `expression` is
+// set, it references an Expression artefact whose result type is bool; the
+// message under validation is the sole input.
+message ValidationConstraint {
+  string name = 1;
+  string message_name = 2;   // fully-qualified type this constraint guards
+  ArtefactRef expression = 3; // @expression returning bool over the message
+  StructuredError on_violation = 4; // error template emitted on failure
+}

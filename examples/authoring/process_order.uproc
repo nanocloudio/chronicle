@@ -1,0 +1,66 @@
+// The spec's commerce.process_order module, authored in the .uproc DSL.
+// Compiles (deterministically) to sealed canonical Expression / Transformation /
+// Decision / Pipeline artefacts plus a Module — the same digests the Rust
+// builder API produces for the identical logic.
+module commerce.process_order {
+
+  // ---- Type environment (message closure + enum constants) ----
+  message commerce.Money {
+    units: int = 1;
+  }
+  message commerce.Order {
+    id: string = 1;
+    customer_id: string = 2;
+    total: commerce.Money = 3;
+  }
+  message commerce.NormalizedOrder {
+    id: string = 1;
+    total: int = 2;
+  }
+  message commerce.Route {
+    kind: int = 1;
+    order_id: string = 2;
+  }
+  message commerce.Ack {
+    order_id: string = 1;
+    route: int = 2;
+  }
+
+  enum AUTOMATIC = 0;
+  enum MANUAL_REVIEW = 1;
+
+  // ---- Logic artefacts ----
+  expression is_large(order: commerce.Order) -> bool {
+    order.total.units >= 1000
+  }
+
+  transformation normalize(order: commerce.Order) -> commerce.NormalizedOrder {
+    commerce.NormalizedOrder {
+      id: order.id,
+      total: order.total.units
+    }
+  }
+
+  decision route(order: commerce.Order) -> commerce.Route {
+    when order.total.units >= 1000 ->
+      commerce.Route { kind: MANUAL_REVIEW, order_id: order.id };
+    default ->
+      commerce.Route { kind: AUTOMATIC, order_id: order.id };
+  }
+
+  // ---- Resource (binding supplied at deploy time) ----
+  resource orders_store required;
+
+  // ---- Orchestration ----
+  pipeline process(order: commerce.Order) -> commerce.NormalizedOrder {
+    call normalized = normalize(order);
+    call routed = route(order);
+    effect stored = @orders_store.put(normalized);
+    commit after stored;
+    return normalized;
+  }
+
+  entry process = process;
+
+  provenance revision "example" toolchain "chronicle-authoring";
+}

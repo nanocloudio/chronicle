@@ -1,0 +1,73 @@
+// The reverser's dispatch and compute; README.md explains.
+// Must stay under `chronicle author`'s 2048-byte doc buffer.
+module app.reverser {
+
+  message rev.Insert { conn_id: int = 1; msg: string = 2; }
+
+  message rev.Evt { ts: int = 1; msg: string = 2; kind: int = 3; }
+
+  message rev.Change { ts: int = 1; msg: string = 2; }
+
+  message rev.Query { conn_id: int = 1; max: int = 2; }
+
+  message rev.Rows { conn_id: int = 1; body: string = 2; }
+
+  enum PUT = 1; // lattice cdc_wire envelope kind
+
+  // Non-puts construct the EMPTY message = counted drop. msg is
+  // the raw row key [ks:4][table:4][present:1]<pk>[term:2].
+  decision keep_puts(e: rev.Evt) -> rev.Change {
+    when e.kind == PUT ->
+      rev.Change { ts: e.ts, msg: e.msg.substring(9, e.msg.size() - 2) };
+    default -> rev.Change {};
+  }
+
+  transformation flip(c: rev.Change) -> rev.Change {
+    rev.Change { ts: c.ts, msg: c.msg.reverse() }
+  }
+
+  transformation pass_evt(e: rev.Evt) -> rev.Evt {
+    rev.Evt { ts: e.ts, msg: e.msg, kind: e.kind }
+  }
+
+  transformation pass_ins(i: rev.Insert) -> rev.Insert {
+    rev.Insert { conn_id: i.conn_id, msg: i.msg }
+  }
+
+  transformation pass_query(q: rev.Query) -> rev.Query {
+    rev.Query { conn_id: q.conn_id, max: q.max }
+  }
+
+  transformation pass_rows(r: rev.Rows) -> rev.Rows {
+    rev.Rows { conn_id: r.conn_id, body: r.body }
+  }
+
+  pipeline ingest(i: rev.Insert) -> rev.Insert {
+    call a = pass_ins(i);
+    return a;
+  }
+
+  pipeline reverse(e: rev.Evt) -> rev.Change {
+    call seen = pass_evt(e);
+    call kept = keep_puts(seen);
+    call flipped = flip(kept);
+    return flipped;
+  }
+
+  pipeline ask(q: rev.Query) -> rev.Query {
+    call a = pass_query(q);
+    return a;
+  }
+
+  pipeline answer(r: rev.Rows) -> rev.Rows {
+    call a = pass_rows(r);
+    return a;
+  }
+
+  entry ingest = ingest;
+  entry reverse = reverse;
+  entry ask = ask;
+  entry answer = answer;
+
+  provenance revision "reverser-v1" toolchain "chronicle-authoring";
+}

@@ -1,0 +1,25 @@
+# Expression via the IR-AT-LOAD path — the fluxor-native alternative to shipping
+# opaque bytecode. Instead of `program` (pre-lowered bytecode) + `max_cost`, this
+# ships `ir`: the checked IR of `order.customer_id`, produced by the host after
+# parse + type-check against the schema. The expression .fmod lowers it to
+# bytecode at load (lower_flat) — "it lowered" == "it can run it", and the cost
+# ceiling is re-derived from the IR, never trusted from a param. A bad token
+# fails closed at LOAD, not as a runtime BadOpcode. Same result as
+# examples/expression/linux.yaml (which ships the equivalent bytecode).
+# Regenerate: cargo test -p chronicle-authoring --test pack print_ir_example_params -- --nocapture
+#
+#   printf '\x02\x01\x03\x00o-1\x02\x07\x00cust-42' \
+#     | fluxor run examples/expression/ir.yaml | tail -c 7      # -> cust-42
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: expression
+    params:
+      ir: "0500010200000014"   # checked IR of order.customer_id (field 2)
+wiring:
+  - from: cli_in.stdin_out
+    to: expression.record_in
+  - from: expression.result_out
+    to: cli_out.bytes_in

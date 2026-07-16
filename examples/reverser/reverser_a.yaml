@@ -1,0 +1,144 @@
+# REVERSER pipeline A — ingest: GET /reverse?msg=… becomes a relational row.
+#
+#   client ─HTTP→ http (wave)             terminates HTTP
+#            │ req_out (HttpRequest)
+#            ↓
+#          dec_http   pipeline            rd bytecode: envelope → rev.Insert
+#            ↓                            (asserts the "/reverse?msg=" prefix)
+#          enc_sql    pipeline            ser bytecode: [conn_id:u32]INSERT…
+#            ↓ request_in
+#          pg_client  (lattice)           SCRAM + simple query; cid_len=4
+#            ↓ reply_out                  echoes the 4-byte conn_id prefix
+#          dec_pg     pipeline            rd bytecode: [cid][rows] → rev.Rows
+#            ↓
+#          enc_http   pipeline            ser bytecode: 200 text/plain "ok"
+#            │ resp_in
+#            ↓
+#          http ─HTTP→ client
+#
+# ONE straight line: the row lands via consensus in lattice, and the "ok"
+# answers only after the store confirmed the INSERT — the reply is the
+# completion signal, not an optimistic guess. What happens NEXT (CDC → the
+# reversing pipeline B) is asynchronous by design.
+#
+# Every `ir_stages`/`decision` value is compiled from `reverser.uproc` via:
+#   H=$(python3 -c 'print(open("examples/reverser/reverser.uproc","rb").read().hex())')
+#   fluxor exec chronicle -- graph "$H" <entry> linux
+# The rd/ser codec programs are hand-authored against the owning modules'
+# envelope layouts (wave server/app.rs, lattice pg_client) — see README.md.
+target: linux
+tick_us: 100
+
+# http↔linux_net and http↔engines are request/response pairs — cycles.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  # ── wave: the HTTP server ────────────────────────────────────────────────
+  - name: http
+    port: ${REV_A_PORT:-15100}
+    # 1 = downstream is `linux_net`: the kernel owns TCP segmentation.
+    host_tcp: 1
+    max_body_kib: 16
+    routes:
+      # A bare "/" IS the HANDLER_APP catch-all (wave routes.rs): the path —
+      # query string included — is forwarded verbatim and the application
+      # decides. dec_http's LIT asserts "/reverse?msg=", so any other path is
+      # a counted decode error (wave answers 504 after its app timeout).
+      - path: "/"
+        app: true
+
+  # ── request path ─────────────────────────────────────────────────────────
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_ins — the two-field identity (a codec-only node has no program
+      # and fails closed, so every node carries one).
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # HttpRequest [conn:u16][stream:u16][verb][flags][plen:u16][hlen:u16]
+      # [blen:u16][path][hdrs][body]:  [conn|stream] read as ONE u32 → f1 —
+      # wave mints a per-request stream generation and find_awaiting_slot
+      # requires the response to ECHO it, so the pair travels the whole
+      # chain as a single opaque token (it is also the 4-byte pg cid).
+      # Then assert the fixed "/reverse?msg=" prefix (13 bytes) and take
+      # plen-13 bytes → f2 (msg). LIT is the guard: a request without the
+      # prefix fails the decode.
+      decode: "7504014001000000700200750201100d0000000000000051700400710d002f726576657273653f6d73673d74400200000041"
+
+  - name: enc_sql
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # [conn_id:u32 LE — the cid_len=4 correlation prefix, opaque to SQL]
+      # then INSERT OR REPLACE INTO inbound (msg) VALUES ('<msg>') — OR
+      # REPLACE so a RESUBMITTED message is a fresh MVCC put (new commit_ts,
+      # new CDC event, appears in the list again).  No SQL-quoting of
+      # msg — a deliberate example simplification (README).
+      encode: "01000201000000620401602e00494e53455254204f52205245504c41434520494e544f20696e626f756e6420286d7367292056414c554553202827010002020000006160020027296a"
+
+  # ── lattice: the SQL connector ───────────────────────────────────────────
+  # Pinned from the store, not vendored. SCRAM-SHA-256 is why storage access
+  # is a compiled module and not bytecode. `cid_len: 4` makes every query
+  # yield a reply carrying the first 4 request bytes verbatim — the conn_id
+  # rides THROUGH the store hop, which is what lets one straight line answer
+  # an HTTP request with a consensus-durable write.
+  - name: pg_client
+    params:
+      endpoint: "${REV_PG_ENDPOINT:-7f000001483c}" # [ip:4][port:2 LE] = 127.0.0.1:15432
+      user: "lattice"
+      database: "lattice"
+      cid_len: 4
+
+  # ── reply path ───────────────────────────────────────────────────────────
+  - name: dec_pg
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # [cid:u32 → f1, the conn|stream token][rest → body].  An INSERT
+      # reply is the bare cid; REST on nothing is an empty body.
+      decode: "750401400100000078400200000041"
+
+  - name: enc_http
+    type: pipeline
+    params:
+      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      # HttpResponse [conn:u16][stream:u16][status=200][flags=0][ct_len=10]
+      # [hdr_len=0][body_len=3] "text/plain" "ok\n" — f1's u32 writes back
+      # as [conn][stream] LE, echoing wave's request generation.
+      encode: "01000201000000620401600800c800000a00000300600a00746578742f706c61696e6003006f6b0a6a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  # `buffer_group` is REQUIRED on every structured-record edge whose frames
+  # carry no self-framing: a non-zero group is mailbox mode, one write = one
+  # whole envelope. The default byte FIFO would fragment or concatenate them.
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+
+  - from: dec_http.result_out
+    to: enc_sql.record_in
+  - from: enc_sql.result_out
+    to: pg_client.request_in
+    buffer_group: 2
+
+  - from: pg_client.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: pg_client.net_in
+
+  - from: pg_client.reply_out
+    to: dec_pg.record_in
+    buffer_group: 3
+  - from: dec_pg.result_out
+    to: enc_http.record_in
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 4

@@ -1,0 +1,233 @@
+# REVERSER storage tier — lattice's durable relational graph with CDC egress.
+#
+# `single-models-cdc.yaml`'s proven back half (consensus, WAL durability,
+# MVCC timestamp leases, ordered disk state-store, cdc_pump) carrying the
+# §14.1 relational front (pg_edge_anchor + relational_executor) instead of
+# the model surface, and quantum's `mqtt_sink` (stream.sink.ordered_ack)
+# instead of the in-repo loopback provider — so committed writes to the
+# `inbound` table leave as CDC envelopes on a real MQTT broker.
+#
+# The pump's keyrange prefix is [KS_RELATIONAL_TABLE][table_id 1]:
+# `inbound` is the FIRST table run.sh creates and the catalog allocator's
+# first INCR returns 1, so the id is deterministic. Scoping to one table
+# matters: pipeline B inserts into `reversed` (table 2) THROUGH this same
+# store, and an unscoped feed would loop those inserts straight back into B.
+#
+# EVERY module here resolves from the fluxor OCI store by CHRONICLE's pins
+# (fluxor.toml: lattice + clustor + quantum): the CDC RFC forbids lattice
+# depending on quantum, so the application project that composes lattice's
+# pump with quantum's sink is the one that pins both. Run from a scratch cwd
+# (wal/ + kv/ land there): FLUXOR_PROJECT_ROOT=$CHRONICLE fluxor run <this>
+# — see run.sh.
+target: linux
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  # ── Relational front (single-relational.yaml's, pg only) ────────
+  - name: pg_edge_anchor
+    params:
+      listen_port: ${REV_PG_PORT:-15432}
+  - name: relational_executor
+  - name: index_backfill
+
+  # ── Lattice KV core ─────────────────────────────────────────────
+  - name: kv_request_router
+    params:
+      lin_reads: 0
+      replicated: 1
+  - name: kv_state_worker
+    params:
+      state_store: 1
+      root_path: 0
+  - name: lattice_apply_bridge
+
+  # ── MVCC timestamp authority ────────────────────────────────────
+  - name: timestamp_allocator
+    params:
+      allocator_id: 1
+      auto_grant_to: 1
+      auto_grant_interval_steps: 100
+      propose_wrap: 1
+
+  # ── Clustor client-proposal pipeline ────────────────────────────
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: ${REV_PEER_PORT:-29090}
+      peer0_port: ${REV_PEER_PORT:-29090}
+  - name: gateway
+    params:
+      self_id: 0
+  - name: admission
+  - name: control_plane
+  - name: consensus
+    params:
+      self_id: 0
+      voter_count: 1
+      heartbeat_interval_ms: 150
+  - name: durability
+    params:
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
+      segment_bytes: 262144
+      self_id: 0
+      voter_count: 1
+      partition_id: 0
+
+  # ── CDC egress: pump + quantum's MQTT QoS-1 producer ────────────
+  - name: cdc_pump
+    params:
+      feed_id: 1
+      table_id: 1
+      # [KS_RELATIONAL_TABLE = 0x80000002][table_id = 1], hex.
+      prefix: "8000000200000001"
+      proto: 1              # PROTO_ETCD — matches the wired pair
+      checkpoint_interval_ms: 500
+      resolved_interval_ms: 500
+      claim_interval_ms: 500
+      retention_budget_ms: 60000
+  - name: mqtt_sink
+    params:
+      broker_ip: ${REV_BROKER_IP:-2130706433} # u32 of 127.0.0.1
+      broker_port: ${REV_BROKER_PORT:-9090}
+      client_id: "reverser-cdc"
+      topic: "lattice/cdc/feed1"
+  - name: compaction_coordinator
+
+  # ── Observability: metric fan-in + HTTP /metrics ────────────────
+  - name: adapter_metrics
+  - name: operations
+    params:
+      emit_interval_ms: 250
+      listen_port: ${REV_OPS_PORT:-29191}
+
+wiring:
+  # ── TCP transport ───────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: pg_edge_anchor.net_in
+  - from: pg_edge_anchor.net_out
+    to: linux_net.net_in
+
+  # ── Connector ↔ executor ────────────────────────────────────────
+  - from: pg_edge_anchor.sql_out
+    to: relational_executor.pg_in
+  - from: relational_executor.pg_out
+    to: pg_edge_anchor.sql_in
+
+  # ── Backfill worker ↔ router (PROTO_INTERNAL_JOB pair) ─────────
+  - from: index_backfill.kv_out
+    to: kv_request_router.internal_job_in
+  - from: kv_request_router.internal_job_out
+    to: index_backfill.kv_in
+
+  # ── Executor ↔ router ───────────────────────────────────────────
+  - from: relational_executor.kv_out
+    to: kv_request_router.internal_sql_in
+  - from: kv_request_router.compute_out
+    to: relational_executor.kv_in
+
+  # ── Proposal ingress: router → gateway → consensus ─────────────
+  - from: kv_request_router.proposal_out
+    to: gateway.client_requests
+  - from: gateway.responses
+    to: kv_request_router.gateway_reject
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # ── Apply path: committed entries → KV worker → response ───────
+  - from: consensus.committed_entries
+    to: lattice_apply_bridge.committed_in
+  - from: lattice_apply_bridge.records_out
+    to: timestamp_allocator.committed_state
+  - from: timestamp_allocator.propose_out
+    to: gateway.client_requests
+  - from: kv_state_worker.lease_request
+    to: timestamp_allocator.lease_request
+  - from: lattice_apply_bridge.kv_out
+    to: kv_state_worker.commands
+  - from: kv_request_router.kv_out
+    to: kv_state_worker.commands
+  - from: kv_state_worker.responses
+    to: kv_request_router.kv_in
+
+  # ── Linearizable-read fence (parity; unused at lin_reads=0) ─────
+  - from: kv_request_router.lin_read_out
+    to: consensus.read
+  - from: consensus.applied
+    to: kv_request_router.read_release
+  - from: admission.permits
+    to: consensus.read_permits
+
+  # ── Clustor persistence ─────────────────────────────────────────
+  - from: consensus.log_append
+    to: durability.entries
+    rate: transaction
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+  - from: consensus.wal_compact
+    to: durability.compact_before
+  - from: durability.metrics
+    to: operations.ingest
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── CDC wiring: pump ⇄ router (etcd pair), pump ⇄ sink ⇄ net ───
+  - from: cdc_pump.kv_out
+    to: kv_request_router.etcd_in
+  - from: kv_request_router.etcd_out
+    to: cdc_pump.kv_in
+  - from: cdc_pump.publish_out
+    to: mqtt_sink.publish_in
+  - from: mqtt_sink.ack_out
+    to: cdc_pump.ack_in
+  - from: mqtt_sink.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: mqtt_sink.net_in
+  - from: cdc_pump.retention
+    to: compaction_coordinator.retention_claims
+  - from: kv_state_worker.compaction_floor
+    to: compaction_coordinator.kv_floor
+  - from: compaction_coordinator.retention_floor_out
+    to: durability.retention_floor
+
+  # ── Observability fan-in → operations → HTTP /metrics ───────────
+  - from: kv_request_router.metrics
+    to: adapter_metrics.events_in
+  - from: kv_state_worker.metrics
+    to: adapter_metrics.events_in
+  - from: cdc_pump.metrics
+    to: adapter_metrics.events_in
+  - from: compaction_coordinator.metrics
+    to: adapter_metrics.events_in
+  - from: adapter_metrics.telemetry_out
+    to: operations.ingest
+  - from: consensus.metrics
+    to: operations.ingest

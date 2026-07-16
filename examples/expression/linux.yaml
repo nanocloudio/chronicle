@@ -1,0 +1,27 @@
+# Run the PARAM-DRIVEN expression evaluator under fluxor-linux.
+#
+#   printf '\x02\x01\x03\x00o-1\x02\x07\x00cust-42' \
+#     | fluxor run examples/expression/linux.yaml > out.bin
+#   xxd out.bin   # -> cust-42
+#
+# The bytecode is NOT baked into the module: the `program` param (hex) selects
+# order.customer_id (field 2): LOAD_PARAM 0; GET_FIELD 2; RET. The sibling config
+# examples/expression/id.yaml runs the SAME .fmod with a different `program`
+# (field 1) and emits `o-1` instead — one binary, any Expression.
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: expression
+    params:
+      program: "0100020200000000"   # order.customer_id (field 2)
+      max_cost: 3
+
+wiring:
+  - from: cli_in.stdin_out
+    to: expression.record_in
+  - from: expression.result_out
+    to: cli_out.bytes_in

@@ -1,0 +1,31 @@
+# Aggregation with an EXPLICIT ONCOUNT trigger (count-based firing). The
+# def is the same customer-total IR def as examples/aggregation/ir.yaml, but with
+# trailing trigger bytes `02` `02000000` (= OnCount, n=2 LE u32) — lower_def
+# passes them through and build_spec decodes them. Instead of emitting only when
+# the watermark closes a window (default OnClose) or after every event
+# (Continuous), the module emits a window's RUNNING PARTIAL every N events folded
+# into it, resetting a per-pane counter each time. The counter is checkpointed
+# (snapshot ver 2), so count-firing survives a restart. Explicit triggers, not a
+# hardcoded policy.
+#
+#   # three alice events, all in window [0,100) (times 10/20/30, amounts
+#   # 100/200/50). OnCount(2) fires once — on the 2nd event (counter hits 2 and
+#   # resets); the 3rd leaves the counter at 1. No closing event advances the
+#   # watermark here, so there is no on-close final in this run.
+#   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x14\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\xc8\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x1e\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x32\x00\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/aggregation/on_count.yaml | xxd
+#   # -> one CustomerTotal frame: count 2, sum 300 (window [0,100))
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: aggregation
+    params:
+      # customer-total IR def with trailing 02 02000000 = OnCount(2) trigger
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d0005000101000000120100000005000202000000010000001202000000050002020000000200000012030000000500020300000001000000120400000005000203000000020000001205000000130200000001080005000103000000140202000000"
+wiring:
+  - from: cli_in.stdin_out
+    to: aggregation.record_in
+  - from: aggregation.result_out
+    to: cli_out.bytes_in

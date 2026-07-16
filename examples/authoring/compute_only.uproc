@@ -1,0 +1,55 @@
+// A pipeline with no effects — the case a document can lower to a runnable graph
+// entirely on its own.
+//
+// `process_order.uproc` is the fuller example, but its pipeline has an `effect`
+// on a `resource`, and a connector binding names an endpoint and credentials
+// that live nowhere in the document. This one is deliberately bindings-free, so
+// `chronicle graph` can take it all the way from source to bootable YAML with
+// nothing supplied from outside — which is what `graph-e2e.sh` proves.
+//
+// Two consecutive `call` stages, so the compute-run collapse is observable: the
+// graph must contain ONE pipeline node, not two.
+module commerce.compute_only {
+
+  // ---- Type environment ----
+  message commerce.Money {
+    units: int = 1;
+  }
+  message commerce.Order {
+    id: string = 1;
+    customer_id: string = 2;
+    total: commerce.Money = 3;
+  }
+  message commerce.NormalizedOrder {
+    id: string = 1;
+    total: int = 2;
+  }
+
+  // ---- Logic artefacts ----
+  transformation normalize(order: commerce.Order) -> commerce.NormalizedOrder {
+    commerce.NormalizedOrder {
+      id: order.id,
+      total: order.total.units
+    }
+  }
+
+  // Takes the PREVIOUS stage's output, so the two stages chain as a pipeline
+  // rather than both reading the original input.
+  transformation surcharge(n: commerce.NormalizedOrder) -> commerce.NormalizedOrder {
+    commerce.NormalizedOrder {
+      id: n.id,
+      total: n.total + 10
+    }
+  }
+
+  // ---- Orchestration ----
+  pipeline process(order: commerce.Order) -> commerce.NormalizedOrder {
+    call normalized = normalize(order);
+    call charged = surcharge(normalized);
+    return charged;
+  }
+
+  entry process = process;
+
+  provenance revision "example" toolchain "chronicle-authoring";
+}

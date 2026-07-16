@@ -1,0 +1,82 @@
+// Artefact 6: PIPELINE — composes named artefacts and external effects into
+// typed workflows. Pipelines NEVER embed anonymous business logic; every stage
+// is a `call` to a named artefact or an `effect` on a named Resource.
+syntax = "proto3";
+
+package unified.v1;
+
+import "unified/v1/common.proto";
+
+message Pipeline {
+  ArtefactHeader header = 1;
+
+  // Typed input/output ports.
+  repeated Port inputs = 2;
+  repeated Port outputs = 3;
+
+  // Source Resource bound to a Pipeline input (spec: source @resources.x).
+  repeated ArtefactRef sources = 4; // ResourceContract refs, direction=source
+
+  repeated Stage stages = 5;
+
+  // Commit point (spec: `commit after <stage>`): stages up to and including the
+  // named stage are committed atomically before the pipeline returns.
+  string commit_after = 6;
+
+  // Which stage output is returned.
+  string return_stage = 7;
+}
+
+message Port {
+  string name = 1;
+  TypeRef type = 2;
+}
+
+message Stage {
+  string name = 1;
+
+  oneof action {
+    // Invoke a named Expression/Transformation/Decision/Aggregation/Pipeline.
+    Call call = 2;
+    // Interact with a named Resource (external action; the only I/O surface).
+    Effect effect = 3;
+  }
+
+  // Inputs to this stage, by name, referencing earlier stage outputs or ports.
+  repeated Binding arguments = 4;
+
+  StagePolicy policy = 5;    // retries/timeouts/backpressure/compensation
+  string on_failure = 6;     // stage name to route to on failure (failure routing)
+}
+
+message Call {
+  ArtefactRef target = 1;    // @qualified.name of the invoked artefact
+}
+
+message Effect {
+  ArtefactRef resource = 1;  // @resource.name
+  string operation = 2;      // ResourceOperation.name
+}
+
+// A named argument binding: `value_ref` names a prior stage or input port; the
+// runtime supplies that typed value as the argument.
+message Binding {
+  string name = 1;
+  string value_ref = 2;      // "order", "normalized", "route", ...
+}
+
+message StagePolicy {
+  uint32 max_retries = 1;
+  uint64 timeout_ms = 2;
+  uint32 max_concurrency = 3;    // fan-out concurrency
+  bool cancellable = 4;
+  ArtefactRef compensation = 5;  // @pipeline/@transformation to run on rollback
+  RetryBackoff backoff = 6;
+}
+
+message RetryBackoff {
+  uint64 initial_ms = 1;
+  double multiplier = 2;
+  uint64 max_ms = 3;
+  // Time source is monotonic-only; wall-clock backoff is forbidden (determinism).
+}

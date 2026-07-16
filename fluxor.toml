@@ -1,0 +1,69 @@
+# chronicle-unified project configuration consumed by the `fluxor` CLI.
+# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
+
+[project]
+name    = "chronicle"
+version = "0.0.1"
+
+# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs, the PIC
+# linker script) materialised by `fluxor sync` into
+# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
+[dependencies]
+fluxor = "0.0.1"
+# Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
+# extraction from fluxor. `examples/grpc_h2/` composes wave's `http` in client
+# and server mode; without this the module resolves only from a stale lockfile
+# entry that still attributes it to `fluxor`.
+wave = "0.0.1"
+# MQTT/Kafka/AMQP messaging is Quantum's domain; `examples/mqtt_sink/` composes
+# quantum's `mqtt_client` (fluxor's old `mqtt` foundation module was retired).
+quantum = "0.0.1"
+# loam supplies the object/metadata tier the registry stores into. The SigV4
+# S3 connector itself is wave's `s3` module: signing an HTTP request is
+# protocol work, and it moved to the project that owns protocols.
+loam = "0.0.1"
+# lattice supplies `pg_client`, the reverser's SQL connector, plus the
+# reverser's storage-tier graph (pg_edge_anchor, cdc_pump, …); clustor is that
+# tier's consensus/WAL substrate. The REVERSER'S composition point is here:
+# lattice must not depend on quantum (CDC RFC), so the application project
+# that composes lattice's pump with quantum's mqtt_sink pins all three.
+lattice = "0.0.1"
+clustor = "0.0.1"
+
+[ci]
+# Module targets `fluxor modules build --all` will produce artefacts for.
+targets = ["bcm2712"]
+
+# No [ci.cargo]: this project has no cargo crate. Every unit test lives in a
+# module harness, run by `fluxor ci`'s own `module-tests` phase — so a crate-less
+# project cannot summarise GREEN having run no unit tests at all
+# (standards/make.md §5 — the loam trap).
+
+[ci.test]
+# The graph E2E gate: each script builds an example graph bundle and drives the
+# built .fmod artefacts through the fluxor-linux runtime, asserting real output
+# (exact frames for the on-device engines; a live SMTP sink, an MQTT broker, and
+# an h2c body for the network compositions — all local Python support processes,
+# no containers). This is the layer cargo tests cannot cover — it catches a
+# stale/blank artefact in target/, a param-schema drift between compiler and
+# module, and broken example configs,
+# each of which otherwise surfaces as a runtime mystery. `fluxor ci` runs these
+# after the strict module build.
+scripts = [
+  # Structural gates: what the tree must BE, checkable without running anything.
+  # (Module harness tests are NOT here — `fluxor ci` runs them as its own
+  # `module-tests` phase. A stopgap script that duplicated it lived here until
+  # that phase landed.)
+  "tools/ci/shipping-surface.sh",
+  # Behavioural drivers: each builds a graph bundle and drives the real .fmod
+  # artefacts through the fluxor-linux runtime, asserting real output.
+  "tools/e2e/*.sh",
+]
+
+[ci.hygiene]
+# `modules/**` are no_std PIC objects that cannot host a test harness, so inline
+# tests there are a real error. Tests belong in `modules/app/*/tests/`, which
+# `fluxor test` builds as ordinary std crates. (This rule once carved out host
+# crates, where inline tests were idiomatic; there are no host crates now.)
+forbid_inline_tests = ["modules"]
+mode                = "strict"
