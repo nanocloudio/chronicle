@@ -53,7 +53,23 @@ use pipe::{
 const MAX_STAGES: usize = 8;
 const HEX_BUF: usize = 4096;
 const PROG_BUF: usize = 2048;
-const ENC_BUF: usize = 2048;
+const ENC_BUF: usize = 4096;
+
+/// One record, in bytes: the read buffer, both stage ping-pong buffers and
+/// the write buffer.
+///
+/// 4096, not 512. A `pipeline` carries whatever record its graph carries, and
+/// 512 was not sized for a workload — it fit the examples that existed. A
+/// record that overruns it is not truncated, it is DROPPED: `channel_read`
+/// stops at the buffer, the codec then reads a length the rest of the record
+/// was going to satisfy, fails, and the record vanishes with a counter. From
+/// the client that is a request that never answers, which is the hardest
+/// possible shape to diagnose from the outside.
+///
+/// A single compact JWS is ~350 bytes, and an HTTP envelope carrying one
+/// carries the path and header block beside it. `pipeline` is
+/// `hardware_targets = ["bcm2712"]`, so no constrained target pays for this.
+const REC_BUF: usize = 4096;
 /// Backing buffer for the version table (holds every loaded version's program;
 /// mutable for hot reload). Larger than one program so several versions coexist.
 const VBIN_BUF: usize = 8192;
@@ -65,10 +81,10 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    in_buf: [u8; 512],
-    buf_a: [u8; 512],
-    buf_b: [u8; 512],
-    out_buf: [u8; 512],
+    in_buf: [u8; REC_BUF],
+    buf_a: [u8; REC_BUF],
+    buf_b: [u8; REC_BUF],
+    out_buf: [u8; REC_BUF],
 
     // Param-driven stage table. `hex` holds the `ir_stages` container, lowered
     // into `prog`; `ver_hex` decodes the `versions` param. Both land in `vbin` —
@@ -200,10 +216,10 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan;
         s.out_chan = out_chan;
         s.ctrl_chan = ctrl_chan;
-        s.in_buf = [0u8; 512];
-        s.buf_a = [0u8; 512];
-        s.buf_b = [0u8; 512];
-        s.out_buf = [0u8; 512];
+        s.in_buf = [0u8; REC_BUF];
+        s.buf_a = [0u8; REC_BUF];
+        s.buf_b = [0u8; REC_BUF];
+        s.out_buf = [0u8; REC_BUF];
         s.hex_len = 0;
         s.enc_hex_len = 0;
         s.enc_len = 0;

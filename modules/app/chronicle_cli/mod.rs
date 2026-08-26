@@ -220,8 +220,42 @@ const MAX_STAGES: usize = 8;
 /// argv slots. Sized for `agg`, the widest command: 5 window scalars + 3
 /// programs + one entry per operator, plus the subcommand itself.
 const MAX_ARGV: usize = 24;
-const ARGV_BUF: usize = 16384;
+// Sized as 2 x UPROC_BUF: a `.uproc` travels as ONE hex argument, so the
+// argv record is twice the document plus the subcommand. The two constants
+// move TOGETHER or an over-bound document stops being a compile error and
+// becomes an argv record the channel never delivers.
+const ARGV_BUF: usize = 65536;
 const BIN_BUF: usize = 2048;
+/// Largest `.uproc` document this CLI will author, in bytes of source.
+///
+/// Raised 16384 -> 32768 when the identity provider grew the code-exchange
+/// and authorization operations: the introspect + token dispatch alone was
+/// 13.3 KB, and each further OIDC junction is another message set, decision
+/// and pipeline. The 2x `ARGV_BUF` relationship is preserved.
+///
+/// Separate from [`BIN_BUF`], which also sizes stack arrays — work buffers
+/// deliberately live in module state, not on the PIC stack, so the document
+/// bound must not drag `2 * BIN_BUF` stack allocations up with it.
+///
+/// It was `BIN_BUF`, and `examples/oci_registry/registry.uproc` is **1967
+/// bytes** — 96% of it. An OCI registry is a far simpler protocol surface
+/// than the identity provider `C13`/`C14` call for, so the bound was
+/// already the binding constraint on what a `.uproc` could express, and the
+/// next real application would have hit it immediately.
+///
+/// Raised rather than worked around, because both alternatives are worse.
+/// Splitting the document breaks the four-file application shape the
+/// examples establish. Pushing configuration out into referenced params
+/// helps and is not enough on its own: even a dispatch-only IdP `.uproc`
+/// has a decision per protocol junction — authorize, redeem, token,
+/// refresh, revoke, introspect, userinfo, logout, consent — where the
+/// registry has a handful.
+///
+/// The cost is module state on a device that has plenty: `chronicle_cli`,
+/// `pipeline` and `decision` are all `hardware_targets = ["bcm2712"]`, so
+/// there is no constrained target paying for this. The old value was not
+/// sized for a workload; it was sized for nothing in particular.
+const UPROC_BUF: usize = 32768;
 const OUT_BUF: usize = 4096;
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
 /// it early; an empty argv — no `--` — never arrives, so we fall through).
@@ -240,8 +274,12 @@ struct State {
     done: u8,
     // Work buffers live in module state, not the PIC stack.
     arec: [u8; ARGV_BUF],
-    ir: [u8; BIN_BUF],
-    prog: [u8; BIN_BUF],
+    /// Hex-decoded input: a `.uproc` document for `author`/`parse`, or a
+    /// smaller artefact for the other subcommands.
+    ir: [u8; UPROC_BUF],
+    /// Compiled program, or the schema text `author` generates from a
+    /// document — which scales with the document.
+    prog: [u8; UPROC_BUF],
     record: [u8; 512],
     buf_a: [u8; 512],
     buf_b: [u8; 512],
@@ -253,18 +291,27 @@ struct State {
     frame: [u8; 512],
     out: [u8; OUT_BUF],
     // `.uproc` declaration arena. In module state, not on the stack: the arrays
+    // total several KiB and a PIC frame cannot hold them. Table sizes were
+    // raised when the reference IdP grew introspect + token + authorization-code
+    // + exchange into one document: 80 message fields across 13 messages, 33
+    // decision rules across 8 junctions — the examples that set the originals
+    // had a handful of each.
     // total several KiB and a PIC frame cannot hold them alongside the compile
     // buffers each artefact kind needs.
-    u_messages: [tc::MessageDecl; 16],
-    u_fields: [tc::FieldDecl; 64],
-    u_enums: [tc::EnumDecl; 16],
+    u_messages: [tc::MessageDecl; 24],
+    u_fields: [tc::FieldDecl; 128],
+    // 32, not 16. A `decision` matches on a TYPED DISCRIMINANT another module
+    // produced, so a document that routes a protocol names every value of
+    // every discriminant it routes on — kagi's `verify_err` alone is twelve.
+    // 16 was not sized for a workload; it fit the examples that existed.
+    u_enums: [tc::EnumDecl; 48],
     u_expressions: [tc::FnDecl; 16],
-    u_transformations: [tc::FnDecl; 16],
-    u_decisions: [tc::DecisionDecl; 8],
-    u_rules: [tc::RuleDecl; 32],
+    u_transformations: [tc::FnDecl; 24],
+    u_decisions: [tc::DecisionDecl; 16],
+    u_rules: [tc::RuleDecl; 48],
     u_resources: [tc::ResourceDecl; 8],
-    u_pipelines: [tc::PipelineDecl; 8],
-    u_stages: [tc::StageDecl; 32],
+    u_pipelines: [tc::PipelineDecl; 16],
+    u_stages: [tc::StageDecl; 48],
     u_args: [tc::Span; 32],
     u_aggregations: [tc::AggregationDecl; 8],
     u_operators: [tc::OperatorDecl; 16],
@@ -2316,36 +2363,24 @@ fn cmd_parse(s: &mut State, hex: &[u8]) -> (usize, i32) {
     let Some(n) = hex_decode(hex, &mut s.ir) else {
         return (append(&mut s.out, 0, b"error: not valid hex\n"), 1);
     };
-    // Declaration arrays live in module state, not on the PIC stack.
-    let mut messages = [Default::default(); 16];
-    let mut fields = [Default::default(); 64];
-    let mut enums = [Default::default(); 16];
-    let mut expressions = [Default::default(); 16];
-    let mut transformations = [Default::default(); 16];
-    let mut decisions = [Default::default(); 8];
-    let mut rules = [Default::default(); 32];
-    let mut resources = [Default::default(); 8];
-    let mut pipelines = [Default::default(); 8];
-    let mut stages = [Default::default(); 32];
-    let mut args = [Default::default(); 32];
-    let mut aggregations = [Default::default(); 8];
-    let mut operators = [Default::default(); 16];
-    let mut entries = [Default::default(); 8];
+    // Declaration arrays live in module state, not on the PIC stack — the
+    // same arena `author`/`graph` use, so `parse` validates exactly the
+    // documents they accept rather than a smaller subset.
     let mut arena = UprocArena {
-        messages: &mut messages,
-        fields: &mut fields,
-        enums: &mut enums,
-        expressions: &mut expressions,
-        transformations: &mut transformations,
-        decisions: &mut decisions,
-        rules: &mut rules,
-        resources: &mut resources,
-        pipelines: &mut pipelines,
-        stages: &mut stages,
-        args: &mut args,
-        aggregations: &mut aggregations,
-        operators: &mut operators,
-        entries: &mut entries,
+        messages: &mut s.u_messages,
+        fields: &mut s.u_fields,
+        enums: &mut s.u_enums,
+        expressions: &mut s.u_expressions,
+        transformations: &mut s.u_transformations,
+        decisions: &mut s.u_decisions,
+        rules: &mut s.u_rules,
+        resources: &mut s.u_resources,
+        pipelines: &mut s.u_pipelines,
+        stages: &mut s.u_stages,
+        args: &mut s.u_args,
+        aggregations: &mut s.u_aggregations,
+        operators: &mut s.u_operators,
+        entries: &mut s.u_entries,
     };
     match uproc_parse(&s.ir[..n], &mut arena) {
         Ok(doc) => {

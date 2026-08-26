@@ -1,0 +1,617 @@
+// The identity provider's DISPATCH. README.md has the rationale.
+//
+// What is NOT here is the point: no credential construction, no signature,
+// no claim, no code, no consent record. `C14` is kept true by this document
+// having no vocabulary for the things it must not do. What IS here is which
+// kagi operation a request names and which HTTP answer a verdict deserves.
+// Both are routing.
+module kagi.idp {
+
+  // wave's HttpRequest, projected. conn_id/stream_id ride through so the
+  // gateway can correlate its answer, exactly as the registry does.
+  //
+  // `credential` is the request BODY, taken whole. `head` is the path and
+  // header block, unparsed and unread — the codec has to walk past them to
+  // reach the body, and a field walked past is better named than dropped.
+  // Nothing here parses either: to this document a credential is opaque
+  // bytes that kagi will judge.
+  message idp.Request {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    credential: string = 4;
+    head: string = 5;
+  }
+
+  // A typed request to kagi. `op` is the operation, not a URL — kagi is
+  // asked to verify a credential, never handed a route to interpret.
+  message idp.KagiCall {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    op: int = 3;
+    credential: string = 4;
+  }
+
+  // kagi's answer, projected from `VerifiedIdentity`. `verdict` is the TYPED
+  // NEXT-STEP this design turns on: the expression VM has no conditional, so
+  // a branch must be a `decision` matching a value some other module
+  // produced, and kagi's `verify_err` is exactly that. `subject`/`issuer`/
+  // `kid` ride along because the codec walks past them anyway; nothing here
+  // branches on them.
+  message idp.KagiReply {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    verdict: int = 3;
+    subject: string = 4;
+    issuer: string = 5;
+    kid: string = 6;
+  }
+
+  // The HTTP answer, built from the verdict alone.
+  message idp.Answer {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    status: int = 3;
+    body: string = 4;
+  }
+
+  // The /oauth/token request. Like idp.Request, but the body is split into a
+  // device certificate and a DPoP proof — the two credentials a token grant
+  // needs — so a codec, not this document, does the split. `head` is still
+  // the path+header block the dispatch matches a route on.
+  message idp.TokenRequest {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    credential: string = 4;
+    proof: string = 5;
+    head: string = 6;
+  }
+
+  // A typed grant call to kagi: admit this presentation AND mint. Carries NO
+  // subject, audience, scope or lifetime — the client asks only with its
+  // credential, and kagi decides who it is and what policy applies. That is
+  // what keeps the pipeline out of the identity decision (C14).
+  message idp.GrantCall {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    credential: string = 3;
+    proof: string = 4;
+  }
+
+  // kagi's grant answer, projected. `status` is the TYPED next-step the
+  // dispatch branches on; `token` is present only on OK and copied verbatim
+  // — the pipeline never builds it.
+  message idp.GrantReply {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    status: int = 3;
+    token: string = 4;
+  }
+
+  enum POST = 3;  // wave's wire/method.rs
+
+
+  // kagi operations. Numbers, not strings: an operation the graph cannot
+  // name is an operation the graph cannot ask for.
+  enum OP_INTROSPECT = 10;
+  enum OP_REFUSE = 99;
+
+  // kagi verdicts, mirroring `auth_wire::verify_err` EXACTLY. These are not
+  // this document's numbers to choose; a mismatch would route a verdict to
+  // the wrong status while looking correct.
+  enum V_OK = 0;
+  enum V_MALFORMED = 1;
+  enum V_NO_KEY = 2;
+  enum V_UNKNOWN_KID = 3;
+  enum V_BAD_SIGNATURE = 4;
+  enum V_EXPIRED = 5;
+  enum V_SUITE_MISMATCH = 6;
+  enum V_WRONG_AUDIENCE = 7;
+  enum V_WRONG_ISSUER = 8;
+  enum V_WRONG_PROFILE = 9;
+  enum V_LOW_ASSURANCE = 10;
+  enum V_NO_CLOCK = 11;
+
+  enum HTTP_OK = 200;
+  enum HTTP_BAD = 400;
+  enum HTTP_UNAUTH = 401;
+  enum HTTP_FORBID = 403;
+  enum HTTP_UNAVAIL = 503;
+
+  // kagi grant verdicts, mirroring `auth_wire::grant_err` EXACTLY. The
+  // presenter-refusal reasons (1..=10) collapse to 400 invalid_grant — a
+  // token endpoint does not tell a client whether it was unknown, revoked or
+  // replayed, which is both RFC 6749 and an information-leak choice kagi's
+  // own token_endpoint already makes. The reasons where nothing looked at
+  // the presenter are 5xx.
+  enum G_OK = 0;
+  enum G_UNAVAILABLE = 7;
+  enum G_NO_CLOCK = 8;
+  enum G_NO_KEY = 9;
+  enum G_PRESENTER_MAX = 10;
+  enum G_MINT_FAILED = 20;
+
+  // Method AND path → kagi operation. One decision per protocol junction.
+  //
+  // The path test is a PREFIX test on `head` (path then header block), so
+  // the path needed no field of its own. Matching a path against a literal
+  // is ROUTING, not parsing.
+  //
+  // wave's `http` routes `/oauth/introspect` EXACTLY, so today nothing else
+  // reaches here — this is not what makes the IdP narrow, it is what KEEPS
+  // it narrow. One more `app: true` route is all it takes for a new path to
+  // arrive, and on method alone this would have introspected it.
+  //
+  // The refuse arm STILL GOES TO KAGI with an empty credential, which kagi
+  // answers `MALFORMED`. A refusal short-circuited here would be the
+  // pipeline deciding, and the whole point is that it cannot.
+  decision to_kagi(req: idp.Request) -> idp.KagiCall {
+    when req.method == POST && req.head.startsWith("/oauth/introspect") ->
+      idp.KagiCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                     op: OP_INTROSPECT, credential: req.credential };
+    default ->
+      idp.KagiCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                     op: OP_REFUSE, credential: "" };
+  }
+
+  // Verdict → HTTP status.
+  //
+  // The last two arms are RANGES, and they are ranges because the table is
+  // first-hit: by the time control reaches them 0, 1, 2 and 11 have already
+  // matched, so `<= V_SUITE_MISMATCH` is exactly {3,4,5,6} and
+  // `<= V_LOW_ASSURANCE` is exactly {7,8,9,10}. Written as twelve equality
+  // arms this said the same thing twice as long, and every new `verify_err`
+  // value would have needed an arm here or fallen silently to the default.
+  // Ordering is load-bearing: moving an arm changes which codes it covers.
+  //
+  // Refusal arms carry NO body — the rule `VerifiedIdentity` enforces on its
+  // own wire, restated where it reaches a client. Only the OK arm carries
+  // the subject, VERBATIM: kagi extracted it, this copies it. Assembling it
+  // into a JSON introspection document would be chronicle constructing an
+  // identity record, which is the line `C14` draws.
+  //
+  // `NO_KEY`/`NO_CLOCK` are 503, not 401: the verifier reached no verdict at
+  // all, and 401 would tell a caller its credential was rejected when
+  // nothing looked at it. The default is 503 for the same reason — a verdict
+  // this document does not recognise is one it cannot act on.
+  decision to_answer(rep: idp.KagiReply) -> idp.Answer {
+    when rep.verdict == V_OK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_OK, body: rep.subject };
+    when rep.verdict == V_MALFORMED ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+    when rep.verdict == V_NO_KEY ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.verdict == V_NO_CLOCK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.verdict <= V_SUITE_MISMATCH ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAUTH, body: "" };
+    when rep.verdict <= V_LOW_ASSURANCE ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_FORBID, body: "" };
+    default ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+  }
+
+  // Identity stages. A codec-only node has no program and fails closed with
+  // VERSION_UNAVAILABLE, so every node carries one.
+  // Method AND path -> a grant call. Same shape as `to_kagi`: a request the
+  // route does not match becomes a call with an empty credential, which kagi
+  // refuses — the refusal is kagi's, never the pipeline's. wave's `http`
+  // routes /oauth/token exactly, so this keeps the IdP narrow rather than
+  // being what makes it narrow (a second app route would otherwise start
+  // arriving here).
+  decision to_grant(req: idp.TokenRequest) -> idp.GrantCall {
+    when req.method == POST && req.head.startsWith("/oauth/token") ->
+      idp.GrantCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                      credential: req.credential, proof: req.proof };
+    default ->
+      idp.GrantCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                      credential: "", proof: "" };
+  }
+
+  // Grant verdict -> HTTP answer. First-hit: the 5xx reasons (nothing looked
+  // at the presenter) are named before the <= G_PRESENTER_MAX range collapses
+  // every presenter refusal to 400. Only OK carries a body, and it is the
+  // token kagi minted, copied verbatim — assembling a JSON token response
+  // around it would be chronicle constructing a credential document, the line
+  // C14 draws. So the 200 body is the bare token, as the introspect 200 is the
+  // bare subject.
+  decision to_token_answer(rep: idp.GrantReply) -> idp.Answer {
+    when rep.status == G_OK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_OK, body: rep.token };
+    when rep.status == G_UNAVAILABLE ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status == G_NO_CLOCK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status == G_NO_KEY ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status == G_MINT_FAILED ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status <= G_PRESENTER_MAX ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+    default ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+  }
+
+  transformation pass_treq(r: idp.TokenRequest) -> idp.TokenRequest {
+    idp.TokenRequest {
+      conn_id: r.conn_id, stream_id: r.stream_id, method: r.method,
+      credential: r.credential, proof: r.proof, head: r.head
+    }
+  }
+
+  transformation pass_gcall(c: idp.GrantCall) -> idp.GrantCall {
+    idp.GrantCall {
+      conn_id: c.conn_id, stream_id: c.stream_id,
+      credential: c.credential, proof: c.proof
+    }
+  }
+
+  transformation pass_greply(k: idp.GrantReply) -> idp.GrantReply {
+    idp.GrantReply {
+      conn_id: k.conn_id, stream_id: k.stream_id,
+      status: k.status, token: k.token
+    }
+  }
+
+  transformation pass_req(r: idp.Request) -> idp.Request {
+    idp.Request {
+      conn_id: r.conn_id, stream_id: r.stream_id,
+      method: r.method, credential: r.credential, head: r.head
+    }
+  }
+
+  transformation pass_call(c: idp.KagiCall) -> idp.KagiCall {
+    idp.KagiCall {
+      conn_id: c.conn_id, stream_id: c.stream_id,
+      op: c.op, credential: c.credential
+    }
+  }
+
+  transformation pass_reply(k: idp.KagiReply) -> idp.KagiReply {
+    idp.KagiReply {
+      conn_id: k.conn_id, stream_id: k.stream_id, verdict: k.verdict,
+      subject: k.subject, issuer: k.issuer, kid: k.kid
+    }
+  }
+
+  transformation pass_ans(a: idp.Answer) -> idp.Answer {
+    idp.Answer {
+      conn_id: a.conn_id, stream_id: a.stream_id,
+      status: a.status, body: a.body
+    }
+  }
+
+  // The request half: HTTP envelope → a typed kagi call.
+  pipeline serve(req: idp.Request) -> idp.KagiCall {
+    call decoded = pass_req(req);
+    call called = to_kagi(decoded);
+    return called;
+  }
+
+  // The reply half: kagi's verdict → an HTTP answer. A SECOND pipeline, not
+  // a longer first one — the halves are separated by a kagi module, and a
+  // chronicle pipeline is a chain of stages, not a request/response.
+  pipeline answer(rep: idp.KagiReply) -> idp.Answer {
+    call passed = pass_reply(rep);
+    call ans = to_answer(passed);
+    return ans;
+  }
+
+  // The /oauth/token request half: HTTP envelope -> a typed grant call.
+  pipeline serve_token(req: idp.TokenRequest) -> idp.GrantCall {
+    call decoded = pass_treq(req);
+    call called = to_grant(decoded);
+    return called;
+  }
+
+  // The grant reply half: kagi's verdict (or token) -> an HTTP answer.
+  pipeline answer_token(rep: idp.GrantReply) -> idp.Answer {
+    call passed = pass_greply(rep);
+    call ans = to_token_answer(passed);
+    return ans;
+  }
+
+  // ─── the code-exchange operation (OIDC authorization-code, second leg) ────
+  //
+  // The client redeems a single-use code + its PKCE verifier for tokens.
+  // authcode re-checks the code's bindings, consumes it once, and mints an
+  // access token and an ID token INSIDE kagi. The pipeline splits the body
+  // into the four fields authcode needs and transports them opaquely; it
+  // chooses no subject, audience, scope or lifetime — the code carries the
+  // subject authcode established at /authorize, and kagi holds the rest.
+
+  // The exchange request, projected. The body is
+  // `code\nredirect_uri\nclient_id\ncode_verifier` — four single-line values
+  // (a code id, a URI, a client id and a PKCE verifier all lack newlines), so
+  // a codec splits them without parsing. `head` is the path+header block the
+  // dispatch matches a route on.
+  message idp.ExchangeRequest {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    code: string = 4;
+    redirect_uri: string = 5;
+    client_id: string = 6;
+    code_verifier: string = 7;
+    head: string = 8;
+  }
+
+  // A typed exchange call to authcode. No subject, no audience: the code IS
+  // the subject binding, and kagi decides the rest.
+  message idp.ExchangeCall {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    code: string = 3;
+    redirect_uri: string = 4;
+    client_id: string = 5;
+    code_verifier: string = 6;
+  }
+
+  // authcode's exchange answer, projected. `status` is the TYPED next-step the
+  // dispatch turns on; the tokens are present only on OK and copied verbatim.
+  message idp.ExchangeReply {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    status: int = 3;
+    access_token: string = 4;
+    id_token: string = 5;
+  }
+
+  // authcode's exchange verdicts, mirroring `auth_wire::authz_err` EXACTLY for
+  // the codes the exchange leg can produce. The presenter refusals collapse to
+  // 400 (a token endpoint does not tell a client whether its code was unknown,
+  // replayed, mismatched or PKCE-failed — RFC 6749 and an info-leak choice);
+  // the reasons where nothing could look at the presenter are 5xx.
+  enum X_OK = 0;
+  enum X_STATE_UNAVAIL = 8;
+  enum X_NO_KEY = 10;
+  enum X_MINT_FAILED = 20;
+
+  // Method AND path → an exchange call. Same shape as `to_grant`: a request
+  // the route does not match becomes a call with an empty code, which kagi
+  // refuses — the refusal is kagi's, never the pipeline's.
+  decision to_exchange(req: idp.ExchangeRequest) -> idp.ExchangeCall {
+    when req.method == POST && req.head.startsWith("/oauth/token") ->
+      idp.ExchangeCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                         code: req.code, redirect_uri: req.redirect_uri,
+                         client_id: req.client_id,
+                         code_verifier: req.code_verifier };
+    default ->
+      idp.ExchangeCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                         code: "", redirect_uri: "", client_id: "",
+                         code_verifier: "" };
+  }
+
+  // Exchange verdict → HTTP answer. First-hit: the presenter refusals are
+  // named as 400 explicitly, and every 5xx reason (state unavailable, no key,
+  // mint failed) plus any unrecognised verdict falls to the default 503 — the
+  // safe direction, since an unknown verdict is one this document cannot act
+  // on. Only OK carries a body, and it is the access token kagi minted, copied
+  // verbatim — assembling a JSON token response around it would be chronicle
+  // constructing a credential document, the line C14 draws.
+  decision to_exchange_answer(rep: idp.ExchangeReply) -> idp.Answer {
+    when rep.status == X_OK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_OK, body: rep.access_token };
+    when rep.status == X_STATE_UNAVAIL ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status == X_NO_KEY ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    when rep.status == X_MINT_FAILED ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+    default ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+  }
+
+  transformation pass_exreq(r: idp.ExchangeRequest) -> idp.ExchangeRequest {
+    idp.ExchangeRequest {
+      conn_id: r.conn_id, stream_id: r.stream_id, method: r.method,
+      code: r.code, redirect_uri: r.redirect_uri, client_id: r.client_id,
+      code_verifier: r.code_verifier, head: r.head
+    }
+  }
+
+  transformation pass_excall(c: idp.ExchangeCall) -> idp.ExchangeCall {
+    idp.ExchangeCall {
+      conn_id: c.conn_id, stream_id: c.stream_id,
+      code: c.code, redirect_uri: c.redirect_uri, client_id: c.client_id,
+      code_verifier: c.code_verifier
+    }
+  }
+
+  transformation pass_exreply(k: idp.ExchangeReply) -> idp.ExchangeReply {
+    idp.ExchangeReply {
+      conn_id: k.conn_id, stream_id: k.stream_id, status: k.status,
+      access_token: k.access_token, id_token: k.id_token
+    }
+  }
+
+  // The exchange request half: HTTP envelope -> a typed exchange call.
+  pipeline serve_exchange(req: idp.ExchangeRequest) -> idp.ExchangeCall {
+    call decoded = pass_exreq(req);
+    call called = to_exchange(decoded);
+    return called;
+  }
+
+  // The exchange reply half: kagi's verdict (or tokens) -> an HTTP answer.
+  pipeline answer_exchange(rep: idp.ExchangeReply) -> idp.Answer {
+    call passed = pass_exreply(rep);
+    call ans = to_exchange_answer(passed);
+    return ans;
+  }
+
+  // ─── the authorize operation (OIDC authorization-code, first leg) ─────────
+  //
+  // A device authenticates at /authorize with its certificate + a DPoP proof;
+  // authcode establishes the subject FROM the certificate, verifies the
+  // client's registered redirect_uri and clamps the requested scope, and
+  // returns a single-use code. The pipeline splits the body into the eight
+  // fields authcode needs and transports them opaquely; it establishes no
+  // subject and mints no code.
+
+  // The authorize request, projected. The body is eight newline-separated
+  // values —
+  // credential\nproof\nclient_id\nredirect_uri\nscope\nstate\ncode_challenge\nnonce
+  // — none of which contains a newline (two compact JWSs, a client id, a URI,
+  // a scope string, an opaque state, a PKCE challenge and a nonce). `head` is
+  // the path+header block the dispatch matches a route on.
+  message idp.AuthzRequest {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    credential: string = 4;
+    proof: string = 5;
+    client_id: string = 6;
+    redirect_uri: string = 7;
+    scope: string = 8;
+    state: string = 9;
+    code_challenge: string = 10;
+    nonce: string = 11;
+    head: string = 12;
+  }
+
+  // A typed authorize call to authcode. The subject is NOT here — authcode
+  // reads it from the certificate. `scope` is a REQUEST authcode clamps to the
+  // client's registered scope before anything is signed.
+  message idp.AuthzCall {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    credential: string = 3;
+    proof: string = 4;
+    client_id: string = 5;
+    redirect_uri: string = 6;
+    scope: string = 7;
+    state: string = 8;
+    code_challenge: string = 9;
+    nonce: string = 10;
+  }
+
+  // authcode's authorize answer, projected. `status` is the TYPED next-step the
+  // dispatch turns on; on OK the code, the kagi-APPROVED redirect_uri and the
+  // echoed state ride along — the pipeline builds none of them.
+  message idp.AuthzReply {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    status: int = 3;
+    code: string = 4;
+    redirect_uri: string = 5;
+    state: string = 6;
+  }
+
+  // authcode's authorize verdicts, mirroring `auth_wire::authz_err` EXACTLY for
+  // the codes the authorize leg produces. UNAUTHENTICATED is 401 (the
+  // certificate was rejected); the client/redirect/PKCE refusals are 400; the
+  // reasons where nothing could look at the request (state unavailable, no
+  // clock, no key) plus any unrecognised verdict are 5xx.
+  enum A_OK = 0;
+  enum A_UNAUTHENTICATED = 1;
+  enum A_UNKNOWN_CLIENT = 2;
+  enum A_BAD_REDIRECT = 3;
+  enum A_NO_PKCE = 4;
+
+  // Method AND path → an authorize call. Same shape as `to_grant`: a request
+  // the route does not match becomes a call with an empty credential, which
+  // kagi refuses — the refusal is kagi's, never the pipeline's.
+  decision to_authorize(req: idp.AuthzRequest) -> idp.AuthzCall {
+    when req.method == POST && req.head.startsWith("/oauth/authorize") ->
+      idp.AuthzCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                      credential: req.credential, proof: req.proof,
+                      client_id: req.client_id, redirect_uri: req.redirect_uri,
+                      scope: req.scope, state: req.state,
+                      code_challenge: req.code_challenge, nonce: req.nonce };
+    default ->
+      idp.AuthzCall { conn_id: req.conn_id, stream_id: req.stream_id,
+                      credential: "", proof: "", client_id: "",
+                      redirect_uri: "", scope: "", state: "",
+                      code_challenge: "", nonce: "" };
+  }
+
+  // Authorize verdict → HTTP answer. First-hit: OK returns the code as the
+  // body; UNAUTHENTICATED is 401, the client/redirect/PKCE refusals are 400,
+  // and every 5xx reason plus any unrecognised verdict falls to the default
+  // 503 (the safe direction). Only OK carries a body — the single-use code,
+  // copied verbatim; the pipeline builds no redirect and no document, the line
+  // C14 draws.
+  decision to_authz_answer(rep: idp.AuthzReply) -> idp.Answer {
+    when rep.status == A_OK ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_OK, body: rep.code };
+    when rep.status == A_UNAUTHENTICATED ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAUTH, body: "" };
+    when rep.status == A_UNKNOWN_CLIENT ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+    when rep.status == A_BAD_REDIRECT ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+    when rep.status == A_NO_PKCE ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_BAD, body: "" };
+    default ->
+      idp.Answer { conn_id: rep.conn_id, stream_id: rep.stream_id,
+                   status: HTTP_UNAVAIL, body: "" };
+  }
+
+  transformation pass_azreq(r: idp.AuthzRequest) -> idp.AuthzRequest {
+    idp.AuthzRequest {
+      conn_id: r.conn_id, stream_id: r.stream_id, method: r.method,
+      credential: r.credential, proof: r.proof, client_id: r.client_id,
+      redirect_uri: r.redirect_uri, scope: r.scope, state: r.state,
+      code_challenge: r.code_challenge, nonce: r.nonce, head: r.head
+    }
+  }
+
+  transformation pass_azcall(c: idp.AuthzCall) -> idp.AuthzCall {
+    idp.AuthzCall {
+      conn_id: c.conn_id, stream_id: c.stream_id,
+      credential: c.credential, proof: c.proof, client_id: c.client_id,
+      redirect_uri: c.redirect_uri, scope: c.scope, state: c.state,
+      code_challenge: c.code_challenge, nonce: c.nonce
+    }
+  }
+
+  transformation pass_azreply(k: idp.AuthzReply) -> idp.AuthzReply {
+    idp.AuthzReply {
+      conn_id: k.conn_id, stream_id: k.stream_id, status: k.status,
+      code: k.code, redirect_uri: k.redirect_uri, state: k.state
+    }
+  }
+
+  // The authorize request half: HTTP envelope -> a typed authorize call.
+  pipeline serve_authorize(req: idp.AuthzRequest) -> idp.AuthzCall {
+    call decoded = pass_azreq(req);
+    call called = to_authorize(decoded);
+    return called;
+  }
+
+  // The authorize reply half: kagi's verdict (or code) -> an HTTP answer.
+  pipeline answer_authorize(rep: idp.AuthzReply) -> idp.Answer {
+    call passed = pass_azreply(rep);
+    call ans = to_authz_answer(passed);
+    return ans;
+  }
+
+  entry serve = serve;
+
+  provenance revision "kagi-idp-dispatch" toolchain "chronicle-authoring";
+}

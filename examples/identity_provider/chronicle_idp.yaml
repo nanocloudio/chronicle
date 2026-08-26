@@ -1,0 +1,306 @@
+# The identity provider: chronicle serving an OAuth-shaped surface over kagi.
+#
+# There is no IdP module and there should not be one. What runs is chronicle's
+# GENERIC engines carrying IdP-shaped params, plus kagi's identity modules
+# pinned from the store. `idp.uproc` compiles to those params; nothing about
+# OAuth is baked into a `.fmod`.
+#
+#   client ─HTTP→ http (wave)            terminates HTTP
+#            │ req_out (HttpRequest)
+#            ↓
+#          dec_http   pipeline           rd bytecode: envelope → Request
+#            ↓
+#          route_op   decision           idp.uproc's `to_kagi`
+#            ↓
+#          enc_call   pipeline           ser bytecode: KagiCall → MSG_VERIFY_REQ
+#            ↓
+#          token_verify (kagi)           VERIFIES, with a TYPED verdict
+#            ↓
+#          dec_reply  pipeline           rd bytecode: VerifiedIdentity → KagiReply
+#            ↓
+#          route_ans  decision           idp.uproc's `to_answer`
+#            ↓
+#          enc_http   pipeline           ser bytecode: Answer → HttpResponse
+#            │ resp_in
+#            ↓
+#          http ─HTTP→ client
+#
+# TWO DECISION NODES, ONE PER PROTOCOL JUNCTION. The expression VM has no
+# conditional, so every branch is a `decision` matching a value some other
+# module produced. `route_op` matches the request's method; `route_ans`
+# matches KAGI'S VERDICT — and that is the whole of `C14`. The pipeline
+# cannot decide to admit something kagi refused, because the only thing it
+# can branch on is what kagi said.
+#
+# What is NOT in this graph is the point. No credential is constructed here,
+# no signature computed, no claim written, no code redeemed, no consent
+# recorded. Every one of those is inside a kagi module, reached by a typed
+# request. The graph routes; it does not decide who anyone is.
+#
+# Run it with ./run.sh. See README.md.
+target: linux
+tick_us: 100
+
+# http↔linux_net and http↔engines are both request/response pairs, which is
+# what a cycle IS here.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  # ── wave: the HTTP server ────────────────────────────────────────────────
+  - name: http
+    port: ${IDP_PORT:-15100}
+    # 1 = downstream is `linux_net`: the kernel owns TCP segmentation.
+    host_tcp: 1
+    max_body_kib: 64
+    routes:
+      # Key delivery, exactly as kagi's own e2e graphs do it: a websocket
+      # carrying mux frames, `ch0` into `token_verify.verify_key`. The
+      # keyset is an OPERATOR input, not a request input — it arrives on a
+      # different port, through a different codec, and nothing on the
+      # serving path can reach it. `retain_replay: false` because a key
+      # frame must never replay to a fresh subscriber.
+      - path: "/ws"
+        websocket_fanout: true
+        retain_replay: false
+      # An EXACT route (no trailing slash), and the credential is the whole
+      # request body — `POST /oauth/introspect` with the compact JWS as the
+      # body. Nothing in this graph parses a path, a query, a form encoding
+      # or a header: `dec_http` skips over the path and header block using
+      # the two lengths the envelope already carries, and takes the rest.
+      # A codec that parsed would be a codec that could parse wrong, on
+      # bytes an attacker chose.
+      #
+      # The body rather than the path because a path is capped at
+      # `abi::config::http::MAX_PATH` (200 on this profile) and a real
+      # compact JWS is longer — a credential in the URL is silently
+      # truncated, which is the worst of both.
+      #
+      # It is deliberately NOT RFC 7662, which posts a form and answers a
+      # JSON document. Parsing that form and assembling that document would
+      # both be chronicle handling identity data. See README.md.
+      - path: "/oauth/introspect"
+        app: true
+
+  # ── request path ─────────────────────────────────────────────────────────
+  #
+  # Every pipeline node carries BOTH a codec and an `ir_stages` program. The
+  # stage is not decoration: a codec-only node has no program and fails
+  # closed with a `{1:"VERSION_UNAVAILABLE"}` record, which downstream looks
+  # like an ordinary record and surfaces two hops away as a decision that
+  # will not fire.
+  #
+  # `ir_stages` and the decision tables are `idp.uproc` compiled, via:
+  #   H=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' \
+  #        examples/identity_provider/idp.uproc)
+  #   fluxor exec chronicle -- graph "$H" serve  linux   # request half
+  #   fluxor exec chronicle -- graph "$H" answer linux   # reply half
+  #
+  # The codecs are hand-written byte programs (`ser`/`rd`), because a wire
+  # format is not something the document describes — the document describes
+  # ROUTING. `enc_call` and `dec_reply` are `auth_wire`'s `MSG_VERIFY_REQ`
+  # and `MSG_VERIFY_RESP` layouts, and if kagi changes those, these change
+  # with them in the same commit (`C15`).
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_req — five fields.
+      ir_stages: "01ff3d0005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000013"
+      # conn_id/stream_id/method as ints, then the body as the credential.
+      #
+      # The interesting part is how it reaches the body. The envelope is
+      # `[conn][stream][method][flags][path_len][hdr_len][body_len]` and
+      # then path, headers, body — so the three lengths are all read BEFORE
+      # any of the three values, and the byte VM's stack is LIFO with no
+      # locals and no swap. Reading `path_len`, then `hdr_len`, then ADDing
+      # them gives ONE length that skips both variable regions in one
+      # `TAKEN`, after which `REST` is exactly the body. That is why `head`
+      # exists as a field: the path and the header block come off together
+      # because taking them separately is not expressible, and naming what
+      # was taken beats silently discarding it.
+      #
+      # Every length here is wave's own framing, never a length read out of
+      # the request — so a request cannot make this program read past what
+      # arrived.
+      decode: "7502014001000000750201400200000075010140030000007001007502017502015070020074400500000078400400000041"
+
+  - name: route_op
+    type: decision
+    params:
+      # idp.uproc's `to_kagi`: POST **to `/oauth/introspect`** →
+      # OP_INTROSPECT with the credential; anything else → OP_REFUSE with an
+      # EMPTY credential, which kagi answers MALFORMED. The refusal is still
+      # kagi's.
+      #
+      # The path literal is visible in the bytes below, and so is the
+      # `CALL 3` (startsWith) and the `AND` that joins it to the method
+      # test. Routing on the method ALONE meant `POST /anything` was
+      # introspected — a valid credential presented to any path answered 200
+      # with the subject.
+      decision: "010c00000031000100020300000010030000000000000020010002050000001211002f6f617574682f696e74726f737065637453030030000c0000003300010002010000004001000000010002020000004002000000100a000000000000004003000000010002040000004004000000410b0000002f000100020100000040010000000100020200000040020000001063000000000000004003000000120000400400000041"
+
+  - name: enc_call
+    type: pipeline
+    params:
+      # pass_call — four fields, the same identity program.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # MSG_VERIFY_REQ (0x42): [type][payload_len u16] then
+      #   [corr u32][credential f16][expected_profile u16]
+      #   [expected_issuer f16][expected_audience f16][method f8][uri f16]
+      #   [min_assurance u8][now_unix_secs u64][source_class u8][flags u8]
+      #
+      # `corr` is written as TWO u16s — conn_id then stream_id — so the
+      # correlation the reply carries IS the connection the answer belongs
+      # to, with no arithmetic to get wrong in either direction.
+      #
+      # Every `expected_*` is empty and `min_assurance` is 0: this example
+      # states no policy, which is a deliberate statement and not an
+      # omission. A deployment that wants an audience rule writes it HERE,
+      # in the graph, where it is reviewable — never in kagi, which enforces
+      # the rule it is given and does not invent one.
+      #
+      # The time fields are zero. `token_verify` reads fluxor's own trusted
+      # clock (B2) and refuses with NO_CLOCK if it cannot; a codec cannot
+      # tell the time, and one that shipped a plausible-looking constant
+      # here would be handing the verifier a forged observation.
+      encode: "60010042650100020100000062020101000202000000620201010002040000006462020101000204000000616002000000600200000060020000006001000060020000006001000060080000000000000000006001000060010000670201006a"
+
+  # ── kagi: the verifier ───────────────────────────────────────────────────
+  #
+  # Pinned from the store, not vendored. It holds the keyset, checks the
+  # signature, the window and the profile, and answers a typed
+  # `VerifiedIdentity`. Nothing above or below it can reach that decision.
+  #
+  # `verify_key` is where the keyset arrives as `MSG_KEY_ADD` frames. With
+  # nothing wired to it the module holds no key and answers NO_KEY — which
+  # this graph turns into 503, and which is the honest answer for an issuer
+  # that has not been given an issuer. See README.md for provisioning it.
+  - name: token_verify
+
+  # ── the keyset carrier ───────────────────────────────────────────────────
+  #
+  # wave's `ws_stream` frames the websocket; kagi's `remote_channel` splits
+  # the byte stream into channels (`[0xFC][ch][len u16][payload]`). Only
+  # `ch0` is wired, and only into `verify_key`.
+  - name: ws
+    type: ws_stream
+
+  - name: mux
+    type: remote_channel
+
+  # ── reply path ───────────────────────────────────────────────────────────
+  - name: dec_reply
+    type: pipeline
+    params:
+      # pass_reply — six fields.
+      ir_stages: "01ff490005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000005000106000000120600000013"
+      # MSG_VERIFY_RESP (0x43) → KagiReply. Skip the envelope, read the
+      # correlation back as two u16s, take the status as the verdict, then
+      # walk issuer/kid/suite to reach the subject. `issuer` and `kid` are
+      # kept rather than skipped: the walk has to read their lengths anyway,
+      # and a field read and thrown away is a field that silently stopped
+      # being read the next time this layout changes.
+      decode: "70030075020140010000007502014002000000750101400300000070020075020174400500000075010174400600000070020075020174400400000041"
+
+  - name: route_ans
+    type: decision
+    params:
+      # idp.uproc's `to_answer`: every `verify_err` value → an HTTP status,
+      # with a fail-closed 503 default. This is the C14 junction — the ONLY
+      # thing it can branch on is kagi's verdict.
+      decision: "060500000012000100020300000010000000000000000020000c000000330001000201000000400100000001000202000000400200000010c8000000000000004003000000010002040000004004000000410500000012000100020300000010010000000000000020000b0000002f0001000201000000400100000001000202000000400200000010900100000000000040030000001200004004000000410500000012000100020300000010020000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f701000000000000400300000012000040040000004105000000120001000203000000100b0000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410500000012000100020300000010060000000000000023000b0000002f00010002010000004001000000010002020000004002000000109101000000000000400300000012000040040000004105000000120001000203000000100a0000000000000023000b0000002f0001000201000000400100000001000202000000400200000010930100000000000040030000001200004004000000410b0000002f0001000201000000400100000001000202000000400200000010f7010000000000004003000000120000400400000041"
+
+  - name: enc_http
+    type: pipeline
+    params:
+      # pass_ans — four fields.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # HttpResponse: [conn_id u16][stream_id u16][status u16][flags u8]
+      #               [ct_len u8][hdr_len u16][body_len u16][ct][hdrs][body]
+      #
+      # `stream_id` is ECHOED, never hardcoded to 0: under h1 it
+      # distinguishes this request from a previous holder of the same
+      # connection id whose answer may still be in flight, and wave's own
+      # `app.rs` says an application that hardcodes it was already broken.
+      #
+      # `text/plain`, and the body is the subject VERBATIM on 200 and empty
+      # on every refusal. Building a JSON introspection document here would
+      # be chronicle assembling an identity record out of parts, which is
+      # exactly the thing `C14` says it must not do.
+      encode: "010002010000006202010100020200000062020101000203000000620201600100006001000a60020000000100020400000064620201600a00746578742f706c61696e01000204000000616a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  # The application fan-out. `buffer_group` is REQUIRED on both http edges: a
+  # non-zero group puts the channel in mailbox mode, one write = one whole
+  # envelope. The default is a byte FIFO, which fragments structured records.
+  # `buffer_bytes` on EVERY edge that carries a record, because the default
+  # channel is 512 bytes and this record is not. A compact JWS is ~350 bytes
+  # on its own, `head` carries the path and header block beside it, and the
+  # typed frame adds its own header per field. The default was fine for
+  # `oci_registry`, whose records are a path and a status.
+  #
+  # The failure it prevents is the reason it is stated on every edge rather
+  # than the one that overflowed first: a record too large for a channel does
+  # not arrive truncated, it does not arrive AT ALL, and from the client that
+  # is a request that hangs until wave's app timeout. Sizing one edge and
+  # leaving the next moves the hang rather than fixing it.
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+    buffer_bytes: 4096
+
+  - from: dec_http.result_out
+    to: route_op.record_in
+    buffer_bytes: 4096
+  - from: route_op.result_out
+    to: enc_call.record_in
+    buffer_bytes: 4096
+
+  # Into and out of kagi. No `buffer_group`: `auth_wire`'s envelope is
+  # self-delimiting — `[type][len u16][payload]` — so a byte FIFO is
+  # correct here, and it is how kagi's own graphs wire this module.
+  # WS framing: http ⇄ ws_stream. `WsFrame` is a record envelope, so both
+  # edges are mailbox mode — without it the channel is a byte FIFO and a
+  # consumer can be handed part of an envelope and read a length that is not
+  # there. Distinct groups: the directions are independent channels.
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 3
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 4
+
+  - from: ws.rx_out
+    to: mux.transport_rx
+  - from: mux.transport_tx
+    to: ws.tx_in
+
+  # The verifying keyset into kagi. This is the ONLY edge into `verify_key`.
+  - from: mux.ch0_rx
+    to: token_verify.verify_key
+
+  - from: enc_call.result_out
+    to: token_verify.verify_requests
+    buffer_bytes: 4096
+  - from: token_verify.results
+    to: dec_reply.record_in
+    buffer_bytes: 4096
+
+  - from: dec_reply.result_out
+    to: route_ans.record_in
+    buffer_bytes: 4096
+  - from: route_ans.result_out
+    to: enc_http.record_in
+    buffer_bytes: 4096
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 2
+    buffer_bytes: 4096

@@ -15,6 +15,10 @@ fluxor = "0.0.1"
 # and server mode; without this the module resolves only from a stale lockfile
 # entry that still attributes it to `fluxor`.
 wave = "0.0.1"
+# kagi owns the identity protocols. `examples/identity_provider/` composes its
+# modules: the IdP is chronicle's generic engines routing to kagi's, and
+# without this pin the graph names modules the store cannot resolve.
+kagi = "0.0.1"
 # MQTT/Kafka/AMQP messaging is Quantum's domain; `examples/mqtt_sink/` composes
 # quantum's `mqtt_client` (fluxor's old `mqtt` foundation module was retired).
 quantum = "0.0.1"

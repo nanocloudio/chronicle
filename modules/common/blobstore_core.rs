@@ -115,7 +115,7 @@ unsafe fn put_raw(
 ) -> Result<(), BlobError> {
     // storage.object PUT argument layout:
     //   [key_len:u16][key][content_type_len:u8]
-    //   [body_ptr:u64][body_len:u64][if_match_len:u8]
+    //   [body_ptr:u64][body_len:u64][precondition:u8][etag_len:u8]
     //   [fence_ptr:u64][fence_cap:u16]
     let mut fence = [0u8; 62];
     let mut arg = [0u8; BLOB_KEY_MAX + 64];
@@ -130,8 +130,9 @@ unsafe fn put_raw(
     p += 8;
     arg[p..p + 8].copy_from_slice(&(body.len() as u64).to_le_bytes());
     p += 8;
-    arg[p] = 0; // unconditional (no if-match)
-    p += 1;
+    arg[p] = 0; // precondition = ANY
+    arg[p + 1] = 0; // etag_len
+    p += 2;
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
     arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());

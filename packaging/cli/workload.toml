@@ -14,4 +14,4 @@ graph = "linux.yaml"
 
 [resources]
 state_bytes = 65536
-buffer_bytes = 16384
+buffer_bytes = 40960

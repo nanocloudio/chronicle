@@ -1,0 +1,209 @@
+# The identity provider: POST /oauth/token, chronicle over kagi.
+#
+# The companion to chronicle_idp.yaml (introspect). Same shape — chronicle's
+# generic engines carry the dispatch, kagi's modules hold every credential
+# decision, and `idp.uproc` compiles to the params. The difference is the
+# junction: this routes to mint_admission's GRANT mode, which admits a device
+# credential and mints an access token, the subject established and signed
+# entirely inside kagi. The pipeline transports the opaque credential in and
+# the opaque token out; it constructs nothing.
+#
+#   client ─HTTP→ http (wave)
+#            │ req_out (HttpRequest)  — body is <credential>\n<proof>
+#            ↓
+#          dec_http    pipeline   rd bytecode: envelope → TokenRequest
+#            ↓                     (splits the body on '\n' into cred + proof)
+#          route_grant decision   idp.uproc's `to_grant`
+#            ↓
+#          enc_grant   pipeline   ser bytecode: GrantCall → MSG_GRANT_REQ
+#            ↓
+#          mint_admission (kagi)  ADMITS, then drives token_mint — the
+#            ↓                    subject never leaves kagi via the pipeline
+#          dec_grant   pipeline   rd bytecode: MSG_GRANT_RESP → GrantReply
+#            ↓
+#          route_ans   decision   idp.uproc's `to_token_answer`
+#            ↓
+#          enc_http    pipeline   ser bytecode: Answer → HttpResponse
+#            ↓ resp_in
+#          http ─HTTP→ client
+#
+# TWO DECISION NODES, ONE PER JUNCTION, and the second matches KAGI'S grant
+# verdict — the pipeline cannot mint what admission refused, because the only
+# thing it can branch on is what kagi said. That is C14 for /oauth/token.
+#
+# Run it with ./run.sh. See README.md.
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: ${IDP_PORT:-15100}
+    host_tcp: 1
+    max_body_kib: 64
+    routes:
+      # Operator input: signing key, device-cert verify key, and the device
+      # record are delivered over the websocket mux, never on the serving
+      # path. `retain_replay: false` — a key or record frame must not replay
+      # to a fresh subscriber.
+      - path: "/ws"
+        websocket_fanout: true
+        retain_replay: false
+      # The token endpoint. The body is <device-certificate>\n<dpop-proof>:
+      # two compact JWSs, neither of which contains a newline, so a codec
+      # splits them without parsing either. Exact route (no trailing slash).
+      - path: "/oauth/token"
+        app: true
+
+  # ── the request half ─────────────────────────────────────────────────────
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_treq — the 6-field TokenRequest identity.
+      ir_stages: "01ff490005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000005000106000000120600000013"
+      # rd: [conn u16][stream u16][method u8] skip flags; path_len+hdr_len,
+      # skip body_len, TAKEN → head; UNTIL '\n' → credential; REST → proof.
+      decode: "75020140010000007502014002000000750101400300000070010075020175020150700200744006000000720a400400000078400500000041"
+
+  - name: route_grant
+    type: decision
+    params:
+      # idp.uproc's `to_grant`: POST /oauth/token → GrantCall{credential,
+      # proof}; anything else → empty credential, which kagi refuses.
+      decision: "010c0000002c00010002030000001003000000000000002001000206000000120c002f6f617574682f746f6b656e53030030000d0000003100010002010000004001000000010002020000004002000000010002040000004003000000010002050000004004000000410b00000029000100020100000040010000000100020200000040020000001200004003000000120000400400000041"
+
+  - name: enc_grant
+    type: pipeline
+    params:
+      # pass_gcall — the 4-field GrantCall identity.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # ser: MSG_GRANT_REQ (0x37) [corr=conn|stream][method="POST"]
+      # [uri="/oauth/token"][credential f16][proof f16].
+      encode: "6001003765010002010000006202010100020200000062020160050004504f5354600e000c002f6f617574682f746f6b656e0100020300000064620201010002030000006101000204000000646202010100020400000061670201006a"
+
+  # ── kagi: admit and mint ──────────────────────────────────────────────────
+  #
+  # mint_admission in GRANT mode. It holds the device-cert keyset (verify_key),
+  # consults the ledger (security_state), and on success builds the MintRequest
+  # from the subject it established and drives token_mint. aud/scope/ttl/iss/
+  # suite are deployment params — a client asks for none, so can widen none.
+  - name: mint_admission
+    iss: "https://issuer.token.test"
+    aud: "https://rs.token.test"
+    scope: "read write"
+    ttl_seconds: 600
+    suite: 2   # Ed25519
+
+  - name: token_mint
+
+  - name: security_state
+
+  - name: ws
+    type: ws_stream
+  - name: mux
+    type: remote_channel
+
+  # ── the reply half ────────────────────────────────────────────────────────
+  - name: dec_grant
+    type: pipeline
+    params:
+      # pass_greply — the 4-field GrantReply identity.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # rd: skip the 3-byte envelope; [conn u16][stream u16][status u8]
+      # [token f16].
+      decode: "70030075020140010000007502014002000000750101400300000075020174400400000041"
+
+  - name: route_ans
+    type: decision
+    params:
+      # idp.uproc's `to_token_answer`: OK → 200 + token; unavailable / no
+      # clock / no key / mint-failed → 503; every presenter refusal → 400;
+      # an unrecognised verdict → 503. First-hit, so the 5xx reasons are
+      # named before the presenter range collapses to 400.
+      decision: "060500000012000100020300000010000000000000000020000c000000330001000201000000400100000001000202000000400200000010c8000000000000004003000000010002040000004004000000410500000012000100020300000010070000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410500000012000100020300000010080000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410500000012000100020300000010090000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410500000012000100020300000010140000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f701000000000000400300000012000040040000004105000000120001000203000000100a0000000000000023000b0000002f0001000201000000400100000001000202000000400200000010900100000000000040030000001200004004000000410b0000002f0001000201000000400100000001000202000000400200000010f7010000000000004003000000120000400400000041"
+  - name: enc_http
+    type: pipeline
+    params:
+      # pass_ans — the 4-field Answer identity.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # ser: HttpResponse [conn][stream][status][flags=0][ct_len=10][hdr_len=0]
+      # [body_len][content-type "text/plain"][body]. Reused verbatim from the
+      # introspect graph — a status and a body, which is all a token or a
+      # refusal is.
+      encode: "010002010000006202010100020200000062020101000203000000620201600100006001000a60020000000100020400000064620201600a00746578742f706c61696e01000204000000616a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  # The serving pipeline.
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+    buffer_bytes: 8192
+  - from: dec_http.result_out
+    to: route_grant.record_in
+    buffer_bytes: 8192
+  - from: route_grant.result_out
+    to: enc_grant.record_in
+    buffer_bytes: 8192
+  - from: enc_grant.result_out
+    to: mint_admission.admit_requests
+    buffer_bytes: 8192
+  - from: mint_admission.admit_replies
+    to: dec_grant.record_in
+    buffer_bytes: 8192
+  - from: dec_grant.result_out
+    to: route_ans.record_in
+    buffer_bytes: 8192
+  - from: route_ans.result_out
+    to: enc_http.record_in
+    buffer_bytes: 8192
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 2
+    buffer_bytes: 8192
+
+  # Websocket key/record chain.
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 3
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 4
+  - from: ws.rx_out
+    to: mux.transport_rx
+  - from: mux.transport_tx
+    to: ws.tx_in
+
+  # ch0: the mint's signing key in, its announced public half back.
+  - from: mux.ch0_rx
+    to: token_mint.key_material
+  - from: token_mint.key_announce
+    to: mux.ch0
+  # ch1: the device-certificate verify key.
+  - from: mux.ch1_rx
+    to: mint_admission.verify_key
+  # ch2: the operator seeds a device record; the ack returns here.
+  - from: mux.ch2_rx
+    to: security_state.requests
+  - from: security_state.replies
+    to: mux.ch2
+
+  # Admission ↔ ledger, and ↔ mint (internal; the token never leaves kagi via
+  # the pipeline, and the subject never enters it).
+  - from: mint_admission.state_requests
+    to: security_state.requests
+  - from: security_state.replies
+    to: mint_admission.state_replies
+  - from: mint_admission.mint_out
+    to: token_mint.mint_requests
+  - from: token_mint.tokens
+    to: mint_admission.mint_in

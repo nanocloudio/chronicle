@@ -47,7 +47,11 @@ default  = true
 name         = "args"
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = 16384
+# 2 x UPROC_BUF: the document travels as one hex argument, and an argv
+# record that exceeds the CHANNEL is never delivered at all — the applet
+# waits for argv that cannot arrive (cli_in now bounds the retry and logs,
+# but the fix is a channel the record fits).
+buffer_size  = 33024
 
 # stdout → cli_out.bytes_in.
 [[ports]]

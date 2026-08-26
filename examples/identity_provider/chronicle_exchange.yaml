@@ -1,0 +1,219 @@
+# The identity provider: POST /oauth/token (the OIDC authorization-code
+# EXCHANGE), chronicle over kagi.
+#
+# The third leg of the reference IdP, after introspect (chronicle_idp.yaml) and
+# the device-grant token (chronicle_token.yaml). This routes to kagi's
+# `authcode` module, which redeems a single-use authorization code + its PKCE
+# verifier for an access token and an ID token — both minted INSIDE kagi over
+# the subject the code carries. The pipeline splits the request body into the
+# four fields authcode needs and transports them opaquely; it constructs no
+# code, no token, no subject.
+#
+#   client ─HTTP→ http (wave)
+#            │ req_out (HttpRequest)  — body is
+#            │                          <code>\n<redirect_uri>\n<client_id>\n<verifier>
+#            ↓
+#          dec_http      pipeline   rd bytecode: envelope → ExchangeRequest
+#            ↓                       (splits the body on '\n' into 4 fields)
+#          route_exchange decision  idp.uproc's `to_exchange`
+#            ↓
+#          enc_exchange  pipeline   ser bytecode: ExchangeCall → CODE_EXCHANGE_REQ
+#            ↓
+#          authcode (kagi)          re-checks the code, consumes it once, mints
+#            ↓                      access + id tokens — the subject never leaves
+#            ↓                      kagi via the pipeline
+#          dec_exchange  pipeline   rd bytecode: CODE_EXCHANGE_RESP → ExchangeReply
+#            ↓
+#          route_ans     decision   idp.uproc's `to_exchange_answer`
+#            ↓
+#          enc_http      pipeline   ser bytecode: Answer → HttpResponse
+#            ↓ resp_in
+#          http ─HTTP→ client
+#
+# TWO DECISION NODES, ONE PER JUNCTION, and the second matches KAGI'S authz
+# verdict — the pipeline cannot mint what authcode refused. That is C14 for the
+# code exchange.
+#
+# The authorization code is created by /authorize in a real flow; to exercise
+# the exchange leg in isolation the operator SEEDS a code record into the
+# ledger over the websocket (exactly as the token graph seeds a device). That
+# is operator state, not pipeline construction — the C14 line is about what the
+# PIPELINE builds, and it builds nothing.
+#
+# Run it with ./run.sh --exchange. See README.md.
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: ${IDP_PORT:-15100}
+    host_tcp: 1
+    max_body_kib: 64
+    routes:
+      - path: "/ws"
+        websocket_fanout: true
+        retain_replay: false
+      # The token endpoint. The body is
+      # <code>\n<redirect_uri>\n<client_id>\n<code_verifier> — four single-line
+      # values a codec splits without parsing. Exact route.
+      - path: "/oauth/token"
+        app: true
+
+  # ── the request half ─────────────────────────────────────────────────────
+  - name: dec_http
+    type: pipeline
+    params:
+      # pass_exreq — the 8-field ExchangeRequest identity.
+      ir_stages: "01ff610005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000005000106000000120600000005000107000000120700000005000108000000120800000013"
+      # rd: [conn u16][stream u16][method u8]; skip flags; path_len+hdr_len,
+      # skip body_len, TAKEN → head; then UNTIL '\n' ×3 (code, redirect_uri,
+      # client_id) and REST → code_verifier.
+      decode: "75020140010000007502014002000000750101400300000070010075020175020150700200744008000000720a4004000000720a4005000000720a400600000078400700000041"
+
+  - name: route_exchange
+    type: decision
+    params:
+      # idp.uproc's `to_exchange`: POST /oauth/token → ExchangeCall{code,
+      # redirect_uri, client_id, code_verifier}; anything else → empty code,
+      # which kagi refuses.
+      decision: "010c0000002c00010002030000001003000000000000002001000208000000120c002f6f617574682f746f6b656e5303003000130000004900010002010000004001000000010002020000004002000000010002040000004003000000010002050000004004000000010002060000004005000000010002070000004006000000410f0000003900010002010000004001000000010002020000004002000000120000400300000012000040040000001200004005000000120000400600000041"
+
+  - name: enc_exchange
+    type: pipeline
+    params:
+      # pass_excall — the 6-field ExchangeCall identity.
+      ir_stages: "01ff490005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000005000106000000120600000013"
+      # ser: CODE_EXCHANGE_REQ (0x3B) [corr=conn|stream][code f16]
+      # [redirect_uri f16][client_id f8][code_verifier f16].
+      encode: "6001003b65010002010000006202010100020200000062020101000203000000646202010100020300000061010002040000006462020101000204000000610100020500000064620101010002050000006101000206000000646202010100020600000061670201006a"
+
+  # ── kagi: redeem the code and mint ────────────────────────────────────────
+  #
+  # authcode holds the device-cert keyset (verify_key), the client registry,
+  # the single-use code store and the device ledger (all in security_state),
+  # and drives token_mint for BOTH the access token and the ID token. iss/aud/
+  # ttl/id_ttl/suite are deployment params — a client asks for none.
+  - name: authcode
+    iss: "https://issuer.authcode.test"
+    aud: "https://rs.authcode.test"
+    ttl_seconds: 600
+    id_ttl_seconds: 300
+    suite: 2   # Ed25519
+
+  - name: token_mint
+
+  - name: security_state
+
+  - name: ws
+    type: ws_stream
+  - name: mux
+    type: remote_channel
+
+  # ── the reply half ────────────────────────────────────────────────────────
+  - name: dec_exchange
+    type: pipeline
+    params:
+      # pass_exreply — the 5-field ExchangeReply identity.
+      ir_stages: "01ff3d0005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000013"
+      # rd: skip the 3-byte envelope; [conn u16][stream u16][status u8]
+      # [access_token f16][id_token f16].
+      decode: "70030075020140010000007502014002000000750101400300000075020174400400000075020174400500000041"
+
+  - name: route_ans
+    type: decision
+    params:
+      # idp.uproc's `to_exchange_answer`: OK → 200 + access token; state
+      # unavailable / no key / mint-failed and any unrecognised verdict → 503;
+      # every presenter refusal → 400. First-hit; the 400 codes are named and
+      # the 5xx reasons fall to the default 503 (the safe direction).
+      decision: "040500000012000100020300000010000000000000000020000c000000330001000201000000400100000001000202000000400200000010c8000000000000004003000000010002040000004004000000410500000012000100020300000010080000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f701000000000000400300000012000040040000004105000000120001000203000000100a0000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410500000012000100020300000010140000000000000020000b0000002f0001000201000000400100000001000202000000400200000010f70100000000000040030000001200004004000000410b0000002f000100020100000040010000000100020200000040020000001090010000000000004003000000120000400400000041"
+
+  - name: enc_http
+    type: pipeline
+    params:
+      # pass_ans — the 4-field Answer identity.
+      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
+      # ser: HttpResponse [conn][stream][status][flags=0][ct_len=10][hdr_len=0]
+      # [body_len][content-type "text/plain"][body]. Reused verbatim from the
+      # introspect and token graphs.
+      encode: "010002010000006202010100020200000062020101000203000000620201600100006001000a60020000000100020400000064620201600a00746578742f706c61696e01000204000000616a"
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+
+  # The serving pipeline.
+  - from: http.req_out
+    to: dec_http.record_in
+    buffer_group: 1
+    buffer_bytes: 8192
+  - from: dec_http.result_out
+    to: route_exchange.record_in
+    buffer_bytes: 8192
+  - from: route_exchange.result_out
+    to: enc_exchange.record_in
+    buffer_bytes: 8192
+  - from: enc_exchange.result_out
+    to: authcode.requests
+    buffer_bytes: 8192
+  - from: authcode.replies
+    to: dec_exchange.record_in
+    buffer_bytes: 8192
+  - from: dec_exchange.result_out
+    to: route_ans.record_in
+    buffer_bytes: 8192
+  - from: route_ans.result_out
+    to: enc_http.record_in
+    buffer_bytes: 8192
+  - from: enc_http.result_out
+    to: http.resp_in
+    buffer_group: 2
+    buffer_bytes: 8192
+
+  # Websocket key/record chain.
+  - from: ws.tx_out
+    to: http.ws_in
+    buffer_group: 3
+  - from: http.ws_out
+    to: ws.rx_in
+    buffer_group: 4
+  - from: ws.rx_out
+    to: mux.transport_rx
+  - from: mux.transport_tx
+    to: ws.tx_in
+
+  # ch0: the mint's signing keys in, its announced public halves back. Two
+  # keys ride this channel — the ACCESS_TOKEN profile and the ID_TOKEN profile.
+  - from: mux.ch0_rx
+    to: token_mint.key_material
+  - from: token_mint.key_announce
+    to: mux.ch0
+  # ch1: the device-certificate verify key (authcode's keyset must be non-empty
+  # to serve, even though the exchange leg authenticates via the code + PKCE).
+  - from: mux.ch1_rx
+    to: authcode.verify_key
+  # ch2: the operator seeds the client registry, a device record and a code
+  # record; the acks return here.
+  - from: mux.ch2_rx
+    to: security_state.requests
+  - from: security_state.replies
+    to: mux.ch2
+
+  # authcode ↔ ledger, and ↔ mint (internal; the tokens never leave kagi via
+  # the pipeline, and the subject never enters it).
+  - from: authcode.state_requests
+    to: security_state.requests
+  - from: security_state.replies
+    to: authcode.state_replies
+  - from: authcode.mint_out
+    to: token_mint.mint_requests
+  - from: token_mint.tokens
+    to: authcode.mint_in

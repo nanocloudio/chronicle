@@ -53,8 +53,12 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    in_buf: [u8; 1024],
-    out_buf: [u8; 1024],
+    // 4096, matching `pipeline`'s `REC_BUF`. The two engines sit on the same
+    // channels carrying the same records, so a `decision` that could hold
+    // less than the `pipeline` feeding it would drop exactly the records the
+    // pipeline had just gone to the trouble of carrying.
+    in_buf: [u8; 4096],
+    out_buf: [u8; 4096],
     hex: [u8; HEX_BUF],
     hex_len: u16,
     cont: [u8; CONT_BUF],
