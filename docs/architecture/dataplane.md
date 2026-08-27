@@ -21,10 +21,9 @@ sibling projects and composed as graph nodes (see
 
 The shared execution cores (`vm_core.rs`, `pipeline_core.rs`, `agg_core.rs`,
 `ser_core.rs`, `deser_core.rs`, `version_core.rs`, `celc_core.rs`, …) live in
-`modules/common/` and are `include!`d verbatim by the `.fmod` modules, by each
-module's own test harness (`fluxor test`), and by the host differentials — so a
-test and the device run identical code
-(see [model.md](model.md#host-and-device-two-implementations-one-semantics)).
+`modules/common/` and are `include!`d verbatim by the `.fmod` modules and by the
+host test harness (`fluxor test`) — so a test and the device run identical code
+(see [model.md](model.md#one-implementation-one-oracle)).
 
 ## The typed record frame
 
@@ -60,8 +59,9 @@ input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶
   program that renders the final record as wire bytes (e.g. a Redis `SET`).
 
 The stage table is a param container — `[nstages:u8]{[cost:u32][len:u16][code]}` —
-not baked, so one pipeline binary runs any pipeline. A legacy single-`stages` param
-is treated as a one-version table for backward compatibility.
+not baked, so one pipeline binary runs any pipeline. An `ir_stages` param lowers
+at load into a single default-version table; a `versions` param supplies a
+ready-made multi-version table.
 
 ## The aggregation module
 
@@ -100,19 +100,35 @@ each artefact's bytecode; `pack_core` serializes the containers;
 new param — no module rebuild — and, for pipelines, can be done on a running
 instance (see [versioning.md](versioning.md)).
 
+## Record lifecycle and accounting
+
+The steady-state modules share one framed-admission and pending-delivery
+discipline (`io_core.rs`): a whole typed frame is admitted non-destructively via
+peek, at most one record is in flight per step, and a blocked output is retained
+and re-driven — never dropped. Each module's step logic is a safe, host-testable
+core (`expression_step_core.rs`, `decision_step_core.rs`); the `.fmod`
+`module_step` is a thin ABI adapter over it.
+
+Every observed record is classified into exactly one disposition by a common
+accounting taxonomy (`accounting_core.rs`) whose invariants —
+`observed = admitted + rejected`, `admitted = succeeded + dropped + failed +
+in_flight` — hold by construction. The 14 baseline instruments plus each
+module's own (an operating-mode gauge, failure-reason splits, work units) are
+published over fluxor telemetry; every bound that shapes what a module admits is
+recorded in the [limit register](limit_register.md), and the per-module port and
+instrument surface in the [resource summary](resource_summary.md).
+
 ## Safety
 
 The modules are `no_std` and must never panic on malformed input — a panic crashes
 the `.fmod`. Every core uses checked slice access, `checked_*`/`wrapping_*`
 arithmetic, and hand-rolled loops that avoid the formatted-panic paths a
 freestanding module cannot link. This is proven by deterministic-fuzz property
-tests (`modules/app/aggregation/tests/robustness.rs`) that hammer every VM with random
-bytecode and inputs. The modules make heavy use of raw-slice borrow detaching in
-`module_step`; the disjointness that keeps it sound is a manual invariant, and the
-`module_step` function is a decomposition candidate as it has grown.
+tests (`tests/harness/tests/aggregation_suites/robustness.rs`) that hammer every
+VM with random bytecode and inputs.
 
 ## Related Documentation
 
-- [model.md](model.md) — the artefact model and the host/device split
+- [model.md](model.md) — the artefact model and the shared cores
 - [connectors.md](connectors.md) — encode/decode byte VMs and the transport
 - [versioning.md](versioning.md) — multi-version pipelines and hot reload

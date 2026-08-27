@@ -39,7 +39,8 @@ later `SET_DEFAULT` back is a rollback.
 
 ## Release manifests
 
-The control-plane unit is a `ReleaseManifest` (`chronicle-canonical::release`): the
+The control-plane unit is a release manifest
+([`release_core.rs`](../../modules/common/release_core.rs)`::ManifestRef`): the
 set of versions and which tag is the default. It:
 
 - validates representability (`validate()` — bounded count, tag/program lengths, a

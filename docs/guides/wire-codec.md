@@ -20,19 +20,12 @@ modules owned by the domain project (wave for HTTP/WS/RTP/SIP/SMTP, quantum for
 MQTT/Kafka/AMQP/NATS, lattice for the databases, loam for S3). Chronicle composes
 those as graph nodes.
 
-Historical note: an earlier design *did* try to be a connector — protocols
-assembled purely from these opcodes, with a text front end
-(`chronicle_canonical::wire`) and `.uproc` `connector { … }` blocks compiling
-templates into them. That path was retired: a reply-code-driven, multi-round-trip
-session is not a stateless codec. The front end and the connector blocks are gone;
-the VMs remain, because message framing at a pipeline edge is genuinely in scope.
-
-## Authoring a program today
+## Authoring a program
 
 There is no template language. `encode` / `decode` programs are assembled from
 the opcode constants below and hex-encoded into the param — see
-[`modules/app/pipeline/tests/ser.rs`](../../modules/app/pipeline/tests/ser.rs)
-and [`deser.rs`](../../modules/app/pipeline/tests/deser.rs) for worked
+[`tests/harness/tests/pipeline_suites/ser.rs`](../../tests/harness/tests/pipeline_suites/ser.rs)
+and [`deser.rs`](../../tests/harness/tests/pipeline_suites/deser.rs) for worked
 programs, and `examples/mqtt_sink/linux.yaml` for one in service: it renders the
 `[topic_len:u8][topic]<id>=<amount>` publish frame that quantum's `mqtt_client`
 takes on `app_in`.
@@ -82,7 +75,7 @@ A program is terminated by `op::FINISH_MSG`.
 
 Both VMs are bounded and never-panic: malformed input returns a structured error,
 proven by the deterministic fuzzing in
-[`robustness.rs`](../../modules/app/aggregation/tests/robustness.rs).
+[`robustness.rs`](../../tests/harness/tests/aggregation_suites/robustness.rs).
 
 ## Related documentation
 

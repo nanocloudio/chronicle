@@ -31,8 +31,7 @@ Out of scope, permanently:
 - **Protocol logic.** Protocols are stateful, multi-round-trip, and
   reply-dependent (SCRAM's client proof, MySQL's scramble response, Kafka's
   membership handshake). They live in compiled per-protocol `.fmod` modules owned
-  by the domain project. Chronicle retired its entire bytecode-codec connector
-  path for this reason; do not rebuild it.
+  by the domain project; do not build protocol codecs in the VM.
 - **Aggregation.** A declarative monoid spec run by a native engine, not
   per-record bytecode.
 - **I/O of any kind.** The VM sees a record and produces a record.
@@ -144,12 +143,14 @@ against, so correctness rests on:
 
 - **Type-checking at compile time.** "It compiled" is the type proof; the device
   does not re-check types, it re-derives cost.
-- **Never-panic fuzzing.** `modules/app/aggregation/tests/robustness.rs` drives
+- **Never-panic fuzzing.** `tests/harness/tests/aggregation_suites/robustness.rs` drives
   every evaluator with deterministic pseudo-random programs and inputs. Malformed
   input must return a `Result`, never panic — a panic inside a `.fmod` takes the
   module down.
-- **Golden conformance vectors.** `modules/app/pipeline/tests/registry.rs`
-  pins source → bytecode → output. These are the semantic oracle: any change to
+- **Golden conformance vectors.** The corpus suites
+  (`tests/harness/tests/pipeline_suites/corpus.rs`,
+  `tests/harness/tests/chronicle_cli_suites/corpus.rs`) pin source → bytecode →
+  output against checked-in recorded answers. These are the semantic oracle: any change to
   the compiler or the VM that alters an existing vector's output is a breaking
   change to the meaning of already-deployed programs, and must be treated as one.
 

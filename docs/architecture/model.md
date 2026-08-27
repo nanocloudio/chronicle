@@ -29,10 +29,9 @@ Three foundations are load-bearing:
 | 7 | Module | immutable OCI deployment / compatibility unit | `module.proto` |
 
 Two further protos — `common.proto` and `resource.proto` — are support types, not
-artefacts. The Protobuf package is `unified.v1`: that is the **spec** type
-namespace (the model unifies orchestration, deterministic state, and runtime distribution), distinct from the
-`chronicle-*` crate names, which are the implementation. The split is deliberate —
-`chronicle` is the engine, `unified.v1` is the spec vocabulary.
+artefacts. The Protobuf package is `unified.v1`: the type namespace of the model
+(which unifies orchestration, deterministic state, and runtime distribution),
+distinct from `chronicle`, the engine that implements it.
 
 ## The build-time / runtime split
 
@@ -66,38 +65,27 @@ bytecode on every instance in a fleet. The one map field that appears inside a
 digested artefact (an Aggregation watermark override table) is encoded as a
 `BTreeMap`, so insertion order cannot perturb the digest.
 
-## Host and device: two implementations, one semantics
+## One implementation, one oracle
 
 This is the most important structural fact to understand about the codebase.
 
-The **on-device runtime** lives in `modules/common/*_core.rs`, which are
-`no_std`, no-alloc, and — critically — **`include!`d verbatim by the `.fmod`
-modules, by their test harnesses, and by the host differentials**. For the evaluator, the staged pipeline, the byte
-codecs, the aggregation kernel, and the version table, host and device run *the
-same source*. This is the "one source of truth" the core headers refer to, and it
-is genuinely one implementation.
+The **runtime** lives in `modules/common/*_core.rs`: `no_std`, no-alloc sources
+that are **`include!`d verbatim by the `.fmod` modules and by the host test
+harness**. For the evaluator, the staged pipeline, the byte codecs, the
+aggregation kernel, the version table, and every other core, host tests and the
+device run *the same source*. There is exactly one implementation, and it is the
+one that runs in production.
 
-The duplication this section used to describe is **gone**. There were once
-separate `chronicle-pipeline` and `chronicle-aggregation` crates carrying richer
-`std` re-implementations of the same semantics, and pane assignment and watermark
-maths were genuinely maintained in two places — a change to lateness rounding had
-to land in both copies or determinism diverged silently.
+Correctness rests on **golden corpora** rather than a second implementation:
+recorded answers, checked in beside the harness suites that read them
+(`tests/harness/tests/*/corpus.rs` and their `resources/`). A compiler or VM
+change that alters a corpus answer is a breaking change to deployed programs and
+is treated as one.
 
-Those crates were absorbed, and the device kernel is now the only implementation.
-The variable-size Distinct / TopK / Quantile operators the host once owned alone
-are on device too, as bounded sorted cells drawn from a fixed pool. There is one
-copy of the pane maths, and it is the copy that runs in production.
-
-There is no crates directory at all. The oracles were retired into golden
-corpora — recorded answers, checked in beside the harness that reads each one —
-and the crate that produced them was deleted with them. `tools/ci/shipping-surface.sh`
+There is no cargo crate anywhere in the project. `tools/ci/shipping-surface.sh`
 asserts that as a checked property rather than a convention: it fails CI if a
-cargo manifest reappears, if a module includes from one, or if anything but
-shipping sources lands in `modules/common/`.
-
-That inverts the old risk. Instead of two implementations that must be kept in
-step by discipline, there is one implementation and one oracle, and the tests
-that compare them are the point of the oracle existing.
+cargo manifest appears, if a module includes host code from one, or if anything
+but shipping sources lands in `modules/common/`.
 
 ## Related Documentation
 

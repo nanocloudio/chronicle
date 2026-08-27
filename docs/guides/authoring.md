@@ -1,22 +1,22 @@
 # The `.uproc` authoring DSL
 
-The spec's Phase 0 calls for a non-normative *authoring syntax* that "compiles to
-canonical Protobuf". `chronicle-canonical`'s authoring path is that surface: a single human-authored
-`.uproc` document describes a processing **module** — its type environment plus
-the logic and orchestration artefacts — and compiles **deterministically** to the
-sealed canonical artefacts + a `Module`.
+A single human-authored `.uproc` document describes a processing **module** — its
+type environment plus the logic and orchestration artefacts — and compiles
+**deterministically** to the sealed canonical artefacts + a `Module`.
 
-It is a thin front end, by design. The document parser recognizes only the
+It is a thin front end, by design. The document parser
+([`uproc_core.rs`](../../modules/common/uproc_core.rs)) recognizes only the
 *structure*; every expression body is captured as a verbatim source span and
-handed unchanged to `chronicle-canonical::cel`. The DSL therefore inherits the exact
-CEL-subset grammar, type-checker, lowerer, and content-digest identity of the
-Rust builder API — a module authored in text seals to the **same digests** as the
-equivalent hand-built artefacts. This is proven by `dsl_matches_the_rust_builder_api`.
+handed unchanged to the CEL compiler
+([`celc_core.rs`](../../modules/common/celc_core.rs)). The DSL therefore inherits
+the exact CEL-subset grammar, type-checker, lowerer, and content-digest identity
+of the engine — a module authored in text seals to digests pinned by the golden
+corpus (`module_identity_matches_the_prost_corpus`).
 
 ## Example
 
 See [`examples/authoring/process_order.uproc`](../../examples/authoring/process_order.uproc)
-— the spec's `commerce.process_order`, authored end-to-end.
+— `commerce.process_order`, authored end to end.
 
 ```
 module commerce.process_order {
@@ -68,7 +68,7 @@ stage         := 'call' IDENT '=' QNAME '(' [IDENT (',' IDENT)*] ')' ';'
 entry         := 'entry' IDENT '=' IDENT ';'
 provenance    := 'provenance' 'revision' STRING 'toolchain' STRING ';'
 type          := 'int'|'uint'|'double'|'bool'|'string'|'bytes' | QNAME
-EXPR          := <the CEL subset of chronicle-canonical::cel, captured verbatim>
+EXPR          := <the CEL subset of celc_core, captured verbatim>
 ```
 
 `//` line comments are allowed anywhere. Rule priorities are assigned by
@@ -77,16 +77,18 @@ declaration order (earlier binds tighter), matching the `first` hit policy.
 ## Guarantees
 
 - **Deterministic identity** — identical source ⇒ identical module + artefact
-  digests (`compilation_is_deterministic`).
-- **Fidelity** — DSL-produced artefacts are byte-identical to the Rust builder
-  API for the same logic (`dsl_matches_the_rust_builder_api`).
+  digests (`sealing_is_deterministic`, `module_identity_matches_the_prost_corpus`).
+- **Fidelity** — parsing and sealing are pinned against the golden corpus, so a
+  parser or compiler change that alters a document's artefacts is a visible,
+  breaking change (`document_parsing_matches_the_corpus`, `rejection_matches_the_corpus`).
 - **Structured errors** — parse errors carry a 1-based line/column; reference and
-  type errors are typed `AuthoringError` values, never panics.
+  type errors are typed `UprocError` values, never panics.
 
 ## Aggregation
 
 The Aggregation artefact (deterministic event-time state) is authored via an
-`aggregation { … }` block that lowers to `chronicle-canonical::aggregation::build_aggregation`.
+`aggregation { … }` block that lowers to a sealed Aggregation artefact
+(`artefact_core.rs::seal_aggregation`).
 See [`examples/authoring/customer_totals.uproc`](../../examples/authoring/customer_totals.uproc).
 
 ```
@@ -120,10 +122,9 @@ into one — are [wire-codec templates](wire-codec.md) compiled to `ser` / `rd`
 bytecode and supplied as a generic `pipeline` module's `encode` / `decode`
 params.
 
-They are **not** authored with a `connector { … }` block. This guide previously
-documented one; no such block exists in either parser, so writing it produces a
-parse error. Wire edges are pipeline params rather than sealed canonical
-artefacts, which is also why they never appear in a Module's artefact refs.
+There is no `connector { … }` block in the DSL — writing one is a parse error.
+Wire edges are pipeline params rather than sealed canonical artefacts, which is
+also why they never appear in a Module's artefact refs.
 
 Protocol I/O itself is not a Chronicle concern at all: a connector is a
 sibling-owned provider module composed as a graph node and resolved from the

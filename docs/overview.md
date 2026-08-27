@@ -21,7 +21,7 @@ distribution/activation — into one engine.
 
 ## Start Here
 
-- [architecture/model.md](architecture/model.md) — the model, the seven artefacts, the build-time/runtime split, content-digest identity, and how host and device relate
+- [architecture/model.md](architecture/model.md) — the model, the seven artefacts, the build-time/runtime split, content-digest identity, and the one-implementation rule
 - [architecture/dataplane.md](architecture/dataplane.md) — the on-device runtime: the generic modules, the record frame, param-driven pipelines, aggregation
 - [guides/authoring.md](guides/authoring.md) — write a `.uproc` module and run it on device
 
@@ -29,10 +29,13 @@ distribution/activation — into one engine.
 
 The authoritative references for how the engine works.
 
-- [architecture/model.md](architecture/model.md) — Unified Deterministic Processing: artefacts, identity, the build-time/runtime split, host-vs-device implementations
+- [architecture/model.md](architecture/model.md) — Unified Deterministic Processing: artefacts, identity, the build-time/runtime split, the one shared implementation
 - [architecture/dataplane.md](architecture/dataplane.md) — generic `.fmod` modules, the typed record frame, staged pipelines, the aggregation engine, param-driven execution
 - [architecture/connectors.md](architecture/connectors.md) — how effects bind to sibling-owned provider modules, the port vocabulary, and why protocols are not bytecode
 - [architecture/versioning.md](architecture/versioning.md) — multiple versions per module, `X-Module-Version` selection, hot reload, release manifests, fleet propagation
+- [architecture/limit_register.md](architecture/limit_register.md) — every capacity bound, its failure mode, and the CI gate that proves the register matches the code
+- [architecture/resource_summary.md](architecture/resource_summary.md) — generated per-module port and instrument summary for compose-time admission
+- [bytecode_policy.md](bytecode_policy.md) — what the VM is for, the no-control-flow fence, and the pinned CEL builtin surface
 
 ## Guides
 
