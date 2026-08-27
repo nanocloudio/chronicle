@@ -3,7 +3,7 @@
 // `include!`d verbatim by both this crate and the on-device modules — one source
 // of truth, host and device.
 //
-// The checked IR (see chronicle-canonical::cel) is the type-free, fully
+// The checked IR (see the CEL compiler (celc_core)) is the type-free, fully
 // name-resolved form of an expression: all schema access already happened, so
 // turning it into bytecode needs no type environment. This file is the piece
 // that does that turning, and it is designed to run *at load on the target*: a

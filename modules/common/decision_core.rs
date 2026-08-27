@@ -125,6 +125,65 @@ pub fn run_decision_scratch<'a>(
     Ok(Fired::Default)
 }
 
+/// [`run_decision_scratch`] that also reports the VM instructions spent across
+/// every predicate evaluated and the constructed outcome (work units).
+/// `spent` accumulates whether the policy matches a rule or falls to the default.
+pub fn run_decision_scratch_metered<'a>(
+    container: &'a [u8],
+    params: &'a [Message<'a>],
+    builder: &mut Builder<'a>,
+    scratch: &mut Scratch<'_>,
+    spent: &mut u64,
+) -> Result<Fired, DecisionError> {
+    *spent = 0;
+    let nrules = *container.first().ok_or(DecisionError::Truncated)? as usize;
+    let mut off = 1usize;
+    let mut i = 0usize;
+    while i < nrules {
+        let (when_cost, when_code) = dec_read_prog(container, &mut off)?;
+        let (out_cost, out_code) = dec_read_prog(container, &mut off)?;
+        let mut w = 0u64;
+        let matched = match eval_scratch_metered(when_code, params, scratch, when_cost, &mut w)
+            .map_err(DecisionError::Eval)?
+        {
+            Value::Bool(b) => b,
+            _ => {
+                *spent += w;
+                return Err(DecisionError::NotBool);
+            }
+        };
+        *spent += w;
+        if matched {
+            construct_metered(out_code, params, builder, scratch, out_cost, spent)?;
+            return Ok(Fired::Rule(i as u8));
+        }
+        i += 1;
+    }
+    let (def_cost, def_code) = dec_read_prog(container, &mut off)?;
+    construct_metered(def_code, params, builder, scratch, def_cost, spent)?;
+    Ok(Fired::Default)
+}
+
+/// [`construct`] that adds the outcome program's VM instructions to `spent`.
+fn construct_metered<'a>(
+    code: &'a [u8],
+    params: &'a [Message<'a>],
+    builder: &mut Builder<'a>,
+    scratch: &mut Scratch<'_>,
+    max_cost: u64,
+    spent: &mut u64,
+) -> Result<(), DecisionError> {
+    builder.len = 0;
+    let mut w = 0u64;
+    let r = eval_full_scratch_metered(code, params, builder, scratch, max_cost, &mut w)
+        .map_err(DecisionError::Eval);
+    *spent += w;
+    match r? {
+        EvalResult::Constructed => Ok(()),
+        EvalResult::Scalar(_) => Err(DecisionError::BadArity),
+    }
+}
+
 /// Evaluate a message-constructing program into `builder`, resetting it first.
 fn construct<'a>(
     code: &'a [u8],

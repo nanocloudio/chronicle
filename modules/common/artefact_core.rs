@@ -3,7 +3,7 @@
 // An artefact's identity is the sha256 of its canonical protobuf encoding. This
 // encodes artefacts directly with `pb_core`, so the same source runs in the
 // authoring crate and inside a `.fmod` — there is no second encoder to drift
-// against, only one that `chronicle-canonical/tests/pb_differential.rs` pins to
+// against, only one that `tests/harness/tests/chronicle_cli.rs (corpus suite)` pins to
 // prost.
 //
 // FIELD ORDER IS SIGNIFICANT. prost writes fields in ascending tag order and

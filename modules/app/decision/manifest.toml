@@ -22,6 +22,8 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Output: the selected outcome as a typed record frame — the first rule whose
 # `when` predicate holds constructs its outcome, else the default outcome.
@@ -29,9 +31,19 @@ content_type = "OctetStream"
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 [observability]
-# Counters live in module state (the token_verify convention); `faulted`
-# is a 0/1 gauge set by a named configuration fault at init/reload.
-metrics = ["fired", "dropped", "errors", "errors_frame", "errors_encode", "faulted"]
-
+# Baseline accounting (ids 0..13, canonical order) front-loaded so index == id,
+# then decision's own instruments: `module_mode`, the init/reload fault flag,
+# the two failure-reason splits that refine `inputs_failed`, and the `Fired` audit
+# — `no_match` count and `last_rule` (0xFFFF = the default).
+metrics = [
+    "bytes_in", "bytes_out",
+    "inputs_observed", "inputs_admitted", "inputs_rejected",
+    "inputs_succeeded", "inputs_policy_dropped", "inputs_failed", "inputs_in_flight",
+    "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
+    "pending_output_bytes",
+    "module_mode", "faulted", "errors_frame", "errors_encode", "no_match", "last_rule", "work_units",
+]

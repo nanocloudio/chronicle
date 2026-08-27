@@ -336,6 +336,10 @@ pub enum AggError {
     BadType,
     /// More operators than `MAX_OPS`.
     TooManyOps,
+    /// A byte/string key longer than `KEY_CAP`. Rejected rather than truncated:
+    /// two distinct keys sharing their first `KEY_CAP` bytes must never alias into
+    /// one lane and combine their aggregates.
+    KeyTooLong,
 }
 
 /// One monoid accumulator cell; interpreted by the operator's kind.
@@ -903,7 +907,13 @@ fn windows_for(spec: &AggSpec, t: i64, out: &mut [i64; MAX_WIN_PER_EVENT]) -> us
     }
     let mut n = 0;
     let mut k = t.checked_div_euclid(step).unwrap_or(0);
-    while k >= 0 {
+    // Bound the walk to MAX_WIN_PER_EVENT iterations: the overlapping windows for a
+    // point are the contiguous top-most `ceil(size/step)` starts, which activation
+    // rejects when it exceeds the cap (see `build_spec`). Capping the loop keeps an
+    // extreme size/step ratio from monopolising the cooperative lane even if a spec
+    // slipped through.
+    let mut iters = 0;
+    while k >= 0 && iters < MAX_WIN_PER_EVENT {
         let w = k.wrapping_mul(step);
         if w <= t && w.wrapping_add(size) > t && n < MAX_WIN_PER_EVENT {
             out[n] = w;
@@ -913,6 +923,7 @@ fn windows_for(spec: &AggSpec, t: i64, out: &mut [i64; MAX_WIN_PER_EVENT]) -> us
             break;
         }
         k -= 1;
+        iters += 1;
     }
     n
 }
@@ -1010,6 +1021,11 @@ pub fn ingest<F: FnMut(&[u8])>(
         Value::Str(s) => (false, 0, s.as_bytes()),
         _ => return Err(AggError::BadType),
     };
+    // Reject an over-long key BEFORE any lane is created or mutated — never
+    // prefix-truncate it into an alias of another key.
+    if !key_is_int && key_bytes.len() > KEY_CAP {
+        return Err(AggError::KeyTooLong);
+    }
     let t = agg_as_int(eval(spec.time_code, &ev, spec.time_cost).map_err(AggError::Eval)?)?;
     if t > state.max_event_time {
         state.max_event_time = t;
@@ -1028,7 +1044,9 @@ pub fn ingest<F: FnMut(&[u8])>(
                 lane.key_is_int = key_is_int;
                 lane.key_int = key_int;
                 if !key_is_int {
-                    let n = key_bytes.len().min(KEY_CAP);
+                    // Length was checked <= KEY_CAP above, so this copies the whole
+                    // key — never a truncating prefix.
+                    let n = key_bytes.len();
                     lane.key[..n].copy_from_slice(&key_bytes[..n]);
                     lane.key_len = n;
                 }

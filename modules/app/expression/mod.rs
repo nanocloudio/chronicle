@@ -7,10 +7,11 @@
 //! this module runs it. Two configs with different `program` values produce
 //! different results from the identical `.fmod` (see examples/expression/*.yaml).
 //!
-//! It loads the SAME bounded evaluator source the host crate `chronicle-bytecode`
-//! uses (via `include!` of core.rs), reads a length-framed record on `in`,
-//! decodes it into fields, runs the param bytecode, and writes the scalar result
-//! bytes to `out`.
+//! It loads the SAME bounded evaluator source the host harness (tests/harness)
+//! uses (via `include!` of `vm_core`), admits a whole typed record frame on `in`
+//! through the shared `io_core` lifecycle, decodes it into fields, runs the param
+//! bytecode, and stages the scalar result bytes to `out` — retained until fully
+//! delivered.
 
 #![no_std]
 #![allow(
@@ -33,22 +34,35 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The bounded evaluator core — identical source to the `chronicle-bytecode` crate.
-#[path = "../../common/vm_core.rs"]
-mod evalcore;
-use evalcore::{builtin_arity, op, scan_code, Field, Message, Value};
+// The shared cores, mounted together in one submodule so vm_core, the canonical
+// typed-frame codec (`pipeline_core`), the record lifecycle (`io_core`), the
+// outcome vocabulary and the syscall `Chan` adapter all see one another — the same
+// `mod`-wrapped `include!` discipline the decision module uses. Expression
+// admits the SAME typed record frame as pipeline/aggregation via `decode_frame`.
+mod expr {
+    use super::abi::SyscallTable;
+    include!("../../common/vm_core.rs");
+    include!("../../common/pipeline_core.rs");
+    include!("../../common/hex_core.rs");
+    include!("../../common/lower_core.rs");
+    include!("../../common/outcome_core.rs");
+    include!("../../common/io_core.rs");
+    include!("../../common/accounting_core.rs");
+    include!("../../common/syschan_core.rs");
+    include!("../../common/expression_step_core.rs");
+}
+use expr::{
+    expr_step, hex_decode, lower_flat, scan_code, Accounting, Mode, Pending, StepResult, SysChan,
+    ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
+};
 
-// Hex codec — identical source to the crate; turns a param's text back into bytes.
-include!("../../common/hex_core.rs");
+// Telemetry emit helpers — crate root, after the SDK runtime, so the `dev_*`
+// telemetry primitives it wraps are in scope.
+include!("../../common/telemetry_core.rs");
 
-// Flat checked-IR lowerer — identical source to the crate. Lets this module accept
-// the higher-level `ir` param (a shipped checked IR) and lower it to bytecode HERE,
-// at load: a successful lowering is the module proving it can run what it was given,
-// rather than trusting opaque bytecode. `lower_flat` resolves `op::*` via the
-// `use evalcore::op` above.
-include!("../../common/lower_core.rs");
-
-const MAX_FIELDS: usize = 8;
+/// Input and output record buffers, sized to the port max_record so a full typed
+/// frame fits and admission is never a partial acceptance.
+const REC_BUF: usize = 4096;
 const HEX_BUF: usize = 1024;
 const CODE_BUF: usize = 512;
 
@@ -57,8 +71,10 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    in_buf: [u8; 512],
-    out_buf: [u8; 256],
+    in_buf: [u8; REC_BUF],
+    out_buf: [u8; REC_BUF],
+    /// One retained output frame, drained before any new input is admitted.
+    pending: Pending,
 
     // Param-driven definition.
     hex: [u8; HEX_BUF],
@@ -72,11 +88,24 @@ struct ModuleState {
     code_len: u16,
     max_cost: u64,
 
-    evaluated: u32,
-    errors: u32,
+    /// The common accounting taxonomy — every observed record classified into
+    /// exactly one input and output disposition, invariants maintained by the core:
+    /// `inputs_succeeded` is a delivered result, `inputs_failed` a terminal
+    /// processing failure, and `inputs_rejected` a boundary refused at admission.
+    acct: Accounting,
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
+    /// Set when a string param exceeded its buffer during parsing. A truncated hex
+    /// program could decode to a DIFFERENT valid program, so an overflow faults the
+    /// candidate rather than running silently-altered bytecode.
+    param_overflow: bool,
+    /// Current operating mode (`outcome_core::Mode` as u8), published as the
+    /// `module_mode` gauge so an operator can tell ready / output-blocked / faulted
+    /// / awaiting-config apart from telemetry alone.
+    mode: u8,
+    /// Wall-clock ms of the last telemetry publish (throttle state).
+    tlm_last_ms: u64,
 }
 
 // Module params: the hex bytecode `program` (str, chunk-appended) and its static
@@ -91,6 +120,7 @@ define_params! {
             s.hex_len += 1;
             i += 1;
         }
+        if i < len { s.param_overflow = true; }
     };
 
     2, max_cost, u32, 8 => |s, d, len| {
@@ -113,6 +143,7 @@ define_params! {
             s.hex_len += 1;
             i += 1;
         }
+        if i < len { s.param_overflow = true; }
     };
 }
 
@@ -156,15 +187,20 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_chan = in_chan;
         s.out_chan = out_chan;
-        s.in_buf = [0u8; 512];
-        s.out_buf = [0u8; 256];
+        s.in_buf = [0u8; REC_BUF];
+        s.out_buf = [0u8; REC_BUF];
+        s.pending = Pending { off: 0, len: 0 };
         s.hex_len = 0;
         s.is_ir = false;
         s.code_len = 0;
         s.max_cost = 8;
-        s.evaluated = 0;
-        s.errors = 0;
+        s.acct = Accounting::default();
         s.faulted = 0;
+        s.param_overflow = false;
+        s.mode = Mode::AwaitingConfig.as_u8();
+        // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
+        // uptime, near 0 at startup), not only after one full interval.
+        s.tlm_last_ms = dev_millis(sys).wrapping_sub(TLM_INTERVAL_MS);
 
         // Decode the param-supplied definition into runnable bytecode.
         //
@@ -202,6 +238,11 @@ pub extern "C" fn module_new(
         if s.code_len > 0 && scan_code(&s.code[..s.code_len as usize]).is_err() {
             fault = b"[expr] FAULT: program needs an opcode/builtin not in this build";
         }
+        // A param that overflowed its buffer was truncated — fault rather than run
+        // silently-altered bytecode. Checked last so it always wins.
+        if s.param_overflow {
+            fault = b"[expr] FAULT: a param exceeded its buffer and was truncated";
+        }
         if !fault.is_empty() {
             s.code_len = 0;
             s.faulted = 1;
@@ -224,87 +265,57 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
+        // Publish telemetry (throttled; zero-cost when no consumer is subscribed).
+        // Emitted BEFORE the early returns so a faulted / awaiting-config / idle
+        // module still reports its mode and counters.
+        s.mode = if s.faulted != 0 {
+            Mode::Faulted.as_u8()
+        } else if s.code_len == 0 {
+            Mode::AwaitingConfig.as_u8()
+        } else if !s.pending.is_empty() {
+            Mode::OutputBlocked.as_u8()
+        } else {
+            Mode::Ready.as_u8()
+        };
+        if let Some((midx, t)) = tlm_tick(sys, &mut s.tlm_last_ms) {
+            // ids 0..13: the baseline accounting block (canonical order).
+            acct_emit(sys, midx, t, 0, &s.acct);
+            // id 14: module_mode; id 15: the init/reload configuration-fault flag.
+            tlm_gauge(sys, midx, t, ACCT_METRIC_COUNT as u16, s.mode as u64);
+            tlm_gauge(sys, midx, t, ACCT_METRIC_COUNT as u16 + 1, s.faulted as u64);
+            // id 16: work units — VM instructions this module has executed.
+            tlm_counter(
+                sys,
+                midx,
+                t,
+                ACCT_METRIC_COUNT as u16 + 2,
+                s.acct.work_units,
+            );
+        }
+
         if s.in_chan < 0 || s.code_len == 0 || s.faulted != 0 {
             return 0;
         }
-        let poll = (sys.channel_poll)(s.in_chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            return 0;
-        }
-
-        let n = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr(), s.in_buf.len());
-        if n <= 0 {
-            return 0;
-        }
-        let read = n as usize;
-        let cost = s.max_cost;
+        let inch = SysChan::new(sys, s.in_chan);
+        let outch = SysChan::new(sys, s.out_chan);
         let code_len = s.code_len as usize;
-
-        // Decode fields, evaluate the param bytecode, stage the result bytes.
-        let mut out_len: usize = 0;
-        {
-            let data = &s.in_buf[..read];
-            let mut fields = [Field {
-                number: 0,
-                value: Value::Null,
-            }; MAX_FIELDS];
-            let nfields = decode(data, &mut fields);
-            let params = [Message {
-                fields: &fields[..nfields],
-            }];
-            let code = &s.code[..code_len];
-            // Arena for the writing builtins; result-scoped, copied out below.
-            let mut sbuf = [0u8; 512];
-            let mut scratch = evalcore::Scratch::new(&mut sbuf);
-            match evalcore::eval_scratch(code, &params, &mut scratch, cost) {
-                Ok(v) => match evalcore::resolve_scratch(v, &scratch) {
-                    Value::Bytes(result) => {
-                        let len = result.len().min(s.out_buf.len());
-                        s.out_buf[..len].copy_from_slice(&result[..len]);
-                        out_len = len;
-                    }
-                    _ => s.errors = s.errors.wrapping_add(1),
-                },
-                Err(_) => s.errors = s.errors.wrapping_add(1),
-            }
-        }
-
-        if out_len > 0 && s.out_chan >= 0 {
-            let poll_out = (sys.channel_poll)(s.out_chan, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                (sys.channel_write)(s.out_chan, s.out_buf.as_ptr(), out_len);
-                s.evaluated = s.evaluated.wrapping_add(1);
-            }
-        }
+        let max_cost = s.max_cost;
+        // The whole record lifecycle lives in `expr_step` over the io_core seam; the
+        // shell only adapts the ABI and maps the disposition to counters. `in_buf`,
+        // `out_buf`, `pending` and `code` are disjoint fields, borrowed together.
+        // The step core records every disposition into `acct` at the one point that
+        // knows admit-bytes and drain-vs-fresh; the shell does not re-derive
+        // counts from `StepResult` (which cannot distinguish those).
+        let _ = expr_step(
+            &inch,
+            &outch,
+            &mut s.in_buf,
+            &mut s.out_buf,
+            &mut s.pending,
+            &s.code[..code_len],
+            max_cost,
+            &mut s.acct,
+        );
         0
     }
-}
-
-/// Decode the length-framed record into borrowed byte-string fields.
-/// Framing: `[count:u8]` then `count` × `[field_number:u8][len:u16 LE][bytes]`.
-fn decode<'a>(data: &'a [u8], fields: &mut [Field<'a>; MAX_FIELDS]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    let count = data[0] as usize;
-    let mut off = 1usize;
-    let mut fi = 0usize;
-    while fi < count && fi < MAX_FIELDS {
-        if off + 3 > data.len() {
-            break;
-        }
-        let number = data[off] as u32;
-        let len = u16::from_le_bytes([data[off + 1], data[off + 2]]) as usize;
-        off += 3;
-        if off + len > data.len() {
-            break;
-        }
-        fields[fi] = Field {
-            number,
-            value: Value::Bytes(&data[off..off + len]),
-        };
-        off += len;
-        fi += 1;
-    }
-    fi
 }

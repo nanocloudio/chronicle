@@ -4,7 +4,10 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 
-# Input: a length-framed record (see mod.rs `decode`), one message per read.
+# Input: one typed record frame (the canonical `pipeline_core` frame) per unit,
+# admitted whole via peek — never partially. `max_record` is the largest frame the
+# module admits; `buffer_size` is the ring the producer edge must be granted so an
+# all-or-nothing write of a max_record frame can never permanently wedge.
 # Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
 # surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
 # LEVEL — strings, math, encoders, bindings — so later variants can compose
@@ -21,14 +24,27 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Output: the evaluated scalar result bytes (here, the selected string field).
 [[ports]]
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 [observability]
-# Counters live in module state (the token_verify convention); `faulted`
-# is a 0/1 gauge set by a named configuration fault at init/reload.
-metrics = ["evaluated", "errors", "faulted"]
+# The common accounting taxonomy is front-loaded (ids 0..13, canonical field
+# order in accounting_core.rs) so the array index equals the emit id; the module's
+# own instruments follow. `module_mode` is the closed operating-mode gauge;
+# `faulted` is the 0/1 init/reload configuration-fault flag.
+metrics = [
+    "bytes_in", "bytes_out",
+    "inputs_observed", "inputs_admitted", "inputs_rejected",
+    "inputs_succeeded", "inputs_policy_dropped", "inputs_failed", "inputs_in_flight",
+    "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
+    "pending_output_bytes",
+    "module_mode", "faulted", "work_units",
+]

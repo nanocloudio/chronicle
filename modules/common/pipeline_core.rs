@@ -277,7 +277,13 @@ pub const STAGE_SCRATCH_CAP: usize = 512;
 
 /// Run one stage: decode `src`, evaluate, and serialize the constructed message
 /// into `dst`. Returns the encoded length.
-fn run_stage(stage: &Stage, src: &[u8], dst: &mut [u8]) -> Result<usize, PipeError> {
+/// [`run_stage`] that adds the stage program's VM instructions to `spent`.
+fn run_stage_metered(
+    stage: &Stage,
+    src: &[u8],
+    dst: &mut [u8],
+    spent: &mut u64,
+) -> Result<usize, PipeError> {
     let mut fields = [Field {
         number: 0,
         value: Value::Null,
@@ -289,13 +295,17 @@ fn run_stage(stage: &Stage, src: &[u8], dst: &mut [u8]) -> Result<usize, PipeErr
     let mut builder = Builder::new();
     let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
     let mut scratch = Scratch::new(&mut sbuf);
-    match eval_full_scratch(
+    let mut w = 0u64;
+    let r = eval_full_scratch_metered(
         stage.code,
         &params,
         &mut builder,
         &mut scratch,
         stage.max_cost,
-    ) {
+        &mut w,
+    );
+    *spent += w;
+    match r {
         Ok(EvalResult::Constructed) => encode_frame_scratch(&builder.message(), &scratch, dst),
         Ok(EvalResult::Scalar(_)) => Err(PipeError::NotConstructed),
         Err(e) => Err(PipeError::StageEval(e)),
@@ -338,6 +348,21 @@ pub fn run_stages(
     buf_b: &mut [u8],
     out: &mut [u8],
 ) -> Result<usize, PipeError> {
+    let mut spent = 0u64;
+    run_stages_metered(stages, input, buf_a, buf_b, out, &mut spent)
+}
+
+/// [`run_stages`] that reports the total VM instructions spent across every stage
+/// executed, including re-executed routes (work units).
+pub fn run_stages_metered(
+    stages: &[Stage],
+    input: &[u8],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+    out: &mut [u8],
+    spent: &mut u64,
+) -> Result<usize, PipeError> {
+    *spent = 0;
     if stages.is_empty() {
         if input.len() > out.len() {
             return Err(PipeError::Encode); // don't silently clip a pass-through
@@ -365,11 +390,11 @@ pub fn run_stages(
         // same bytes the FAILED stage read: the failure produced no output, so
         // there is nothing newer to hand it.
         let res = if !started {
-            run_stage(stage, input, buf_a)
+            run_stage_metered(stage, input, buf_a, spent)
         } else if latest_is_a {
-            run_stage(stage, &buf_a[..cur_len], buf_b)
+            run_stage_metered(stage, &buf_a[..cur_len], buf_b, spent)
         } else {
-            run_stage(stage, &buf_b[..cur_len], buf_a)
+            run_stage_metered(stage, &buf_b[..cur_len], buf_a, spent)
         };
         match res {
             Ok(n) => {

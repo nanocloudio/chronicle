@@ -1,0 +1,2 @@
+name=linux commit=80b5868 governor=performance temp_start=75C temp_end=82C advisory=0
+fed_frames=400000 window_s=10 reps=5 median_rec_per_s=4949 rates=[ 4982 4936 4887 4960 4949]

@@ -21,7 +21,7 @@ timer_class      = "agnostic"
 # the sha256 of its canonical protobuf encoding, produced here by
 # `modules/common/{pb_core,artefact_core}.rs` with no allocator and no `prost`,
 # and proven equal to the host toolchain's digest
-# (`chronicle-canonical/tests/pb_differential.rs`). A device can therefore
+# (`tests/harness/tests/chronicle_cli.rs (corpus suite)`). A device can therefore
 # author, identify and publish work without a Linux build host.
 #
 # Everything runs the SAME include!'d cores the on-device engines run

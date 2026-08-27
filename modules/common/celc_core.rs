@@ -1,14 +1,14 @@
 // No-alloc CEL front end: parse + type-check + checked-IR emission in ONE pass.
 //
 // This is THE compiler — the only implementation. The host crate
-// (`chronicle-canonical::cel`) is a thin std wrapper that `include!`s this same
+// (the CEL compiler (`celc_core`)) is a thin std wrapper that `include!`s this same
 // source: its `TypeEnv` builder renders to the textual environment below and
 // its string errors are sliced from the spans this core reports. The core
 // exploits the fact that the flat checked-IR encoding (`lower_core.rs` `ir`) is
 // a POST-ORDER token stream — operands precede operators — so a recursive
 // descent over the source can emit IR bytes directly as it reduces, carry each
 // subexpression's type in its return value, and never allocate. The
-// differential test (`chronicle-canonical/tests/celc_differential.rs`)
+// differential test (`tests/harness/tests/pipeline.rs (builtins suite)`)
 // proves the wrapper's rendered environment is faithful to the hand-written
 // text form the device receives.
 //

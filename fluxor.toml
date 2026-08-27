@@ -59,6 +59,11 @@ scripts = [
   # `module-tests` phase. A stopgap script that duplicated it lived here until
   # that phase landed.)
   "tools/ci/shipping-surface.sh",
+  "tools/ci/secret-safety.sh",
+  "tools/ci/accounting-order.sh",
+  "tools/ci/limit-register.sh",
+  "tools/ci/core-coverage.sh",
+  "tools/ci/resource-summary.sh",
   # Behavioural drivers: each builds a graph bundle and drives the real .fmod
   # artefacts through the fluxor-linux runtime, asserting real output.
   "tools/e2e/*.sh",

@@ -32,8 +32,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 // Evaluator + frame codec + aggregation engine + hex codec — identical source to
-// the `chronicle-bytecode` crate, all in ONE module so cross-references resolve.
+// the host harness (tests/harness), all in ONE module so cross-references resolve.
 mod agg {
+    use super::abi::SyscallTable;
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
     include!("../../common/agg_core.rs");
@@ -43,21 +44,67 @@ mod agg {
     // because core.rs is include!'d into this same block. Same self-validation
     // as the expression/pipeline modules: "it lowered" == "it can run it".
     include!("../../common/lower_core.rs");
+    include!("../../common/outcome_core.rs");
+    include!("../../common/io_core.rs");
+    include!("../../common/accounting_core.rs");
+    include!("../../common/syschan_core.rs");
 }
 use agg::{
-    agg_op_kind, frame_len, hex_decode, ingest, lower_def, read_prog, AggSpec, AggState,
-    BarrierGate, Durability, EmitTrigger, OpSpec, MAX_OPS,
+    admit_frame, agg_op_kind, drain_all, frame_len, hex_decode, ingest, lower_def, read_prog,
+    Accounting, Admit, AggSpec, AggState, BarrierGate, Durability, EmitTrigger, Mode, OpSpec,
+    Pending, Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, MAX_OPS,
 };
+
+// Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
+include!("../../common/telemetry_core.rs");
 
 const HEX_BUF: usize = 8192;
 const CONT_BUF: usize = 4096;
+/// Input event buffer, sized to the port max_record so a whole typed event frame
+/// from an upstream pipeline/decision module is admitted — never a partial.
+const REC_BUF: usize = 4096;
+/// Largest single emitted window frame retained for delivery. An aggregation
+/// result (a key plus a handful of operator values) is well under this.
+const EMIT_FRAME_MAX: usize = 512;
+/// One event can emit up to `MAX_LANES * MAX_PANES * 2` = 256 frames (every live
+/// pane on an `OnProcessing` trigger, then again on finalization). The emission
+/// queue holds a whole event's output so a full output ring (EAGAIN) never forces
+/// a drop: emissions are captured here during `ingest`, then drained one frame per
+/// step, and the next event is not admitted until the queue empties.
+const EMIT_Q_CAP: usize = 256 * (2 + EMIT_FRAME_MAX);
+/// The largest snapshot `AggState::snapshot` can produce, so EVERY admitted state
+/// is checkpointable. Derived from the capacities: 42 global bytes + 16
+/// lanes × (60 lane bytes + 8 panes × 270) ≈ 35,562; rounded up with margin. The
+/// checkpoint buffer and the `checkpoint_out` record are both sized to this, so a
+/// full snapshot travels as one retained record — delivered atomically, retained
+/// on a full ring (no chunk-reassembly protocol, no loss under EAGAIN). Fits a
+/// `u16` cursor (`Pending`) since it is under 64 KiB.
+const MAX_SNAPSHOT: usize = 40960;
+/// Hex of a supplied restore checkpoint: twice the decoded snapshot. `state_hex_len`
+/// is `u32` because this exceeds a `u16`.
+const SNAP_HEX: usize = 2 * MAX_SNAPSHOT;
 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    in_buf: [u8; 1024],
+    in_buf: [u8; REC_BUF],
+    // Emission queue: one event's window emissions, length-prefixed
+    // (`[len:u16][frame]`…), captured during `ingest` and drained one frame per
+    // step so a full output ring never loses an emission. `emit_head`/`emit_tail`
+    // are byte cursors (u32 — the queue exceeds 64 KiB).
+    emit_q: [u8; EMIT_Q_CAP],
+    emit_head: u32,
+    emit_tail: u32,
+    /// Emissions dropped because a single event exceeded the queue's proven bound
+    /// (a bounded-state overflow, counted like lane/pane overflow — never silent).
+    emit_overflow: u32,
+    /// The common accounting taxonomy. An admitted EVENT is one input; its
+    /// window emissions are its fan-out outputs (staged into the queue, drained one
+    /// per step). `emit_overflow` and the saturation counters refine
+    /// `outputs_failed`.
+    acct: Accounting,
     hex: [u8; HEX_BUF],
     hex_len: u16,
     cont: [u8; CONT_BUF],
@@ -70,9 +117,16 @@ struct ModuleState {
     // A CHECKPOINT to resume from (`state` param): hex of an AggState::snapshot.
     // Non-empty ⇒ restore the windowed state at load instead of starting fresh —
     // durable deterministic state / replay-recovery.
-    state_hex: [u8; HEX_BUF],
-    state_hex_len: u16,
+    state_hex: [u8; SNAP_HEX],
+    state_hex_len: u32,
     has_state: bool,
+    // A full-snapshot staging buffer, reused for the checkpoint EMIT (snapshot →
+    // stage) and, at load, for decoding a supplied restore checkpoint. Sized to the
+    // proven maximum snapshot so every admitted state is checkpointable/restorable.
+    ckpt_stage: [u8; MAX_SNAPSHOT],
+    // One retained checkpoint record, drained across steps so a full ring never
+    // drops a checkpoint.
+    ckpt_pending: Pending,
     // Checkpoint EMIT: out[1], and emit a snapshot every `ckpt_every` events
     // (0 = disabled). `events_since_ckpt` counts events since the last emit.
     ckpt_chan: i32,
@@ -94,9 +148,15 @@ struct ModuleState {
     // Producer half (raft-propose mode): when proposal_out (out[2]) is wired the
     // module submits its checkpoint snapshot to consensus as a TAGGED proposal,
     // learns the assigned log index via assigned_in (in[2]) and the current term
-    // via leader_in (in[3]), records it in the gate, and stages itself until
-    // the commit horizon (barrier_in) crosses that index — the full
-    // on-device Clustor state.distributed.raft.v1 loop, self-contained.
+    // via leader_in (in[3]), records it in the gate, and stages itself until the
+    // commit horizon (barrier_in) crosses that index. TWO lifecycles, kept
+    // distinct: (1) STARTUP FENCING — the boot generation stages the
+    // restored state until it is proven committed, then activates; (2) ONGOING
+    // GENERATIONS — after activation the module periodically re-proposes the
+    // current state under a FRESH `corr` and re-proposes on a term change, so state
+    // is replicated over time, not only fenced once at boot. Commit-acknowledged
+    // retry-until-durable and proposals larger than one record are clustor-
+    // coordinated and out of a single module's scope.
     raft_mode: bool,
     proposal_chan: i32,
     assigned_chan: i32,
@@ -104,6 +164,18 @@ struct ModuleState {
     current_term: u64,
     corr: u64,
     proposed: bool,
+    /// 1 = a present-but-invalid supplied checkpoint. Distinct from "no checkpoint"
+    /// (absent state starts fresh); a malformed/oversized one is a terminal
+    /// activation fault — the module refuses to process rather than silently
+    /// erasing history and continuing from a fresh state.
+    faulted: bool,
+    /// A string param overflowed its buffer during parsing (truncated) — a fault,
+    /// since a truncated def could decode to a different aggregation.
+    param_overflow: bool,
+    /// Current operating mode (`Mode` as u8), published as `module_mode`.
+    mode: u8,
+    /// Wall-clock ms of the last telemetry publish (throttle state).
+    tlm_last_ms: u64,
     agg: AggState,
 }
 
@@ -117,6 +189,7 @@ define_params! {
             s.hex_len += 1;
             i += 1;
         }
+        if i < len { s.param_overflow = true; }
     };
     // Higher-level IR-`def` (a shipped checked IR) lowered to bytecode at load.
     // Guard on len>0: set_defaults() fires every closure, so an absent param
@@ -130,6 +203,7 @@ define_params! {
                 s.hex_len += 1;
                 i += 1;
             }
+            if i < len { s.param_overflow = true; }
         }
     };
     // A checkpoint (hex of AggState::snapshot) to resume from. Guard on len>0:
@@ -139,7 +213,7 @@ define_params! {
         if len > 0 {
             s.has_state = true;
             let mut i = 0usize;
-            while i < len && (s.state_hex_len as usize) < HEX_BUF {
+            while i < len && (s.state_hex_len as usize) < SNAP_HEX {
                 s.state_hex[s.state_hex_len as usize] = *d.add(i);
                 s.state_hex_len += 1;
                 i += 1;
@@ -207,7 +281,17 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_chan = in_chan;
         s.out_chan = out_chan;
-        s.in_buf = [0u8; 1024];
+        s.in_buf = [0u8; REC_BUF];
+        s.emit_head = 0;
+        s.emit_tail = 0;
+        s.emit_overflow = 0;
+        s.acct = Accounting::default();
+        s.ckpt_pending = Pending { off: 0, len: 0 };
+        s.param_overflow = false;
+        s.mode = Mode::AwaitingConfig.as_u8();
+        // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
+        // uptime, near 0 at startup), not only after one full interval.
+        s.tlm_last_ms = dev_millis(sys).wrapping_sub(TLM_INTERVAL_MS);
         s.hex_len = 0;
         s.cont_len = 0;
         s.is_ir = false;
@@ -228,9 +312,18 @@ pub extern "C" fn module_new(
         s.current_term = 0;
         s.corr = 1;
         s.proposed = false;
+        s.faulted = false;
         core::ptr::write(&mut s.agg, AggState::new());
 
         parse_tlv(s, params, params_len);
+        // A param truncated at its buffer is a terminal fault — a truncated def could
+        // decode to a different aggregation.
+        if s.param_overflow {
+            s.faulted = true;
+            let m: &'static [u8] =
+                b"[aggregation] FAULT: a param exceeded its buffer and was truncated";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
         if s.is_ir {
             // `ir_def` param: decode the hex to the flat IR-`def`, then lower it
             // HERE into the bytecode `def`. A program that won't lower fails
@@ -255,20 +348,28 @@ pub extern "C" fn module_new(
         // restore returns None, so we keep the fresh state rather than a
         // half-built one and log it.
         if s.has_state {
-            match hex_decode(&s.state_hex[..s.state_hex_len as usize], &mut s.ir_scratch) {
-                Some(n) => match AggState::restore(&s.ir_scratch[..n]) {
-                    Some(restored) => {
-                        s.agg = restored;
-                        dev_log(
-                            sys,
-                            3,
-                            b"[aggregation] resumed from checkpoint".as_ptr(),
-                            37,
-                        );
-                    }
-                    None => dev_log(sys, 3, b"[aggregation] bad checkpoint".as_ptr(), 28),
-                },
-                None => dev_log(sys, 3, b"[aggregation] bad checkpoint".as_ptr(), 28),
+            // A checkpoint was SUPPLIED. It restores, or it is a terminal fault —
+            // never a silent fall-back to a fresh state, which would erase the very
+            // history the checkpoint exists to preserve. Absent state (the
+            // `!has_state` case) is what legitimately starts fresh.
+            let restored = hex_decode(&s.state_hex[..s.state_hex_len as usize], &mut s.ckpt_stage)
+                .and_then(|n| AggState::restore(&s.ckpt_stage[..n]));
+            match restored {
+                Some(r) => {
+                    s.agg = r;
+                    dev_log(
+                        sys,
+                        3,
+                        b"[aggregation] resumed from checkpoint".as_ptr(),
+                        37,
+                    );
+                }
+                None => {
+                    s.faulted = true;
+                    let m: &'static [u8] =
+                        b"[aggregation] FAULT: supplied checkpoint is invalid; refusing to start with erased state";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                }
             }
         }
         // Distributed activation barrier: if a `barrier` param gives the (term,
@@ -388,14 +489,19 @@ unsafe fn try_propose(s: &mut ModuleState, sys: &SyscallTable) {
     let total = 3 + plen;
     let poll = (sys.channel_poll)(s.proposal_chan, 0x02);
     if poll > 0 && (poll as u32 & 0x02) != 0 {
-        (sys.channel_write)(s.proposal_chan, pf.as_ptr(), total);
-        s.proposed = true;
-        dev_log(
-            sys,
-            3,
-            b"[aggregation] checkpoint proposed to raft".as_ptr(),
-            40,
-        );
+        // Mark proposed ONLY on a fully-accepted write; a full ring leaves
+        // `proposed` false so the one-shot proposal retries next step rather than
+        // being silently lost.
+        let w = (sys.channel_write)(s.proposal_chan, pf.as_ptr(), total);
+        if w == total as i32 {
+            s.proposed = true;
+            dev_log(
+                sys,
+                3,
+                b"[aggregation] checkpoint proposed to raft".as_ptr(),
+                40,
+            );
+        }
     }
 }
 
@@ -524,7 +630,12 @@ fn build_spec<'a>(
     if o3 >= cont.len() {
         return None;
     }
-    let nops = (cont[o3] as usize).min(MAX_OPS);
+    // Reject a def declaring more operators than MAX_OPS rather than silently
+    // truncating to MAX_OPS (which would drop authored operators).
+    if cont[o3] as usize > MAX_OPS {
+        return None;
+    }
+    let nops = cont[o3] as usize;
     let mut off = o3 + 1;
     let mut i = 0usize;
     while i < nops {
@@ -570,17 +681,34 @@ fn build_spec<'a>(
 /// full/not-yet-ready channel never drops the checkpoint. Snapshots into
 /// ir_scratch (unused after load).
 unsafe fn try_checkpoint(s: &mut ModuleState, sys: &SyscallTable) {
-    if s.ckpt_every == 0 || s.events_since_ckpt < s.ckpt_every || s.ckpt_chan < 0 {
+    if s.ckpt_chan < 0 {
         return;
     }
-    let ckpt_chan = s.ckpt_chan;
-    let scratch_ptr = s.ir_scratch.as_mut_ptr();
-    let scratch = core::slice::from_raw_parts_mut(scratch_ptr, CONT_BUF);
-    if let Some(sn) = s.agg.snapshot(scratch) {
-        let poll_c = (sys.channel_poll)(ckpt_chan, 0x02);
-        if poll_c > 0 && (poll_c as u32 & 0x02) != 0 {
-            (sys.channel_write)(ckpt_chan, scratch_ptr, sn);
-            s.events_since_ckpt = 0;
+    let ckpt = SysChan::new(sys, s.ckpt_chan);
+    // Drain a retained checkpoint first — a full ring never drops it. One
+    // whole snapshot travels as a single max_record-sized record.
+    if !s.ckpt_pending.is_empty() {
+        match s.ckpt_pending.drain(&ckpt, &s.ckpt_stage) {
+            Staged::Pending => {}
+            _ => s.ckpt_pending = Pending { off: 0, len: 0 },
+        }
+        return;
+    }
+    if s.ckpt_every == 0 || s.events_since_ckpt < s.ckpt_every {
+        return;
+    }
+    // Snapshot the FULL state into the max-sized buffer — every admitted state
+    // fits — then stage it. `snapshot` returns None only if the state exceeded
+    // MAX_SNAPSHOT, which the capacities make impossible; leave the interval to
+    // retry if it somehow does.
+    let snap = core::slice::from_raw_parts_mut(s.ckpt_stage.as_mut_ptr(), MAX_SNAPSHOT);
+    if let Some(sn) = s.agg.snapshot(snap) {
+        // The interval resets when the snapshot is TAKEN, so a blocked delivery does
+        // not re-snapshot; the retained record drains on later steps.
+        s.events_since_ckpt = 0;
+        match s.ckpt_pending.stage(&ckpt, &s.ckpt_stage, sn) {
+            Staged::Pending => {}
+            _ => s.ckpt_pending = Pending { off: 0, len: 0 },
         }
     }
 }
@@ -591,6 +719,50 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+
+        // Publish telemetry (throttled; zero-cost when no consumer). A stateful
+        // operator exports its saturation/late/correction and checkpoint/barrier
+        // state. Emitted before the early returns so a faulted / barrier-staged
+        // module still reports.
+        s.mode = if s.faulted {
+            Mode::Faulted.as_u8()
+        } else if !s.active {
+            Mode::BarrierWait.as_u8()
+        } else if s.cont_len < 36 {
+            Mode::AwaitingConfig.as_u8()
+        } else if s.emit_head < s.emit_tail || !s.ckpt_pending.is_empty() {
+            Mode::OutputBlocked.as_u8()
+        } else {
+            Mode::Ready.as_u8()
+        };
+        if let Some((midx, t)) = tlm_tick(sys, &mut s.tlm_last_ms) {
+            // ids 0..13: the baseline accounting block (events as inputs, window
+            // emissions as fan-out outputs).
+            acct_emit(sys, midx, t, 0, &s.acct);
+            // ids 14..: aggregation's own instruments. module_mode, then the
+            // saturation / late / correction counters and checkpoint/term health that
+            // an edge counter cannot express — each a refinement of the baseline, not
+            // a replacement. `emit_overflow` refines `outputs_failed`.
+            let b = ACCT_METRIC_COUNT as u16;
+            tlm_gauge(sys, midx, t, b, s.mode as u64);
+            tlm_counter(sys, midx, t, b + 1, s.emit_overflow as u64);
+            tlm_counter(sys, midx, t, b + 2, s.agg.lane_overflows() as u64);
+            tlm_counter(sys, midx, t, b + 3, s.agg.late_drops() as u64);
+            tlm_counter(sys, midx, t, b + 4, s.agg.corrections() as u64);
+            tlm_counter(sys, midx, t, b + 5, s.agg.pane_overflows() as u64);
+            tlm_counter(sys, midx, t, b + 6, s.agg.coll_overflows() as u64);
+            tlm_counter(sys, midx, t, b + 7, s.agg.non_retractable_drops() as u64);
+            tlm_gauge(sys, midx, t, b + 8, s.events_since_ckpt as u64);
+            tlm_gauge(sys, midx, t, b + 9, s.current_term);
+            // work units — window emissions produced (fold/finalize work).
+            tlm_counter(sys, midx, t, b + 10, s.acct.work_units);
+        }
+
+        // A present-but-invalid supplied checkpoint is a terminal fault: refuse
+        // input rather than run with silently-erased history.
+        if s.faulted {
+            return 0;
+        }
 
         // Distributed activation barrier: while staged behind an unmet barrier,
         // drain commit horizons and process NO events (upstream back-pressures on
@@ -609,63 +781,139 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Flush a pending checkpoint first — retried every step, so a channel
-        // that wasn't writable when the interval elapsed still drains later.
+        // Drain any retained window emissions before admitting the next event. One
+        // frame per step, all-or-nothing: a full output ring leaves the frame in the
+        // queue (head not advanced) to retry, and the next event is not admitted
+        // until the queue empties — so a fan-out event never loses an emission under
+        // EAGAIN. Byte cursors are u32 because the queue exceeds 64 KiB.
+        if s.emit_head < s.emit_tail {
+            let head = s.emit_head as usize;
+            let flen = u16::from_le_bytes([s.emit_q[head], s.emit_q[head + 1]]) as usize;
+            let poll_out = (sys.channel_poll)(s.out_chan, 0x02);
+            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                let w = (sys.channel_write)(s.out_chan, s.emit_q.as_ptr().add(head + 2), flen);
+                if w == flen as i32 {
+                    s.emit_head += (2 + flen) as u32;
+                    s.acct.output_drained(flen as u32);
+                    if s.emit_head >= s.emit_tail {
+                        s.emit_head = 0;
+                        s.emit_tail = 0;
+                        // The whole queue drained: this event's every emission is
+                        // delivered, so the in-flight event is now resolved.
+                        s.acct.input_succeeded();
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // Checkpoint only when no emissions are pending — a checkpoint must not get
+        // ahead of undelivered output. Retried every step until accepted.
         try_checkpoint(s, sys);
+
+        // ONGOING replicated checkpoint (raft-propose mode, post-activation): every
+        // `checkpoint_every` events, propose the current state as a NEW generation
+        // with a fresh correlation id — so state is periodically replicated, not
+        // only fenced once at boot. A term change re-proposes under the new
+        // term (drain_leader keeps `current_term` current). Delivery is checked in
+        // `try_propose`; the boot gate is not re-driven here — commit-acknowledged
+        // retry-until-durable is clustor-coordinated.
+        if s.raft_mode && s.ckpt_every > 0 && s.events_since_ckpt >= s.ckpt_every {
+            drain_leader(s, sys);
+            if s.proposed {
+                s.corr = s.corr.wrapping_add(1);
+                s.proposed = false;
+            }
+            try_propose(s, sys);
+            if s.proposed {
+                s.events_since_ckpt = 0;
+            }
+        }
 
         if s.in_chan < 0 || s.cont_len < 36 {
             return 0;
         }
-        let poll = (sys.channel_poll)(s.in_chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            return 0;
-        }
-        let n = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr(), s.in_buf.len());
-        if n <= 0 {
-            return 0;
-        }
-        let read = n as usize;
-        let out_chan = s.out_chan;
         let cont_len = s.cont_len as usize;
 
-        // Parse the param container into an AggSpec (borrows s.cont).
+        // Parse the param container into an AggSpec (borrows a raw view of s.cont,
+        // so it does not tie up a borrow of `s`).
         let mut ops = [OpSpec {
             kind: agg::AggOp::Count,
             selector: &[],
             sel_cost: 0,
         }; MAX_OPS];
-        // Split the borrows: spec + agg state are disjoint fields of `s`.
-        let cont_ptr = s.cont.as_ptr();
-        let cont = core::slice::from_raw_parts(cont_ptr, cont_len);
+        let cont = core::slice::from_raw_parts(s.cont.as_ptr(), cont_len);
         let Some((spec, _nops)) = build_spec(cont, &mut ops) else {
             return 0;
         };
 
-        // Process every event frame in the read; emit finalized windows to out.
-        let mut off = 0usize;
-        while off < read {
-            let frame_ptr = s.in_buf.as_ptr();
-            let avail = core::slice::from_raw_parts(frame_ptr.add(off), read - off);
-            let Some(len) = frame_len(avail) else {
-                break;
-            };
-            if off + len > read {
-                break;
+        // Admit exactly one whole typed event frame (peek-confirmed, never partial).
+        let inch = SysChan::new(sys, s.in_chan);
+        let read = match admit_frame(&inch, &mut s.in_buf, frame_len) {
+            Admit::Complete(nn) => {
+                s.acct.admit_input(nn as u64);
+                nn
             }
-            let frame = core::slice::from_raw_parts(frame_ptr.add(off), len);
-            let _ = ingest(&mut s.agg, &spec, frame, |out_frame| {
-                let poll_out = (sys.channel_poll)(out_chan, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    (sys.channel_write)(out_chan, out_frame.as_ptr(), out_frame.len());
-                }
-            });
-            s.events_since_ckpt = s.events_since_ckpt.wrapping_add(1);
-            off += len;
-        }
+            Admit::Empty | Admit::NeedMore => return 0,
+            Admit::BoundaryLost => {
+                // An event frame beyond max_record: observed and rejected.
+                let _ = drain_all(&inch, &mut s.in_buf);
+                s.acct.reject_input(0);
+                return 0;
+            }
+            // A channel fault before an event is framed is a dependency error.
+            Admit::ChanError(_) => return 0,
+        };
+        let frame = core::slice::from_raw_parts(s.in_buf.as_ptr(), read);
 
-        // Attempt the checkpoint again after this batch (also retried at the top
-        // of every subsequent step until the channel accepts it).
-        try_checkpoint(s, sys);
+        // Ingest the event, CAPTURING every window emission into the queue instead of
+        // writing inline. `ingest` commits its state; the captured emissions are then
+        // drained over the following steps. Raw pointers into the queue fields so the
+        // emit closure does not borrow `s` while `ingest` holds `&mut s.agg`.
+        let eq_ptr = s.emit_q.as_mut_ptr();
+        let tail_ptr = &mut s.emit_tail as *mut u32;
+        let mut overflow = false;
+        // Fan-out accounting: how many emissions this event captured (and their total
+        // bytes) versus how many the bounded queue could not hold.
+        let mut captured: u32 = 0;
+        let mut captured_bytes: u32 = 0;
+        let mut dropped: u32 = 0;
+        let _ = ingest(&mut s.agg, &spec, frame, |out_frame| {
+            let flen = out_frame.len();
+            let t = *tail_ptr as usize;
+            if flen > EMIT_FRAME_MAX || t + 2 + flen > EMIT_Q_CAP {
+                // A single event exceeded the queue's proven bound — a bounded-state
+                // overflow, counted like lane/pane overflow, never a silent loss.
+                overflow = true;
+                dropped += 1;
+                return;
+            }
+            *eq_ptr.add(t) = (flen & 0xff) as u8;
+            *eq_ptr.add(t + 1) = ((flen >> 8) & 0xff) as u8;
+            core::ptr::copy_nonoverlapping(out_frame.as_ptr(), eq_ptr.add(t + 2), flen);
+            *tail_ptr = (t + 2 + flen) as u32;
+            captured += 1;
+            captured_bytes += flen as u32;
+        });
+        if overflow {
+            s.emit_overflow = s.emit_overflow.wrapping_add(1);
+        }
+        // Account the event's fan-out: captured emissions are generated+pending (they
+        // drain over the following steps); dropped emissions are generated+failed. An
+        // event that produced NO retained emission has met its output obligation now
+        // and is resolved immediately; otherwise it resolves when the queue drains.
+        if captured > 0 {
+            s.acct.outputs_staged_bulk(captured, captured_bytes);
+        }
+        if dropped > 0 {
+            s.acct.outputs_failed_bulk(dropped);
+        }
+        if captured == 0 {
+            s.acct.input_succeeded();
+        }
+        // work units: this event's window emissions are its fold/finalize work.
+        s.acct.add_work(captured as u64);
+        s.events_since_ckpt = s.events_since_ckpt.wrapping_add(1);
         0
     }
 }

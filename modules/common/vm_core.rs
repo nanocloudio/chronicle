@@ -210,8 +210,22 @@ pub fn eval_scratch<'a>(
     scratch: &mut Scratch<'_>,
     max_cost: u64,
 ) -> Result<Value<'a>, EvalError> {
+    let mut spent = 0u64;
+    eval_scratch_metered(code, params, scratch, max_cost, &mut spent)
+}
+
+/// [`eval_scratch`] that also reports the VM instructions spent (work units).
+/// `spent` is written whether the program succeeds or fails — the work a failed
+/// program did before faulting is still work the step consumed.
+pub fn eval_scratch_metered<'a>(
+    code: &'a [u8],
+    params: &'a [Message<'a>],
+    scratch: &mut Scratch<'_>,
+    max_cost: u64,
+    spent: &mut u64,
+) -> Result<Value<'a>, EvalError> {
     let mut builder = Builder::new();
-    match eval_full_scratch(code, params, &mut builder, scratch, max_cost)? {
+    match eval_full_scratch_metered(code, params, &mut builder, scratch, max_cost, spent)? {
         EvalResult::Scalar(v) => Ok(v),
         EvalResult::Constructed => Err(EvalError::BadResultArity),
     }
@@ -246,10 +260,25 @@ pub fn eval_full_scratch<'a>(
     scratch: &mut Scratch<'_>,
     max_cost: u64,
 ) -> Result<EvalResult<'a>, EvalError> {
+    let mut spent = 0u64;
+    eval_full_scratch_metered(code, params, builder, scratch, max_cost, &mut spent)
+}
+
+/// [`eval_full_scratch`] that reports VM instructions spent into `spent`.
+/// The counter is live on every return path, so a caller reads the true work a
+/// record cost even when the program faulted or exceeded its budget.
+pub fn eval_full_scratch_metered<'a>(
+    code: &'a [u8],
+    params: &'a [Message<'a>],
+    builder: &mut Builder<'a>,
+    scratch: &mut Scratch<'_>,
+    max_cost: u64,
+    spent: &mut u64,
+) -> Result<EvalResult<'a>, EvalError> {
     let mut stack: [Value<'a>; STACK_CAP] = [Value::Null; STACK_CAP];
     let mut sp: usize = 0;
     let mut pc: usize = 0;
-    let mut cost: u64 = 0;
+    *spent = 0;
     #[cfg(feature = "bindings")]
     let mut locals: [Option<Value<'a>>; MAX_LOCALS] = [None; MAX_LOCALS];
 
@@ -276,8 +305,8 @@ pub fn eval_full_scratch<'a>(
         if pc >= code.len() {
             return Err(EvalError::Truncated);
         }
-        cost += 1;
-        if cost > max_cost {
+        *spent += 1;
+        if *spent > max_cost {
             return Err(EvalError::CostExceeded);
         }
         let opcode = code[pc];
@@ -348,7 +377,7 @@ pub fn eval_full_scratch<'a>(
                 let arity = builtin_arity(id).ok_or(EvalError::BadBuiltin(id))?;
                 // Each call costs its arity on top of the step, so a builtin
                 // is never cheaper than the loads it consumed.
-                cost += arity as u64;
+                *spent += arity as u64;
                 if sp < arity {
                     return Err(EvalError::StackUnderflow);
                 }

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Expression E2E: one evaluator .fmod runs ANY Expression, chosen purely by the
 # `program` param — the same input record yields a different field per config.
-# Input record {1:"o-1", 2:"cust-42"} (compact [num][len:u16][bytes] frame).
+# Input record {1:"o-1", 2:"cust-42"} as the canonical typed frame
+# ([count] then per field [num][type=0 bytes][len:u16][bytes]).
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no expression "fluxor modules build failed"; finish; exit; }
 
-IN=020103006f2d31020700637573742d3432
+IN=02010003006f2d3102000700637573742d3432
 
 build_graph examples/expression/linux.yaml || { no "expr customer" build; finish; exit; }
 got=$(run_hex $IN 4)

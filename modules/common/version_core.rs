@@ -186,6 +186,40 @@ pub fn version_selector<'a>(fields: &[Field<'a>]) -> &'a [u8] {
     &[]
 }
 
+/// The version selector read DIRECTLY from a raw typed frame, without decoding
+/// every field into a `Field` array first (the pipeline needs only field
+/// 255 to route a record, but `run_stages` decodes the frame again anyway, so a
+/// full pre-decode purely to read the selector is duplicate hot-path work). Walks
+/// the self-delimiting frame — the same layout `frame_len` walks — and returns
+/// field 255's payload bytes, or empty when absent. Byte-for-byte equivalent to
+/// `version_selector(&decode_frame(frame))` for the selector field (a bytes/str
+/// payload is the same raw span either way); proven by a parity test.
+pub fn version_selector_from_frame(frame: &[u8]) -> &[u8] {
+    if frame.is_empty() {
+        return &[];
+    }
+    let count = frame[0] as usize;
+    let mut off = 1usize;
+    let mut i = 0;
+    while i < count {
+        if off + 4 > frame.len() {
+            break;
+        }
+        let num = frame[off] as u32;
+        let len = u16::from_le_bytes([frame[off + 2], frame[off + 3]]) as usize;
+        off += 4;
+        if off + len > frame.len() {
+            break;
+        }
+        if num == VERSION_SELECTOR_FIELD {
+            return &frame[off..off + len];
+        }
+        off += len;
+        i += 1;
+    }
+    &[]
+}
+
 /// Hot-reload control op-codes (applied to the backing buffer at runtime, over
 /// the module's `ctrl_input` port). Non-disruptive: in-flight records keep the
 /// version they already resolved; only the table changes.

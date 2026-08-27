@@ -10,7 +10,7 @@
 //! A decision is its OWN node (not a pipeline bytecode stage) because the VM has
 //! no branching opcode — a single program constructs one message and cannot select
 //! among several. The first-hit driver lives in `decision_core.rs`, `include!`d
-//! verbatim from the `chronicle-bytecode` crate, so this module and the host tests
+//! verbatim from the host harness (tests/harness), so this module and the host tests
 //! run identical logic.
 
 #![no_std]
@@ -35,15 +35,24 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 mod dec {
+    use super::abi::SyscallTable;
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
     include!("../../common/decision_core.rs");
     include!("../../common/hex_core.rs");
+    include!("../../common/outcome_core.rs");
+    include!("../../common/io_core.rs");
+    include!("../../common/accounting_core.rs");
+    include!("../../common/syschan_core.rs");
+    include!("../../common/decision_step_core.rs");
 }
 use dec::{
-    decode_frame, encode_frame_scratch, hex_decode, run_decision_scratch, scan_decision_container,
-    Builder, Field, Message, Scratch, Value, MAX_PIPE_FIELDS, STAGE_SCRATCH_CAP,
+    decision_step, hex_decode, scan_decision_container, Accounting, Mode, Pending, Reason,
+    StepResult, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
 };
+
+// Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
+include!("../../common/telemetry_core.rs");
 
 const HEX_BUF: usize = 8192;
 const CONT_BUF: usize = 4096;
@@ -59,23 +68,38 @@ struct ModuleState {
     // pipeline had just gone to the trouble of carrying.
     in_buf: [u8; 4096],
     out_buf: [u8; 4096],
+    /// One retained output frame, drained before any new input is admitted.
+    pending: Pending,
     hex: [u8; HEX_BUF],
     hex_len: u16,
     cont: [u8; CONT_BUF],
     cont_len: u16,
-    fired: u32,
-    /// Outcomes that constructed an empty message — the drop convention: the
-    /// record was consumed deliberately and routed nowhere.
-    dropped: u32,
-    errors: u32,
+    /// The common accounting taxonomy: a delivered non-empty outcome is
+    /// `inputs_succeeded`, an empty-outcome filter `inputs_policy_dropped`, an
+    /// admission refusal `inputs_rejected`, and any terminal processing failure
+    /// `inputs_failed`. The two reason splits below refine `inputs_failed`.
+    acct: Accounting,
     /// Frame-decode failures, split from eval errors so a miswired channel
-    /// (malformed frames) is distinguishable from a broken program.
+    /// (malformed frames) is distinguishable from a broken program. A refinement of
+    /// `inputs_failed`, not an addition to it.
     errors_frame: u32,
     /// Output-frame encode failures (oversized outcome).
     errors_encode: u32,
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
+    /// A string param overflowed its buffer during parsing (truncated) — a fault,
+    /// since a truncated container could decode to a different policy.
+    param_overflow: bool,
+    /// Current operating mode (`Mode` as u8), published as `module_mode`.
+    mode: u8,
+    /// Wall-clock ms of the last telemetry publish (throttle state).
+    tlm_last_ms: u64,
+    /// Records that matched no rule and took the DEFAULT outcome.
+    no_match: u32,
+    /// The rule index that produced the most recent outcome (`0xFFFF` = the default,
+    /// or none yet) — the `Fired` audit, published as a gauge.
+    last_rule: u16,
 }
 
 define_params! {
@@ -88,6 +112,7 @@ define_params! {
             s.hex_len += 1;
             i += 1;
         }
+        if i < len { s.param_overflow = true; }
     };
 }
 
@@ -131,11 +156,17 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_chan = in_chan;
         s.out_chan = out_chan;
+        s.pending = Pending { off: 0, len: 0 };
         s.hex_len = 0;
         s.cont_len = 0;
-        s.fired = 0;
-        s.dropped = 0;
-        s.errors = 0;
+        s.acct = Accounting::default();
+        s.param_overflow = false;
+        s.mode = Mode::AwaitingConfig.as_u8();
+        // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
+        // uptime, near 0 at startup), not only after one full interval.
+        s.tlm_last_ms = dev_millis(sys).wrapping_sub(TLM_INTERVAL_MS);
+        s.no_match = 0;
+        s.last_rule = 0xFFFF;
         s.errors_frame = 0;
         s.errors_encode = 0;
         s.faulted = 0;
@@ -160,6 +191,9 @@ pub extern "C" fn module_new(
                 fault = b"[decision] FAULT: container invalid or needs a builtin not in this build";
             }
         }
+        if s.param_overflow {
+            fault = b"[decision] FAULT: a param exceeded its buffer and was truncated";
+        }
         if !fault.is_empty() {
             s.cont_len = 0;
             s.faulted = 1;
@@ -180,65 +214,70 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
+        s.mode = if s.faulted != 0 {
+            Mode::Faulted.as_u8()
+        } else if s.cont_len == 0 {
+            Mode::AwaitingConfig.as_u8()
+        } else if !s.pending.is_empty() {
+            Mode::OutputBlocked.as_u8()
+        } else {
+            Mode::Ready.as_u8()
+        };
+        if let Some((midx, t)) = tlm_tick(sys, &mut s.tlm_last_ms) {
+            // ids 0..13: the baseline accounting block.
+            acct_emit(sys, midx, t, 0, &s.acct);
+            // ids 14..: decision's own instruments. module_mode, the init
+            // fault flag, the two failure-reason splits, and the `Fired`
+            // audit — no_match count and the last rule index (0xFFFF = default).
+            let b = ACCT_METRIC_COUNT as u16;
+            tlm_gauge(sys, midx, t, b, s.mode as u64);
+            tlm_gauge(sys, midx, t, b + 1, s.faulted as u64);
+            tlm_counter(sys, midx, t, b + 2, s.errors_frame as u64);
+            tlm_counter(sys, midx, t, b + 3, s.errors_encode as u64);
+            tlm_counter(sys, midx, t, b + 4, s.no_match as u64);
+            tlm_gauge(sys, midx, t, b + 5, s.last_rule as u64);
+            // work units — VM instructions across predicates + the chosen outcome.
+            tlm_counter(sys, midx, t, b + 6, s.acct.work_units);
+        }
+
         if s.in_chan < 0 || s.cont_len == 0 || s.faulted != 0 {
             return 0;
         }
-        let poll = (sys.channel_poll)(s.in_chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            return 0;
+        let inch = SysChan::new(sys, s.in_chan);
+        let outch = SysChan::new(sys, s.out_chan);
+        let cont_len = s.cont_len as usize;
+        // The whole record lifecycle lives in `decision_step` over the io_core seam;
+        // the shell only adapts the ABI and maps the disposition to counters.
+        let mut fired: i16 = -2; // unchanged if no decision ran this step
+        let r = decision_step(
+            &inch,
+            &outch,
+            &mut s.in_buf,
+            &mut s.out_buf,
+            &mut s.pending,
+            &s.cont[..cont_len],
+            &mut fired,
+            &mut s.acct,
+        );
+        // Record the audit: which branch produced the outcome.
+        if fired >= 0 {
+            s.last_rule = fired as u16;
+        } else if fired == -1 {
+            s.last_rule = 0xFFFF;
+            s.no_match = s.no_match.wrapping_add(1);
         }
-        let n = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr(), s.in_buf.len());
-        if n <= 0 {
-            return 0;
-        }
-        let frame = core::slice::from_raw_parts(s.in_buf.as_ptr(), n as usize);
-
-        // Decode the input record frame into a single message parameter.
-        let mut fields = [Field {
-            number: 0,
-            value: Value::Null,
-        }; MAX_PIPE_FIELDS];
-        let nf = match decode_frame(frame, &mut fields) {
-            Ok(nf) => nf,
-            Err(_) => {
-                s.errors_frame = s.errors_frame.wrapping_add(1);
-                return 0;
+        // The step core has already recorded every disposition into `acct`. The
+        // wrapper adds only the failure-reason SPLITS that refine
+        // `inputs_failed`: a frame-decode failure (a miswired channel) apart from an
+        // oversized-outcome encode failure.
+        match r {
+            StepResult::Failed(Reason::Malformed) => {
+                s.errors_frame = s.errors_frame.wrapping_add(1)
             }
-        };
-        let params = [Message {
-            fields: &fields[..nf],
-        }];
-
-        // First-hit decision -> constructed outcome message.
-        let cont = core::slice::from_raw_parts(s.cont.as_ptr(), s.cont_len as usize);
-        let mut builder = Builder::new();
-        // Arena for the writing builtins (reverse/case/replace/base64) in
-        // predicates and outcomes; record-scoped, serialized before reuse.
-        let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
-        let mut scratch = Scratch::new(&mut sbuf);
-        match run_decision_scratch(cont, &params, &mut builder, &mut scratch) {
-            Ok(_) => {
-                s.fired = s.fired.wrapping_add(1);
-                // DROP convention: an outcome that constructs an EMPTY message
-                // routes nowhere. A first-hit policy whose default is `M {}`
-                // is a filter — the non-matching records vanish here, counted,
-                // instead of polluting downstream with hollow records.
-                if builder.message().fields.is_empty() {
-                    s.dropped = s.dropped.wrapping_add(1);
-                    return 0;
-                }
-                match encode_frame_scratch(&builder.message(), &scratch, &mut s.out_buf) {
-                    Ok(m) => {
-                        let out_chan = s.out_chan;
-                        let poll_out = (sys.channel_poll)(out_chan, 0x02);
-                        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                            (sys.channel_write)(out_chan, s.out_buf.as_ptr(), m);
-                        }
-                    }
-                    Err(_) => s.errors_encode = s.errors_encode.wrapping_add(1),
-                }
+            StepResult::Failed(Reason::TooLarge) => {
+                s.errors_encode = s.errors_encode.wrapping_add(1)
             }
-            Err(_) => s.errors = s.errors.wrapping_add(1),
+            _ => {}
         }
         0
     }

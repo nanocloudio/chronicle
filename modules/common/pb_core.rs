@@ -21,7 +21,7 @@
 //   * a MESSAGE field is presence-based — `Some(empty)` still emits a tag and a
 //     zero length, so `open`/`close` always write, and the caller decides.
 //
-// `chronicle-canonical/tests/pb_differential.rs` pins this against prost over
+// `tests/harness/tests/chronicle_cli.rs (corpus suite)` pins this against prost over
 // the real artefacts; treat a diff there as an identity break, never a nit.
 
 /// Deterministic encoding failures — values, never panics.

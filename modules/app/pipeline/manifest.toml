@@ -23,12 +23,16 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Output: the final stage's constructed message, in the same typed record frame.
 [[ports]]
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Control: hot-reload ops for the version table (add a version / flip the default
 # / remove a drained one). See version_core.rs `vctl`. Optional — a config that
@@ -37,9 +41,20 @@ content_type = "OctetStream"
 name         = "control"
 direction    = "ctrl_input"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 [observability]
-# Counters live in module state (the token_verify convention); `faulted`
-# is a 0/1 gauge set by a named configuration fault at init/reload.
-metrics = ["processed", "errors", "reloads", "rejected", "unavailable", "faulted"]
-
+# Baseline accounting (ids 0..13, canonical order) front-loaded so index == id,
+# then pipeline's own instruments: `module_mode`, the init/reload fault flag,
+# the two reload-CONTROL counters (accepted/rejected hot-reload messages — control,
+# not record dispositions), and `unavailable` (a refinement of which succeeded inputs
+# were routed to the fail-closed VERSION_UNAVAILABLE marker).
+metrics = [
+    "bytes_in", "bytes_out",
+    "inputs_observed", "inputs_admitted", "inputs_rejected",
+    "inputs_succeeded", "inputs_policy_dropped", "inputs_failed", "inputs_in_flight",
+    "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
+    "pending_output_bytes",
+    "module_mode", "faulted", "reloads", "rejected", "unavailable", "work_units",
+]

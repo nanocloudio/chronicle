@@ -24,6 +24,8 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Output: one typed record frame per finalized window (a CustomerTotal), emitted
 # when the event-time watermark closes the window.
@@ -31,6 +33,8 @@ content_type = "OctetStream"
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
+max_record   = 4096
+buffer_size  = 4096
 
 # Optional distributed activation barrier (in[1]): commit horizons from Clustor's
 # `consensus.committed_entries` (MSG_COMMITTED_ENTRY: [term:u64 LE][index:u64 LE]
@@ -44,6 +48,8 @@ name         = "barrier_in"
 index        = 1
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 64
+buffer_size  = 256
 
 # Optional checkpoint stream (out[1]): the raw AggState::snapshot bytes, emitted
 # every `checkpoint_every` events when that param is set. A downstream sink
@@ -54,6 +60,10 @@ name         = "checkpoint_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
+# Sized to the proven maximum AggState snapshot so a full state is checkpointable
+# as one retained record, not silently dropped when it exceeds a small ring.
+max_record   = 40960
+buffer_size  = 40960
 
 # Producer half of the Clustor binding (raft-propose mode). Wiring proposal_out
 # (out[2]) enables it: the module submits its checkpoint snapshot to
@@ -66,19 +76,39 @@ name         = "proposal_out"
 index        = 2
 direction    = "output"
 content_type = "OctetStream"
+max_record   = 512
+buffer_size  = 512
 
 [[ports]]
 name         = "assigned_in"
 index        = 2
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 64
+buffer_size  = 256
 
 [[ports]]
 name         = "leader_in"
 index        = 3
 direction    = "input"
 content_type = "OctetStream"
+max_record   = 64
+buffer_size  = 256
 
 [observability]
-exempt = "on-device aggregation executor demo — throughput is observed at real pipeline edges (connector modules), not this stateful transform"
-
+# Baseline accounting (ids 0..13) is front-loaded so index == id — events are
+# inputs, window emissions are fan-out outputs — then aggregation's own
+# instruments: `module_mode`, then the saturation / late / correction, checkpoint
+# and term state an edge counter cannot express. `emit_overflow` and the overflow
+# counters refine `outputs_failed`.
+metrics = [
+    "bytes_in", "bytes_out",
+    "inputs_observed", "inputs_admitted", "inputs_rejected",
+    "inputs_succeeded", "inputs_policy_dropped", "inputs_failed", "inputs_in_flight",
+    "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
+    "pending_output_bytes",
+    "module_mode",
+    "emit_overflow", "lane_overflows", "late_drops", "corrections",
+    "pane_overflows", "coll_overflows", "non_retractable_drops",
+    "events_since_ckpt", "current_term", "work_units",
+]
