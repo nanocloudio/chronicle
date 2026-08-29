@@ -2,6 +2,14 @@ version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
+# Cadence-independent: a pure record transform. Stages run over the record in
+# front of them; telemetry reads the device clock, never the tick count.
+timer_class     = "agnostic"
+
+# The sink role of the ordered-ack exchange surface: a producer wired to
+# `publish_in` gets every publish answered on `ack_out` once its payload has
+# been processed and the result accepted downstream. See the ingress ports.
+capabilities = ["stream.ordered_ack.sink"]
 
 
 # Input: a typed record frame (see mod.rs / pipeline_core.rs `decode_frame`):
@@ -37,6 +45,66 @@ buffer_size  = 4096
 # Control: hot-reload ops for the version table (add a version / flip the default
 # / remove a drained one). See version_core.rs `vctl`. Optional — a config that
 # doesn't wire it just runs the versions loaded at startup.
+# ── Egress: the ordered-ack exchange surface ──────────────────────────
+#
+# When wired, a pipeline's result leaves as a `Publish` frame instead of a
+# bare record on `result_out`, and the destination answers on `ack_in`. That is
+# what lets one pipeline publish to an MQTT topic, a Kafka partition, a table
+# or an HTTP endpoint by changing which provider the graph pins — the pipeline
+# never learns which.
+#
+# Both are optional. A graph wiring neither delivers results on `result_out`.
+# The pipeline is an at-most-once producer on this surface: it holds no replay
+# log, so publishes outstanding at a LINK_DOWN are counted (`invalidated`), not
+# re-sent.
+[[ports]]
+name         = "publish_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+# The peer on this wire must provide the surface. Checked at build, on the
+# edge — not "some module in the graph declares it".
+requires_capability = "stream.ordered_ack"
+# One framed publish at this module's ceiling: the 3-byte envelope, the
+# contract's 13-byte overhead, and a 4096-byte result frame (no key). See
+# `PUB_FRAME_MAX` in mod.rs.
+max_record   = 4112
+buffer_size  = 16448
+
+[[ports]]
+name         = "ack_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+max_record   = 12
+buffer_size  = 512
+
+# ── Ingress: the sink role ─────────────────────────────────────────────
+#
+# When wired, records arrive as `Publish` payloads on `publish_in` instead of
+# on `record_in`, and each publish is answered on `ack_out`: OK once the
+# record's output is accepted downstream, OVERSIZE for a payload beyond the
+# contract ceiling, UNROUTABLE when the payload cannot be processed. LINK_UP
+# is announced once the module is ready to take records; it never goes down.
+# A payload is taken whole up to PAYLOAD_MAX (`INGRESS_BUF`): a raw chunk for
+# the `decode` program, or — without one — itself one typed record.
+[[ports]]
+name         = "publish_in"
+index        = 2
+direction    = "input"
+content_type = "OctetStream"
+# Any producer's frame, whole: PUBLISH_FRAME_MAX + the 3-byte envelope.
+max_record   = 8720
+buffer_size  = 34880
+
+[[ports]]
+name         = "ack_out"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 12
+buffer_size  = 512
+
 [[ports]]
 name         = "control"
 direction    = "ctrl_input"
@@ -57,4 +125,25 @@ metrics = [
     "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
     "pending_output_bytes",
     "module_mode", "faulted", "reloads", "rejected", "unavailable", "work_units",
+    # Egress: the in-flight window (gauge), typed refusals, publishes
+    # invalidated by a LINK_DOWN, and LINK_DOWN signals seen.
+    "inflight", "refused", "invalidated", "link_downs",
+    # Ingress: publishes accepted and refused as a sink.
+    "sink_acked", "sink_refused",
 ]
+
+# The sink role's terms. `transport`: an ack means the record's output was
+# accepted by the next channel — handed on, not made durable; one destination
+# is one ordering unit, so a broadcast is a plain publish; any contract
+# payload is taken (`INGRESS_BUF`).
+[capability_facts."stream.ordered_ack.sink"]
+ack        = "transport"
+ordering   = "single"
+broadcast  = "degenerate"
+max_payload = 8192
+
+# The largest payload a pipeline result can carry, against a provider's
+# declared backend ceiling. Fact against fact: `max_record` above frames a
+# whole record, this is the payload alone.
+[capability_facts."stream.ordered_ack"]
+max_payload = 4096

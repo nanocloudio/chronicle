@@ -76,7 +76,7 @@ impl<'a> Message<'a> {
 }
 
 /// Maximum fields a single constructed message may carry.
-pub const MAX_BUILD_FIELDS: usize = 16;
+pub const MAX_BUILD_FIELDS: usize = 32;
 
 /// Fixed-capacity accumulator for a constructed message. Its fields borrow from
 /// the input (`'a`), so construction allocates nothing. The caller owns the
@@ -147,6 +147,10 @@ pub mod op {
     pub const ADD: u8 = 0x50;
     pub const SUB: u8 = 0x51;
     pub const MUL: u8 = 0x52;
+    /// Integer division, truncating toward zero. A zero divisor is a
+    /// `DivByZero` eval error — the decision fails closed, as every other
+    /// fault does; a policy that divides by a field must guard it.
+    pub const DIV: u8 = 0x56;
     // Message construction.
     pub const SET_FIELD: u8 = 0x40; // number:u32 — pop value into builder
     pub const FINISH_MSG: u8 = 0x41; // result is the built message
@@ -180,6 +184,8 @@ pub enum EvalError {
     /// A `CALL` named a builtin this build does not carry (unknown id, or its
     /// extension feature is compiled out).
     BadBuiltin(u16),
+    /// `DIV` with a zero divisor.
+    DivByZero,
     /// A scratch-producing builtin overflowed the caller's arena (or the
     /// caller provided none — `eval_full` without an arena).
     ScratchOverflow,
@@ -528,7 +534,7 @@ fn arith_op<'a>(
             *pc += 8;
             push!(Value::Int(v));
         }
-        op::ADD | op::SUB | op::MUL => {
+        op::ADD | op::SUB | op::MUL | op::DIV => {
             let b = match as_int(pop!()) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
@@ -537,9 +543,13 @@ fn arith_op<'a>(
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
+            if opcode == op::DIV && b == 0 {
+                return Some(Err(EvalError::DivByZero));
+            }
             let r = match opcode {
                 op::ADD => a.wrapping_add(b),
                 op::SUB => a.wrapping_sub(b),
+                op::DIV => a.wrapping_div(b),
                 _ => a.wrapping_mul(b), // MUL
             };
             push!(Value::Int(r));
@@ -649,7 +659,8 @@ pub fn scan_code(code: &[u8]) -> Result<(), EvalError> {
             | op::NOT
             | op::ADD
             | op::SUB
-            | op::MUL => 0,
+            | op::MUL
+            | op::DIV => 0,
             op::LOAD_PARAM | op::PUSH_BOOL => 1,
             op::GET_FIELD | op::SET_FIELD => 4,
             op::PUSH_I64 => 8,

@@ -1,0 +1,49 @@
+# HTTP AS AN EXCHANGE PROVIDER — a request in, a response back, correlated.
+#
+# The mirror of `examples/pipeline_egress/`. There the surface carried records
+# to a destination that only accepts them (`stream.ordered_ack.sink`); here the
+# same frames, the same correlation and the same ports carry a request to one
+# that ANSWERS (`stream.ordered_ack.exchange`). Nothing about the producer
+# changes — which is the claim the exchange surface makes, tested rather than
+# asserted.
+#
+# A `Publish` on `publish_in` carries the request record:
+#
+#   [method:u8][path_len:u16][body_len:u16][path…][body…]
+#
+# and the answer comes back on `reply_out` as a `Reply` carrying the response
+# body and ECHOING the request's `msg_key` — so a stage handling the reply can
+# rejoin it to whatever produced the request without holding state.
+#
+# The `exchange` variant is what carries the client's graph-driven mode; the
+# default variant is the one-shot param client and has neither port.
+#
+#   python3 tools/support/http_echo.py /tmp/req.txt   # prints its port
+#   fluxor run examples/http_exchange/linux.yaml < request.bin
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: http
+    variant: exchange
+    params:
+      mode: 1              # client
+      protocol: 0          # HTTP/1.1
+      host_ip: 2130706433  # 127.0.0.1
+      port: 18080
+
+wiring:
+  - from: cli_in.stdin_out
+    to: http.publish_in
+  - from: http.reply_out
+    to: cli_out.bytes_in
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in

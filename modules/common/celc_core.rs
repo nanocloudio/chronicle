@@ -403,12 +403,19 @@ impl Celc<'_> {
 
     fn mul_level(&mut self) -> Result<(CTy, bool), CelcErr> {
         let (mut lt, mut root) = self.unary()?;
-        while self.eat(b"*") {
+        loop {
+            let tag = if self.eat(b"*") {
+                ir::MUL
+            } else if self.eat(b"/") {
+                ir::DIV
+            } else {
+                break;
+            };
             let (rt, _) = self.unary()?;
             if !cty_is_int(&lt) || !cty_is_int(&rt) {
                 return Err(CelcErr::NotInteger);
             }
-            self.put1(ir::MUL)?;
+            self.put1(tag)?;
             lt = CTy::Int;
             root = false;
         }

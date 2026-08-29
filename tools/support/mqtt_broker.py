@@ -7,7 +7,8 @@ container was a heavy dependency for that assertion and made the test collide
 with concurrent runs, so this speaks just enough of the protocol:
 
     CONNECT  -> CONNACK        SUBSCRIBE -> SUBACK
-    PUBLISH  (QoS 0, captured) PINGREQ   -> PINGRESP
+    PUBLISH  (QoS 0/1, captured; QoS 1 -> PUBACK)
+    PINGREQ  -> PINGRESP
 
 Like the SMTP sink it binds port 0 and prints the port, so nothing has to guess
 a free one, and it serves CONTINUOUSLY — the harness boots the graph once to
@@ -28,7 +29,7 @@ import socket
 import sys
 
 TIMEOUT_S = 30
-CONNECT, CONNACK, PUBLISH, SUBSCRIBE, SUBACK = 1, 2, 3, 8, 9
+CONNECT, CONNACK, PUBLISH, PUBACK, SUBSCRIBE, SUBACK = 1, 2, 3, 4, 8, 9
 PINGREQ, PINGRESP, DISCONNECT = 12, 13, 14
 
 
@@ -76,11 +77,24 @@ def serve(conn, out):
             packet_id = body[:2]
             conn.sendall(bytes([SUBACK << 4, 0x03]) + packet_id + bytes([0x00]))
         elif ptype == PUBLISH:
+            qos = (head[0] >> 1) & 0x03
             tlen = int.from_bytes(body[:2], "big")
             topic = body[2 : 2 + tlen].decode("utf-8", "replace")
-            # QoS 0 has no packet identifier, so the payload is the remainder.
-            payload = body[2 + tlen :].decode("utf-8", "replace")
-            out.write_text(f"{topic} {payload}")
+            rest = body[2 + tlen :]
+            if qos > 0:
+                # QoS 1 carries a packet identifier between topic and payload,
+                # and must be PUBACKed — without it a QoS-1 producer never
+                # frees its in-flight window, so this is what exercises the
+                # ordered-ack path rather than just the publish.
+                packet_id = rest[:2]
+                payload = rest[2:]
+                conn.sendall(bytes([PUBACK << 4, 0x02]) + packet_id)
+            else:
+                payload = rest
+            # Written as BYTES, not text: a payload may be a binary record
+            # frame, and utf-8 replacement destroys exactly the bytes a test
+            # needs to assert on.
+            out.write_bytes(topic.encode() + b" " + payload)
         elif ptype == PINGREQ:
             conn.sendall(bytes([PINGRESP << 4, 0x00]))
         elif ptype == DISCONNECT:

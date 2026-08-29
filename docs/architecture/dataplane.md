@@ -63,6 +63,13 @@ not baked, so one pipeline binary runs any pipeline. An `ir_stages` param lowers
 at load into a single default-version table; a `versions` param supplies a
 ready-made multi-version table.
 
+The pipeline also speaks the ordered-ack exchange surface in both directions:
+wire `publish_out`/`ack_in` and results leave as correlated publishes to any
+provider of the surface; wire `publish_in`/`ack_out` and the pipeline is the
+sink, taking each publish's payload as its record and acknowledging it once
+its output is accepted downstream (see
+[connectors.md](connectors.md#the-exchange-surface)).
+
 ## The aggregation module
 
 `app/aggregation` is the on-device event-time engine

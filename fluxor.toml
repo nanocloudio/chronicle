@@ -19,8 +19,9 @@ wave = "0.0.1"
 # modules: the IdP is chronicle's generic engines routing to kagi's, and
 # without this pin the graph names modules the store cannot resolve.
 kagi = "0.0.1"
-# MQTT/Kafka/AMQP messaging is Quantum's domain; `examples/mqtt_sink/` composes
-# quantum's `mqtt_client` (fluxor's old `mqtt` foundation module was retired).
+# MQTT/Kafka/AMQP messaging is Quantum's domain. `examples/pipeline_egress/`
+# composes quantum's `mqtt_sink`, an ordered-ack provider, so the pipeline
+# publishes through the contract and names no protocol.
 quantum = "0.0.1"
 # loam supplies the object/metadata tier the registry stores into. The SigV4
 # S3 connector itself is wave's `s3` module: signing an HTTP request is

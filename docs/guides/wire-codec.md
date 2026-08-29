@@ -26,9 +26,9 @@ There is no template language. `encode` / `decode` programs are assembled from
 the opcode constants below and hex-encoded into the param — see
 [`tests/harness/tests/pipeline_suites/ser.rs`](../../tests/harness/tests/pipeline_suites/ser.rs)
 and [`deser.rs`](../../tests/harness/tests/pipeline_suites/deser.rs) for worked
-programs, and `examples/mqtt_sink/linux.yaml` for one in service: it renders the
-`[topic_len:u8][topic]<id>=<amount>` publish frame that quantum's `mqtt_client`
-takes on `app_in`.
+programs, and `examples/identity_provider/chronicle_authorize.yaml` for one in
+service: it renders an HTTP `POST /oauth/authorize` request, length-framed body
+included, for the IdP's authorize endpoint.
 
 ## `ser` — record → bytes
 

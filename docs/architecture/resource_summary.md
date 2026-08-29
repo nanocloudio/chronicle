@@ -24,9 +24,13 @@ emits are the baseline (14) plus its own, verified by
 | decision | bcm2712 | result_out | output | 4096 | 4096 | 21 |
 | expression | bcm2712 | record_in | input | 4096 | 4096 | 17 |
 | expression | bcm2712 | result_out | output | 4096 | 4096 | 17 |
-| pipeline | bcm2712 | record_in | input | 4096 | 4096 | 20 |
-| pipeline | bcm2712 | result_out | output | 4096 | 4096 | 20 |
-| pipeline | bcm2712 | control | ctrl_input | 4096 | 4096 | 20 |
+| pipeline | bcm2712 | record_in | input | 4096 | 4096 | 26 |
+| pipeline | bcm2712 | result_out | output | 4096 | 4096 | 26 |
+| pipeline | bcm2712 | publish_out | output | 4112 | 16448 | 26 |
+| pipeline | bcm2712 | ack_in | input | 12 | 512 | 26 |
+| pipeline | bcm2712 | publish_in | input | 8720 | 34880 | 26 |
+| pipeline | bcm2712 | ack_out | output | 12 | 512 | 26 |
+| pipeline | bcm2712 | control | ctrl_input | 4096 | 4096 | 26 |
 
 Generated from `modules/app/*/manifest.toml`. Steady-state modules also
 declare a per-step budget of one record plus pending-output drain,

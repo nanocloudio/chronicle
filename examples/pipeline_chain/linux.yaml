@@ -1,0 +1,41 @@
+# TWO PIPELINES CHAINED OVER THE ORDERED-ACK EXCHANGE SURFACE.
+#
+# `first` publishes its results on `publish_out`; `second` is the sink — it
+# takes each publish's payload as its record on `publish_in` and answers on
+# `ack_out` once its own result is accepted downstream. The same wiring that
+# reaches an MQTT topic or a Kafka partition reaches another pipeline, and
+# the acks are what let `first` keep publishing: its in-flight window is
+# released only by `second`'s answers.
+#
+# Both stages double `amount`, so {1: id, 2: n} leaves as {1: id, 2: 4n}.
+#
+#   fluxor run examples/pipeline_chain/linux.yaml < records.bin
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+
+modules:
+  - name: first
+    type: pipeline
+    params:
+      # One stage: {1: id, 2: amount * 2}, as `chronicle compile-stages` emits it.
+      ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+  - name: second
+    type: pipeline
+    params:
+      ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: first.record_in
+  # The surface: records out as publishes, acks back.
+  - from: first.publish_out
+    to: second.publish_in
+  - from: second.ack_out
+    to: first.ack_in
+  - from: second.result_out
+    to: cli_out.bytes_in

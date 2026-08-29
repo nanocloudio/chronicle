@@ -2,6 +2,11 @@ version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
+# Cadence-independent: windows are EVENT time carried in the records, the
+# checkpoint interval counts events, and telemetry reads the device clock.
+# Nothing here measures time in ticks, so a variable-cadence domain cannot
+# change what it computes — only when it gets to compute it.
+timer_class     = "agnostic"
 
 
 # Input: one or more typed event record frames (see agg_core.rs). Each frame is

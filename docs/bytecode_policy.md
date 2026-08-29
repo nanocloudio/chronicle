@@ -160,7 +160,8 @@ Rarely legitimate, but not never — arithmetic and comparison operators are
 in-fence. The bar:
 
 - It is a **pure, total function** of its operands (no trap, no unbounded work).
-  Division must define its zero case as a value, not a fault.
+  Division's zero case is a structured `DivByZero` error, as in CEL — never a
+  trap.
 - It **cannot** change control flow.
 - It comes with conformance vectors and fuzz coverage in the same change.
 - The host evaluator and the `.fmod` share one source (`*_core.rs`, `include!`d)

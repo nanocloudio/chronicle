@@ -2,6 +2,8 @@ version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
+# Cadence-independent: a pure record transform with no notion of time at all.
+timer_class     = "agnostic"
 
 
 # Input: one typed record frame (the canonical `pipeline_core` frame) per unit,

@@ -31,10 +31,15 @@
 // Requires `pack_core` (the `ir_stages` container), `hex_core` (param encoding)
 // and `graph_core` (the `GraphError` vocabulary and the layout it defines).
 
-/// Version tag of the sibling-owned provider modules this composes. Providers
-/// publish under `<silicon>/<module>:<PROVIDER_VERSION>` in the fluxor OCI
-/// store; the deploy driver pins that reference so the build resolves the module
-/// from the store rather than from a Chronicle-owned `.fmod`.
+/// Default version tag for a sibling-owned provider. Providers publish under
+/// `<silicon>/<module>:<version>` in the fluxor OCI store; the deploy driver
+/// pins that reference so the build resolves the module from the store rather
+/// than from a Chronicle-owned `.fmod`.
+///
+/// This is only the FALLBACK. Siblings release independently, so one constant
+/// for every provider is wrong as soon as any of them cuts a version — the pin
+/// would resolve to an artifact that exists under a different tag, or to
+/// nothing. A binding's `version` field gives each provider its own.
 pub const PROVIDER_VERSION: &[u8] = b"0.1.0";
 
 /// A connector effect binding: which capability a Resource effect realizes, plus
@@ -44,86 +49,105 @@ pub const PROVIDER_VERSION: &[u8] = b"0.1.0";
 /// -> provider choice is DATA, not judgment. An empty `password` on Redis means
 /// no password, matching the host's `Option`.
 #[derive(Clone, Copy)]
-pub enum Connector<'a> {
-    Redis {
-        endpoint_hex: &'a [u8],
-        password: &'a [u8],
-    },
-    Pg {
-        endpoint_hex: &'a [u8],
-        user: &'a [u8],
-        database: &'a [u8],
-        password: &'a [u8],
-    },
-    Kafka {
-        endpoint_hex: &'a [u8],
-        client_id: &'a [u8],
-        topic: &'a [u8],
-    },
-    Mongo {
-        endpoint_hex: &'a [u8],
-        user: &'a [u8],
-        database: &'a [u8],
-        password: &'a [u8],
-        collection: &'a [u8],
-    },
+pub struct Connector<'a> {
+    /// The DOCUMENT's word for this effect (`b"kafka"`), used as the base node
+    /// instance name and its `<kind>N` suffix. Not the provider's name.
+    pub kind: &'a [u8],
+    /// The provider module that realizes the capability — the node's `type:`.
+    /// A deployment's pin, not a choice made here.
+    pub provider: &'a [u8],
+    /// The version tag that provider publishes under. Per provider, because
+    /// siblings release independently and one shared constant mispins the
+    /// moment two of them diverge.
+    pub version: &'a [u8],
+    /// The port pair the graph wires: records in, answer out.
+    pub in_port: &'a [u8],
+    pub out_port: &'a [u8],
+    /// Whether the provider ANSWERS WITH DATA — the `reply` capability fact.
+    /// A provider that does not reply terminates its chain: its output port
+    /// carries an acknowledgement or a status line, not a record a next stage
+    /// could read.
+    pub replies: bool,
+    /// The node's params, in the provider manifest's order: `(name, value,
+    /// quoted)`. `quoted = false` emits the value bare, which a numeric param
+    /// requires — a provider's `u32` decoder rejects `"167772161"`.
+    ///
+    /// The NAMES ARE THE PROVIDER'S and they arrive from the caller. That is
+    /// the point of this shape: nothing here knows what any provider calls
+    /// its params, so binding a new destination is a deployment change, not a
+    /// code change in this file.
+    pub params: &'a [(&'a [u8], &'a [u8], bool)],
 }
 
 impl Connector<'_> {
-    /// The connector's kind tag — the base node INSTANCE name (and, repeated, the
-    /// `<kind>N` suffix). The node's `type:` is the provider module, not this.
+    /// The connector's kind tag — the base node INSTANCE name.
     ///
-    /// Deliberately not `fn(&self) -> &'static [u8]`: a match returning static
-    /// references compiles to a table of (pointer, len) pairs, and static pointer
-    /// tables do not relocate in a PIC module. Every accessor here appends into a
-    /// caller buffer for that reason.
+    /// Appends into a caller buffer rather than returning a `&'static [u8]`:
+    /// a match returning static references compiles to a table of
+    /// (pointer, len) pairs, and static pointer tables do not relocate in a
+    /// PIC module. Every field here is caller-supplied for the same reason —
+    /// a descriptor TABLE would not survive loading, but a slice the caller
+    /// owns does.
     pub fn kind(&self, out: &mut [u8]) -> Result<usize, GraphError> {
-        match self {
-            Connector::Redis { .. } => gput(out, 0, b"redis"),
-            Connector::Pg { .. } => gput(out, 0, b"pg"),
-            Connector::Kafka { .. } => gput(out, 0, b"kafka"),
-            Connector::Mongo { .. } => gput(out, 0, b"mongo"),
-        }
+        gput(out, 0, self.kind)
     }
 
-    /// The sibling-owned provider module that realizes this capability — the
-    /// graph node's `type:`. Silicon-independent; [`provider_pin`] adds the
-    /// silicon-scoped store reference.
-    ///
-    /// [`provider_pin`]: Connector::provider_pin
+    /// The sibling-owned provider module that realizes this capability.
     pub fn provider_module(&self, out: &mut [u8]) -> Result<usize, GraphError> {
-        match self {
-            Connector::Redis { .. } => gput(out, 0, b"redis_client"), // Lattice
-            Connector::Pg { .. } => gput(out, 0, b"pg_client"),       // Lattice
-            Connector::Kafka { .. } => gput(out, 0, b"kafka_client"), // Quantum
-            Connector::Mongo { .. } => gput(out, 0, b"mongo_client"), // Lattice
-        }
+        gput(out, 0, self.provider)
     }
 
-    /// The store pin to record so the build composes this capability's provider
-    /// from the OCI store, scoped to `silicon` (e.g. `b"bcm2712"`):
-    /// `<silicon>/<module>:<PROVIDER_VERSION>`.
+    /// Whether a stage may follow this effect. See [`Connector::replies`].
+    pub fn replies(&self) -> bool {
+        self.replies
+    }
+
+    /// The store pin to record so the build composes this capability's
+    /// provider from the OCI store, scoped to `silicon`:
+    /// `<silicon>/<module>:<version>`.
     pub fn provider_pin(&self, silicon: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
-        let mut m = [0u8; 32];
-        let n = self.provider_module(&mut m)?;
         let mut p = gput(out, 0, silicon)?;
         p = gput(out, p, b"/")?;
-        p = gput(out, p, &m[..n])?;
+        p = gput(out, p, self.provider)?;
         p = gput(out, p, b":")?;
-        gput(out, p, PROVIDER_VERSION)
+        gput(out, p, self.version)
     }
 
     /// This connector's `(data_in, data_out)` port names.
     fn ports(&self, inp: &mut [u8], outp: &mut [u8]) -> Result<(usize, usize), GraphError> {
-        match self {
-            Connector::Redis { .. } | Connector::Pg { .. } => {
-                Ok((gput(inp, 0, b"request_in")?, gput(outp, 0, b"reply_out")?))
-            }
-            Connector::Kafka { .. } | Connector::Mongo { .. } => {
-                Ok((gput(inp, 0, b"publish_in")?, gput(outp, 0, b"status_out")?))
-            }
-        }
+        Ok((gput(inp, 0, self.in_port)?, gput(outp, 0, self.out_port)?))
     }
+}
+
+/// One deployment-supplied binding: which provider realizes a document's
+/// named `resource`.
+///
+/// A `.uproc` declares `resource orders_store required;` and never says what
+/// serves it — "binding supplied at deploy time", which is the whole point of
+/// the declaration. This is that supply. The document names WHAT it needs; a
+/// deployment names WHICH provider, and the two meet here.
+#[derive(Clone, Copy)]
+pub struct ResourceBinding<'a> {
+    /// The `resource` name as the document spells it.
+    pub resource: &'a [u8],
+    /// The provider bound to it.
+    pub connector: Connector<'a>,
+}
+
+/// Find the binding for a named resource, or `None` when the deployment
+/// supplied none — which is a deployment error, not a document error.
+pub fn resolve_binding<'a>(
+    bindings: &'a [ResourceBinding<'a>],
+    resource: &[u8],
+) -> Option<&'a Connector<'a>> {
+    let mut i = 0;
+    while i < bindings.len() {
+        if bindings[i].resource == resource {
+            return Some(&bindings[i].connector);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// One resolved stage of a pipeline, ready to lower.
@@ -241,54 +265,43 @@ fn emit_param(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usiz
     gput(out, p, b"\"\n")
 }
 
-/// Emit a connector node's params, in the provider manifest's order.
+/// Emit a connector node's params, in the order the caller gave them.
+///
+/// One loop, no provider knowledge. Every param name, value and quoting
+/// decision arrives on the binding — which is what makes adding a
+/// destination a deployment change rather than an edit here, and what keeps
+/// a provider's param rename from silently breaking chronicle: a graph naming
+/// a param the provider does not accept builds fine and is refused at load,
+/// so the names must come from the deployment that knows the provider.
 fn emit_connector_params(out: &mut [u8], p: usize, c: &Connector) -> Result<usize, GraphError> {
-    match c {
-        Connector::Redis {
-            endpoint_hex,
-            password,
-        } => {
-            let p = emit_param(out, p, b"endpoint", endpoint_hex)?;
-            if password.is_empty() {
-                Ok(p)
-            } else {
-                emit_param(out, p, b"password", password)
-            }
+    let mut p = p;
+    for (key, value, quoted) in c.params {
+        // An empty value means "not set": omitted so the provider's own
+        // default applies, rather than emitting an empty string it would
+        // have to interpret.
+        if value.is_empty() {
+            continue;
         }
-        Connector::Pg {
-            endpoint_hex,
-            user,
-            database,
-            password,
-        } => {
-            let mut p = emit_param(out, p, b"endpoint", endpoint_hex)?;
-            p = emit_param(out, p, b"user", user)?;
-            p = emit_param(out, p, b"database", database)?;
-            emit_param(out, p, b"password", password)
-        }
-        Connector::Kafka {
-            endpoint_hex,
-            client_id,
-            topic,
-        } => {
-            let mut p = emit_param(out, p, b"endpoint", endpoint_hex)?;
-            p = emit_param(out, p, b"client_id", client_id)?;
-            emit_param(out, p, b"produce_topic", topic)
-        }
-        Connector::Mongo {
-            endpoint_hex,
-            user,
-            database,
-            password,
-            collection,
-        } => {
-            let mut p = emit_param(out, p, b"endpoint", endpoint_hex)?;
-            p = emit_param(out, p, b"user", user)?;
-            p = emit_param(out, p, b"database", database)?;
-            p = emit_param(out, p, b"password", password)?;
-            emit_param(out, p, b"collection", collection)
-        }
+        p = if *quoted {
+            emit_param(out, p, key, value)?
+        } else {
+            emit_param_raw(out, p, key, value)?
+        };
     }
+    Ok(p)
+}
+
+/// Emit one param with the value unquoted, `  key: 1234`.
+///
+/// A numeric param needs this: a provider's `u32` decoder rejects
+/// `"167772161"`, and whether a value is numeric is the provider's fact, so
+/// it rides on the binding rather than being inferred from the bytes.
+fn emit_param_raw(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usize, GraphError> {
+    let mut p = gput(out, p, b"      ")?;
+    p = gput(out, p, key)?;
+    p = gput(out, p, b": ")?;
+    p = gput(out, p, value)?;
+    gput(out, p, b"\n")
 }
 
 /// Emit one `wiring:` edge, `  - from: <a>\n    to: <b>\n`.
@@ -342,7 +355,14 @@ pub fn lower_pipeline_with(
 
     // Per-kind instance counts, so repeated nodes get stable unique names.
     let (mut pipe_n, mut decision_n) = (0usize, 0usize);
-    let (mut redis_n, mut pg_n, mut kafka_n, mut mongo_n) = (0usize, 0usize, 0usize, 0usize);
+    // Per-KIND instance counters, keyed by the document's own word for the
+    // effect: a second `redis` is `redis2`, while the first `kafka` starts
+    // fresh. The kinds are whatever the bindings name, so the table is
+    // discovered as the plan is walked.
+    let mut kind_names = [[0u8; NAME_CAP]; MAX_CHAIN];
+    let mut kind_lens = [0usize; MAX_CHAIN];
+    let mut kind_counts = [0usize; MAX_CHAIN];
+    let mut kinds_seen = 0usize;
 
     // Modules are emitted as the plan is walked; wiring needs the whole chain, so
     // it is emitted afterwards from `chain`.
@@ -420,17 +440,37 @@ pub fn lower_pipeline_with(
             }
             PlanStage::Effect(binding) => {
                 needs_net = true;
-                let n = match binding {
-                    Connector::Redis { .. } => &mut redis_n,
-                    Connector::Pg { .. } => &mut pg_n,
-                    Connector::Kafka { .. } => &mut kafka_n,
-                    Connector::Mongo { .. } => &mut mongo_n,
-                };
+                // A provider that does not answer with data terminates the
+                // chain. Checked BEFORE the node is emitted, so a bad plan
+                // fails to lower rather than lowering to a bad graph.
+                if !binding.replies() && i + 1 < stages.len() {
+                    return Err(GraphError::EffectNotChainable);
+                }
                 let mut base = [0u8; NAME_CAP];
                 let bl = binding.kind(&mut base)?;
+
+                // Find this kind's counter, or start one.
+                let mut slot = kinds_seen;
+                let mut k = 0usize;
+                while k < kinds_seen {
+                    if kind_lens[k] == bl && kind_names[k][..bl] == base[..bl] {
+                        slot = k;
+                        break;
+                    }
+                    k += 1;
+                }
+                if slot == kinds_seen {
+                    if kinds_seen >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
+                    kind_names[slot][..bl].copy_from_slice(&base[..bl]);
+                    kind_lens[slot] = bl;
+                    kinds_seen += 1;
+                }
+
                 let mut name = [0u8; NAME_CAP];
-                let nl = instance_name(&base[..bl], *n, &mut name)?;
-                *n += 1;
+                let nl = instance_name(&base[..bl], kind_counts[slot], &mut name)?;
+                kind_counts[slot] += 1;
 
                 let (mut ip, mut op) = ([0u8; NAME_CAP], [0u8; NAME_CAP]);
                 let (il, ol) = binding.ports(&mut ip, &mut op)?;

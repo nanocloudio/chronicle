@@ -8,16 +8,16 @@
 #     lattice: pg_edge_anchor → executor → router → consensus → WAL/NVMe
 #                                             │ committed puts (table 1)
 #                                             ▼
-#                     cdc_pump ──publish──┬─▶ loopback_sink (owns the acks)
-#                                         └─▶ B: dec_evt → keep_puts → flip
-#                                                → enc_sql → pg_client ──┘
+#                     cdc_pump ──publish──▶ B: dec_evt → keep_puts → flip
+#                              ◀── ack ───     → enc_sql → pg_client ──┘
 #
 # The SAME application as run.sh's distributed shape — identical uproc
 # containers, identical codec programs where the wire is identical — with
 # two deployment substitutions and zero logic changes:
-#   - the MQTT broker leg becomes an in-graph TEE of the pump's publish
-#     channel (loopback_sink still consumes it and answers the ordered_ack
-#     protocol; pipeline B reads the same frames passively), and
+#   - the MQTT broker leg becomes pipeline B itself: dec_evt is the pump's
+#     ordered-ack sink (`publish_in`/`ack_out`), so every CDC event is
+#     acknowledged by the pipeline that consumed it, and the pump's
+#     in-flight window is the backpressure between store and app, and
 #   - the pg_client connections ride the ip module's LOCAL-DELIVERY
 #     fastpath (fluxor ip: a connect to 127.0.0.1 binds a conn pair
 #     against the local listener — no TCP, no ARP), which is what makes a
@@ -165,7 +165,6 @@ modules:
       # drain repeating forever, SQL timing out behind it — the rig
       # soak's "storage dead at burst 3"). 15 s lets a burst drain.
       stall_grace_ms: 15000
-  - name: loopback_sink
 
 
   # ═══ THE APPLICATION — wave http + the three chronicle pipelines ═══
@@ -179,7 +178,8 @@ modules:
   # Containers compiled from reverser.uproc; codecs annotated in the
   # linux graphs (reverser_a/b/c.yaml) — identical bytes where the wire
   # is identical. The one new codec is dec_evt's: it reads the pump's
-  # raw SinkPublish channel frames instead of MQTT subscriber frames.
+  # publish PAYLOAD (the cdc_wire envelope) instead of MQTT subscriber
+  # frames — the pipeline's ingress strips the publish framing itself.
   - name: http
     # The `app` variant: h1 + the HANDLER_APP fan-out and nothing else
     # (−84 KB vs full). The netboot path has an empirical ~3.6 MB image
@@ -245,9 +245,10 @@ modules:
     type: pipeline
     params:
       ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
-      # [0xED][len][corr:u64][flags][klen:u16][plen:u16][msg_key] then the
-      # cdc_wire envelope. Every kind decodes cleanly; keep_puts filters.
-      decode: "710100ed70020070090075020170020074400400000071020001007501014003000000700d00750201744002000000750801400100000041"
+      # The cdc_wire envelope: [01 00][kind:u8] → f3, 13 bytes skipped,
+      # [len:u16][key] → f2, [commit_ts:u64] → f1. Every kind decodes
+      # cleanly; keep_puts filters.
+      decode: "71020001007501014003000000700d00750201744002000000750801400100000041"
   - name: keep_puts
     type: decision
     params:
@@ -390,25 +391,12 @@ wiring:
     to: kv_request_router.etcd_in
   - from: kv_request_router.etcd_out
     to: cdc_pump.kv_in
-  # The publish channel is TEED: the sink consumes + acks (the ordered_ack
-  # contract), pipeline B reads the SAME frames passively. buffer_group =
-  # mailbox mode so each SinkPublish frame arrives whole.
+  # Pipeline B is the pump's ordered-ack sink: it acks each event once the
+  # INSERT it produced is accepted downstream, and the pump's in-flight
+  # window bounds how far the store can run ahead of the app.
   - from: cdc_pump.publish_out
-    to: loopback_sink.publish_in
-    buffer_group: 5
-    buffer_bytes: 16384
-  # B's tee leg gets REAL headroom. The tee blocks when ANY leg is full,
-  # and B consumes one event per step while its own INSERTs contend with
-  # the pump's scans for the store — without this buffer a burst fills
-  # the leg, the tee stalls, the sink stops ACKING, and the pump replays
-  # its window forever (measured: 5000+ scans opened, SQL starved dead).
-  # 64 KiB absorbs ~600 queued envelopes; the sink leg stays snappy and
-  # the ack stream never couples to B's pace.
-  - from: cdc_pump.publish_out
-    to: dec_evt.record_in
-    buffer_group: 6
-    buffer_bytes: 65536
-  - from: loopback_sink.ack_out
+    to: dec_evt.publish_in
+  - from: dec_evt.ack_out
     to: cdc_pump.ack_in
 
   # ── Observability fan-in → operations → HTTP /metrics ───────────
@@ -446,7 +434,7 @@ wiring:
     to: http.resp_in
     buffer_group: 14
 
-  # B (dec_evt.record_in is fed by the publish tee above)
+  # B (dec_evt.publish_in is fed by the pump above)
   - from: dec_evt.result_out
     to: keep_puts.record_in
   - from: keep_puts.result_out

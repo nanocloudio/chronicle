@@ -149,6 +149,7 @@ use tc::{
     oci_push,
     oci_resolve_tag,
     param_message_name,
+    parse_bindings,
     parse_i64,
     plan_activation,
     print_digest,
@@ -184,9 +185,11 @@ use tc::{
     version_digest,
     ActivationError,
     AggregationSpec,
+    BindingParamStore,
     BindingSpec,
     BlobError,
     CkptError,
+    Connector,
     DecisionSpec,
     Doc,
     EntrySpec,
@@ -204,6 +207,7 @@ use tc::{
     PushBufs,
     RegError,
     ReleaseError,
+    ResourceBinding,
     RuleSource,
     RuleSpec,
     SlotError,
@@ -227,6 +231,8 @@ use tc::{
     KIND_SCHEMA,
     KIND_TRANSFORMATION,
     MAX_ARGV,
+    MAX_BINDINGS,
+    MAX_BINDING_PARAMS,
     MAX_ITEMS,
     MAX_SET,
     MAX_VERSIONS,
@@ -1119,7 +1125,13 @@ fn cmd_compile_stages(
 /// An `Effect` stage is refused rather than guessed: a connector binding names an
 /// endpoint and credentials that exist nowhere in the document, and inventing a
 /// default would emit a graph that looks runnable and points at nothing.
-fn cmd_graph(s: &mut State, hex: &[u8], pipeline: &[u8], target: &[u8]) -> (usize, i32) {
+fn cmd_graph(
+    s: &mut State,
+    hex: &[u8],
+    pipeline: &[u8],
+    target: &[u8],
+    bindings_spec: &[u8],
+) -> (usize, i32) {
     let Some(n) = hex_decode(hex, &mut s.ir) else {
         return (append(&mut s.out, 0, b"error: not valid hex\n"), 1);
     };
@@ -1139,6 +1151,26 @@ fn cmd_graph(s: &mut State, hex: &[u8], pipeline: &[u8], target: &[u8]) -> (usiz
         operators: &mut s.u_operators,
         entries: &mut s.u_entries,
     };
+    // The deployment's half of the document: which provider serves each
+    // `resource` the pipeline declares.
+    let mut param_store: BindingParamStore =
+        [[(b"".as_slice(), b"".as_slice(), true); MAX_BINDING_PARAMS]; MAX_BINDINGS];
+    let mut binds = [ResourceBinding {
+        resource: b"",
+        connector: Connector {
+            kind: b"",
+            provider: b"",
+            version: b"",
+            in_port: b"",
+            out_port: b"",
+            replies: false,
+            params: &[],
+        },
+    }; MAX_BINDINGS];
+    let Some(nb) = parse_bindings(bindings_spec, &mut param_store, &mut binds) else {
+        return (append(&mut s.out, 0, b"error: malformed binding spec\n"), 1);
+    };
+
     graph_document(
         &s.ir[..n],
         &mut arena,
@@ -1149,6 +1181,7 @@ fn cmd_graph(s: &mut State, hex: &[u8], pipeline: &[u8], target: &[u8]) -> (usiz
         &mut s.out,
         pipeline,
         target,
+        &binds[..nb],
     )
 }
 
@@ -1720,6 +1753,7 @@ fn pipe_err_name(e: tc::PipeError) -> &'static [u8] {
             EvalError::TypeError => b"stage eval: type error",
             EvalError::BuildOverflow => b"stage eval: too many constructed fields",
             EvalError::BadBuiltin(_) => b"stage eval: builtin not in this build",
+            EvalError::DivByZero => b"stage eval: division by zero",
             EvalError::ScratchOverflow => b"stage eval: scratch arena overflow (STAGE_SCRATCH_CAP)",
             EvalError::BadLocal(_) => b"stage eval: bad cel.bind local slot",
         },
@@ -2027,7 +2061,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         } else {
                             b"bcm2712".as_slice()
                         };
-                        cmd_graph(s, &arec[a..b], &arec[c..d], target)
+                        // argv[4]: the deployment's bindings, optional — a
+                        // document with no `effect` needs none.
+                        let bindings = if argc >= 5 {
+                            let (g, h) = argv[4];
+                            &arec[g..h]
+                        } else {
+                            b"".as_slice()
+                        };
+                        cmd_graph(s, &arec[a..b], &arec[c..d], target, bindings)
                     } else {
                         (
                             append(

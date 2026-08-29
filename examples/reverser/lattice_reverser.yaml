@@ -3,7 +3,7 @@
 # `single-models-cdc.yaml`'s proven back half (consensus, WAL durability,
 # MVCC timestamp leases, ordered disk state-store, cdc_pump) carrying the
 # §14.1 relational front (pg_edge_anchor + relational_executor) instead of
-# the model surface, and quantum's `mqtt_sink` (stream.sink.ordered_ack)
+# the model surface, and quantum's `mqtt_sink` (stream.ordered_ack)
 # instead of the in-repo loopback provider — so committed writes to the
 # `inbound` table leave as CDC envelopes on a real MQTT broker.
 #
@@ -102,12 +102,13 @@ modules:
       topic: "lattice/cdc/feed1"
   - name: compaction_coordinator
 
-  # ── Observability: metric fan-in + HTTP /metrics ────────────────
+  # ── Observability: metric fan-in ────────────────────────────────
+  # `operations` emits metrics only. A /metrics endpoint is composed by
+  # wiring wave's `http` in front of it, not configured here.
   - name: adapter_metrics
   - name: operations
     params:
       emit_interval_ms: 250
-      listen_port: ${REV_OPS_PORT:-29191}
 
 wiring:
   # ── TCP transport ───────────────────────────────────────────────

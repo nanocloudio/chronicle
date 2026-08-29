@@ -1,0 +1,52 @@
+# A PIPELINE PUBLISHING THROUGH THE ORDERED-ACK EXCHANGE SURFACE.
+#
+# The point of this graph is what is NOT in it. The pipeline names no broker,
+# no topic, no protocol: it doubles order.amount (an IR stage) and emits the
+# result as a `SinkPublish` frame on `publish_out`. Everything MQTT lives in
+# quantum's `mqtt_sink`, which is reached only by a wire.
+#
+# Swapping the destination is one line — `mqtt_sink` becomes `kafka_sink` or
+# `amqp_sink`, which declare the same `stream.ordered_ack.sink` capability and
+# the same port pair — and the pipeline is untouched. That is the whole thesis
+# of the surface, and this is the graph that demonstrates it.
+#
+# The pipeline carries no `encode` program: there is no publish frame to
+# hand-render, because framing for the surface is the contract's, not the
+# graph author's. And because the sink answers on `ack_out`, the pipeline
+# learns whether each record was durably accepted.
+#
+#   fluxor run examples/pipeline_egress/linux.yaml
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: pipeline
+    params:
+      # One stage: {1: id, 2: amount * 2}, as `chronicle compile-stages` emits it.
+      ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+  - name: mqtt_sink
+    params:
+      broker_ip: 2130706433    # 127.0.0.1
+      broker_port: 11883
+      client_id: "chronicle-egress"
+      topic: "cu/orders"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  # The surface: records out, durable acks back.
+  - from: pipeline.publish_out
+    to: mqtt_sink.publish_in
+  - from: mqtt_sink.ack_out
+    to: pipeline.ack_in
+  # Transport, owned by the provider.
+  - from: mqtt_sink.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: mqtt_sink.net_in

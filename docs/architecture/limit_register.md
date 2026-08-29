@@ -25,13 +25,15 @@ Dimensions: **B**=bytes, **rec**=records/frames, **fld**=fields, **st**=stages,
 |---|---|---|---|---|---|---|---|---|---|
 | `REC_BUF` | 4096 | B | per record, per module | capacity | oversized frame → `BoundaryLost` → `inputs_rejected`, channel reset (consumed: whole stream drained) | one in + one out buffer per module = 8 KiB state | one typed frame; matches the port `max_record` every graph declares | fix-forward format change moves all producers+consumers together | `expression::an_oversized_frame…`, `decision::an_oversized_frame…` |
 | `STAGE_SCRATCH_CAP` | 512 | B | per record | capacity | scratch exhaustion → eval error → `inputs_failed` (consumed) | on the step, not retained | one record's field-construction scratch | larger module variant | `pipeline` stage suites |
-| `MAX_BUILD_FIELDS` | 16 | fld | per record | v1 invariant | field 17 → decode/build reject (consumed) | 16 × `Field` per decode frame | a typed record's field count; the same bound the codec admits | fix-forward format change | `pipeline_core` frame suites |
+| `MAX_BUILD_FIELDS` | 32 | fld | per record | v1 invariant | field 33 → decode/build reject (consumed) | 32 × `Field` per decode frame | a typed record's field count; the same bound the codec admits | fix-forward format change | `pipeline_core` frame suites |
 
 ## Pipeline
 
 | Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
 |---|---|---|---|---|---|---|---|---|---|
 | `MAX_STAGES` | 8 | st | per record | capacity | `stage_count > MAX_STAGES` → `inputs_failed`, never truncated (consumed) | 8 × `Stage` descriptor on the step | a bounded pipeline depth; a longer chain is a graph of nodes | larger variant | `pipeline::…over_cap_stage…` |
+| `INGRESS_BUF` | `PAYLOAD_MAX` (8192) | B | per module (pipeline) | capacity | publish payload > ceiling → OVERSIZE refusal, frame consumed (consumed: yes, counted) | one intake buffer | a sink for any producer of the exchange surface takes the contract's whole payload; the decoded record is still one `REC_BUF` frame | tracks the contract | `tools/e2e/pipeline-chain.sh`, `examples/reverser/reverser_pi5.yaml` (build fact check) |
+| `MAX_INFLIGHT` | 8 | rec | per module | capacity | window full → no record admitted until the destination answers (backpressure, consumed: no) | one counter; the frames live downstream | publishes unacknowledged at once on the exchange surface | larger variant | `tools/e2e/pipeline-chain.sh` (more records than the window, all delivered) |
 | `MAX_VERSIONS` | 8 | ver | per module | capacity | reload adding a 9th version → reload rejected, active table unchanged | version table in `VBIN_BUF` | concurrent blue/green + a few pinned generations | larger variant | `pipeline::hot_reload…` |
 | `VERSION_TAG_CAP` | 24 | B | per version | capacity | tag > 24 B → reload rejected (control msg, not a record) | 24 B × versions | a version label, not a payload | fix-forward | `version_core` suites |
 | `VBIN_BUF` | 8192 | B | per module | capacity | candidate table > 8 KiB → reload rejected, active unchanged | one active + one candidate = 16 KiB | the compiled version table (all stages of all versions) | larger variant | `pipeline_lifecycle` reload |
@@ -82,7 +84,9 @@ MAX_WIN_PER_EVENT | modules/common/agg_core.rs | 8
 COLL_CAP | modules/common/agg_core.rs | 16
 KEY_CAP | modules/common/agg_core.rs | 48
 MAX_STAGES | modules/app/pipeline/mod.rs | 8
-MAX_BUILD_FIELDS | modules/common/vm_core.rs | 16
+MAX_INFLIGHT | modules/app/pipeline/mod.rs | 8
+INGRESS_BUF | modules/app/pipeline/mod.rs | PAYLOAD_MAX
+MAX_BUILD_FIELDS | modules/common/vm_core.rs | 32
 MAX_VERSIONS | modules/common/version_core.rs | 8
 VERSION_TAG_CAP | modules/common/version_core.rs | 24
 MAX_LOCALS | modules/common/vm_core.rs | 8

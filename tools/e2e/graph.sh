@@ -57,15 +57,43 @@ printf '%s\n' "$host" | grep -q 'cli_in.stdin_out' \
   && ok "the linux profile brackets the chain with cli" \
   || no graph "linux profile did not emit cli edges"
 
-# Fail-closed, not fail-plausible: an effect names an endpoint and credentials
-# that exist nowhere in the document, so a binding cannot be invented. Emitting
-# a graph that points at nothing would be worse than refusing.
+# Fail-closed, not fail-plausible: a document declares WHAT it needs
+# (`resource orders_store required`) and never what serves it, so a binding
+# cannot be invented. Emitting a graph that points at nothing would be worse
+# than refusing.
 eff=$(hex_of examples/authoring/process_order.uproc)
 out=$(cli graph "$eff" process 2>/dev/null)
 case "$out" in
-  *"connector binding is not in the document"*)
-    ok "an unbound effect is refused rather than guessed" ;;
-  *) no graph "expected an unbound-effect refusal, got: '$(printf '%s' "$out" | head -1)'" ;;
+  *"has no binding"*)
+    ok "an unbound resource is refused rather than guessed" ;;
+  *) no graph "expected an unbound-resource refusal, got: '$(printf '%s' "$out" | head -1)'" ;;
+esac
+
+# ...and the other half: SUPPLY the binding and the same document lowers. This
+# is the deployment's answer to the document's question, and the whole reason
+# `resource` is a declaration rather than an endpoint literal. Every field here
+# is the PROVIDER's — module name, port names, param names — so binding a
+# different destination is this string changing, not chronicle changing.
+BIND='orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,endpoint=7f000001;user=app;database=orders'
+out=$(cli graph "$eff" process bcm2712 "$BIND" 2>/dev/null)
+case "$out" in
+  *"type: pg_client"*)
+    if printf '%s' "$out" | grep -q 'endpoint: "7f000001"' &&
+       printf '%s' "$out" | grep -q 'to: pg.request_in'; then
+      ok "a bound resource lowers to its provider, ports and params"
+    else
+      no graph "bound effect lowered without the provider's params/ports: $(printf '%s' "$out" | head -3)"
+    fi ;;
+  *) no graph "expected a lowered pg_client node, got: '$(printf '%s' "$out" | head -2)'" ;;
+esac
+
+# A numeric param is emitted UNQUOTED: a provider's u32 decoder rejects
+# `"167772161"`, and which params are numeric is the provider's fact.
+BIND_NUM='orders_store,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,broker_ip=#167772161;topic=orders'
+out=$(cli graph "$eff" process bcm2712 "$BIND_NUM" 2>/dev/null)
+case "$out" in
+  *"broker_ip: 167772161"*) ok "a numeric param is emitted unquoted" ;;
+  *) no graph "expected an unquoted broker_ip, got: '$(printf '%s' "$out" | grep broker_ip | head -1)'" ;;
 esac
 
 # A decision splits the compute run, so the graph gets a SECOND pipeline node

@@ -976,6 +976,7 @@ pub fn graph_document(
     st_out: &mut [u8],
     pipeline: &[u8],
     target: &[u8],
+    bindings: &[ResourceBinding],
 ) -> (usize, i32) {
     let doc = match uproc_parse(src, &mut *arena) {
         Ok(d) => d,
@@ -1016,7 +1017,9 @@ pub fn graph_document(
     // `cont`; `plan[]` holds slices into it.
     const MAX_PLAN_STAGES: usize = 16;
     let mut spans = [(0usize, 0usize); MAX_PLAN_STAGES];
-    let mut kinds = [0u8; MAX_PLAN_STAGES]; // 0 compute, 1 decision
+    let mut kinds = [0u8; MAX_PLAN_STAGES]; // 0 compute, 1 decision, 2 effect
+                                            // Connectors resolved from the deployment's bindings, parallel to `kinds`.
+    let mut effects = [None::<Connector>; MAX_PLAN_STAGES];
     let mut used = 0usize;
     let mut n_stages = 0usize;
 
@@ -1025,17 +1028,29 @@ pub fn graph_document(
             return (append(&mut *st_out, 0, b"error: too many stages\n"), 1);
         }
         let st = arena.stages[pipe.first_stage as usize + k];
-        if st.kind == STAGE_EFFECT {
-            let mut p = append(&mut *st_out, 0, b"error: stage '");
-            p = append(&mut *st_out, p, st.name.of(src));
-            p = append(
-                &mut *st_out,
-                p,
-                b"' is an effect; a connector binding is not in the document\n",
-            );
-            return (p, 1);
-        }
         let target_name = st.target.of(src);
+
+        // An EFFECT names a `resource`; the deployment says what serves it.
+        // The document deliberately does not, so an unbound resource is a
+        // deployment error and says so.
+        if st.kind == STAGE_EFFECT {
+            let Some(connector) = resolve_binding(bindings, target_name) else {
+                let mut p = append(&mut *st_out, 0, b"error: resource '");
+                p = append(&mut *st_out, p, target_name);
+                p = append(
+                    &mut *st_out,
+                    p,
+                    b"' has no binding; supply one for each `resource` the \
+                      pipeline uses\n",
+                );
+                return (p, 1);
+            };
+            effects[n_stages] = Some(*connector);
+            kinds[n_stages] = 2;
+            spans[n_stages] = (used, 0);
+            n_stages += 1;
+            continue;
+        }
 
         // A Call names either a transformation (a compute stage) or a decision
         // (its own node). Transformations are searched first because that is the
@@ -1139,10 +1154,25 @@ pub fn graph_document(
     for i in 0..n_stages {
         let (off, len) = spans[i];
         let bytes = &st_cont[off..off + len];
-        plan[i] = if kinds[i] == 0 {
-            PlanStage::Compute { stage_ir: bytes }
-        } else {
-            PlanStage::Decision { container: bytes }
+        plan[i] = match kinds[i] {
+            0 => PlanStage::Compute { stage_ir: bytes },
+            1 => PlanStage::Decision { container: bytes },
+            // Resolved above from the deployment's bindings; an effect stage
+            // without one cannot reach here, and is refused rather than
+            // silently lowered as compute if it ever does.
+            _ => match effects[i] {
+                Some(c) => PlanStage::Effect(c),
+                None => {
+                    return (
+                        append(
+                            &mut *st_out,
+                            0,
+                            b"error: effect stage has no resolved binding\n",
+                        ),
+                        1,
+                    )
+                }
+            },
         };
     }
 
@@ -1380,4 +1410,139 @@ pub fn release_from_argv(
     let mut p = append(&mut *st_out, 0, &st_prog[..hn]);
     p = append(&mut *st_out, p, b"\n");
     (p, 0)
+}
+
+// ── Deployment bindings ───────────────────────────────────────────────────
+//
+// A `.uproc` names the resources a pipeline needs and deliberately says
+// nothing about what serves them. This parses the other half — the
+// deployment's answer — from one argument, so a node can lower a document
+// with effects without a build host.
+//
+// Grammar, one binding per `|`:
+//
+//   <resource>,<kind>,<provider>,<version>,<in_port>,<out_port>,<r|n>,<params>
+//
+// where `<params>` is `k=v` pairs joined by `;` (so neither `,` nor `;` nor
+// `=` can appear inside a value), and a value led by `#` is NUMERIC — emitted
+// unquoted, because a provider's `u32` decoder rejects a quoted number. `r`/`n`
+// says whether the provider answers with data a next stage could read: `r` for
+// a `stream.ordered_ack.exchange` or request/reply provider, `n` for a sink.
+//
+//   orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,endpoint=7f000001;user=app
+//   feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,broker_ip=#167772161;topic=orders
+//
+// Every field is the PROVIDER's, not chronicle's: the param names, the port
+// names and the module name all arrive from the deployment, which is what
+// lets a new destination be a config change rather than a code change.
+
+/// Bindings a single `chronicle graph` invocation may carry.
+pub const MAX_BINDINGS: usize = 8;
+/// Params one binding may carry.
+pub const MAX_BINDING_PARAMS: usize = 12;
+/// One connector param as the binding carries it: `(name, value, quoted)`.
+pub type BindingParam<'a> = (&'a [u8], &'a [u8], bool);
+/// Caller-owned storage the parsed bindings' params point into.
+pub type BindingParamStore<'a> = [[BindingParam<'a>; MAX_BINDING_PARAMS]; MAX_BINDINGS];
+
+/// Split `src` on `sep`, writing up to `out.len()` pieces. Returns the number
+/// of pieces in `src`, which exceeds `out.len()` when some were not stored —
+/// a caller refuses that rather than acting on a prefix.
+fn split_on<'a>(src: &'a [u8], sep: u8, out: &mut [&'a [u8]]) -> usize {
+    let (mut n, mut start, mut i) = (0usize, 0usize, 0usize);
+    while i <= src.len() {
+        if i == src.len() || src[i] == sep {
+            if n < out.len() {
+                out[n] = &src[start..i];
+            }
+            n += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Parse the deployment's bindings. Returns the count, or `None` on a
+/// malformed field, a binding with the wrong field count, or more bindings or
+/// params than fit — a binding that cannot be read is refused rather than
+/// half-applied, because a partly-bound graph is worse than an unbuilt one.
+///
+/// Two passes, deliberately: the params are filled first, and only then are
+/// the bindings built pointing INTO them. One pass cannot borrow the buffer
+/// it is still writing to.
+pub fn parse_bindings<'a>(
+    src: &'a [u8],
+    params: &'a mut BindingParamStore<'a>,
+    out: &mut [ResourceBinding<'a>; MAX_BINDINGS],
+) -> Option<usize> {
+    if src.is_empty() {
+        return Some(0);
+    }
+    let mut specs = [b"".as_slice(); MAX_BINDINGS];
+    let n = split_on(src, b'|', &mut specs);
+    if n > MAX_BINDINGS {
+        return None;
+    }
+
+    // Fields per binding, held until the params are in place.
+    let mut fields = [[b"".as_slice(); 8]; MAX_BINDINGS];
+    let mut replies = [false; MAX_BINDINGS];
+    let mut lens = [0usize; MAX_BINDINGS];
+
+    for (b, spec) in specs.iter().take(n).enumerate() {
+        let mut f = [b"".as_slice(); 8];
+        if split_on(spec, b',', &mut f) != 8 {
+            return None;
+        }
+        replies[b] = match f[6] {
+            b"r" => true,
+            b"n" => false,
+            _ => return None,
+        };
+        fields[b] = f;
+
+        let mut kvs = [b"".as_slice(); MAX_BINDING_PARAMS];
+        let np = split_on(f[7], b';', &mut kvs);
+        if np > MAX_BINDING_PARAMS {
+            return None;
+        }
+        let mut pn = 0usize;
+        for kv in kvs.iter().take(np) {
+            if kv.is_empty() {
+                continue;
+            }
+            let mut halves = [b"".as_slice(); 2];
+            if split_on(kv, b'=', &mut halves) != 2 {
+                return None;
+            }
+            let (key, mut val) = (halves[0], halves[1]);
+            // `#` marks a numeric value: emitted unquoted.
+            let quoted = val.is_empty() || val[0] != b'#';
+            if !quoted {
+                val = &val[1..];
+            }
+            params[b][pn] = (key, val, quoted);
+            pn += 1;
+        }
+        lens[b] = pn;
+    }
+
+    // The fill is done; take the buffer immutably for the bindings to borrow.
+    let params: &'a BindingParamStore<'a> = params;
+    for b in 0..n {
+        out[b] = ResourceBinding {
+            resource: fields[b][0],
+            connector: Connector {
+                kind: fields[b][1],
+                provider: fields[b][2],
+                version: fields[b][3],
+                in_port: fields[b][4],
+                out_port: fields[b][5],
+                replies: replies[b],
+                params: &params[b][..lens[b]],
+            },
+        };
+    }
+    Some(n)
 }

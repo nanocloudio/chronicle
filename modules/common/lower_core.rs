@@ -44,6 +44,7 @@ pub mod ir {
     pub const CALL: u8 = 0x15; // id:u16 LE — args already on the stack
     pub const STORE_LOCAL: u8 = 0x16; // idx:u8
     pub const LOAD_LOCAL: u8 = 0x17; // idx:u8
+    pub const DIV: u8 = 0x18;
 }
 
 /// Deterministic lowering failures. Never panics on malformed input.
@@ -146,6 +147,7 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
             ir::ADD => emit!(op::ADD),
             ir::SUB => emit!(op::SUB),
             ir::MUL => emit!(op::MUL),
+            ir::DIV => emit!(op::DIV),
             ir::SETFIELD => {
                 let nb = rd_bytes!(4);
                 emit!(op::SET_FIELD, nb);

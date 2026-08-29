@@ -67,9 +67,10 @@ http://192.168.1.9/messages?max=10
 The single-board shape is the distributed one with two deployment
 substitutions and zero logic changes:
 
-- the MQTT broker leg becomes an in-graph **tee** of the pump's publish
-  channel — `loopback_sink` still consumes and acks it (the ordered_ack
-  contract is untouched), pipeline B reads the same frames passively;
+- the MQTT broker leg becomes pipeline B itself: `dec_evt` is the pump's
+  **ordered-ack sink** (`publish_in`/`ack_out`), so every CDC event is
+  acknowledged by the pipeline that consumed it and the pump's in-flight
+  window is the backpressure between store and app;
 - the pg_client connections ride the fluxor ip module's **local-delivery
   fastpath**: a connect to 127.0.0.1 binds a conn pair against the local
   listener directly — no TCP, no ARP (a host cannot resolve itself through
@@ -113,7 +114,7 @@ Two schema choices carry the whole design:
 The CDC RFC (`lattice/.context/rfc_cdc_egress.md`) forbids lattice depending
 on quantum. The cross-project composition therefore lives HERE, in the
 application project: `lattice_reverser.yaml` wires lattice's `cdc_pump`
-(capability `stream.sink.ordered_ack`) to quantum's `mqtt_sink`, and
+(capability `stream.ordered_ack`) to quantum's `mqtt_sink`, and
 chronicle's `fluxor.toml` pins both projects (plus `clustor`, the consensus
 substrate). Swap `mqtt_sink` for `kafka_sink` or `amqp_sink` and nothing in
 lattice or in the pipelines changes.

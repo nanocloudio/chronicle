@@ -102,6 +102,10 @@ modules:
   - name: token_mint
 
   - name: security_state
+    params:
+      # One board, one ledger: the single-node authority. A ledger that does
+      # not declare its authority refuses every request.
+      authority: "single-node"
 
   - name: ws
     type: ws_stream
