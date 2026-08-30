@@ -54,8 +54,18 @@ use dec::{
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
-const HEX_BUF: usize = 8192;
-const CONT_BUF: usize = 4096;
+/// The decision param, as hex on the way in and as the deserialized container
+/// in use. `HEX_BUF` is twice `CONT_BUF` because hex doubles.
+///
+/// `CONT_BUF` carries the largest table the authoring path can produce — a
+/// full `author_core::MAX_RULE` decision — so a container this node is handed
+/// is refused for its arm count at authoring rather than truncated here. A
+/// param that does overrun is a FAULT: the node names it and refuses input,
+/// because a truncated container decodes to a different policy.
+///
+/// Both buffers live in module STATE, so they cost state and not a PIC frame.
+const HEX_BUF: usize = 40960;
+const CONT_BUF: usize = 20480;
 
 #[repr(C)]
 struct ModuleState {

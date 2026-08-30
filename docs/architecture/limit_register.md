@@ -17,7 +17,7 @@ Two rules govern every limit and are verified by tests, not by prose:
 
 Dimensions: **B**=bytes, **rec**=records/frames, **fld**=fields, **st**=stages,
 **ver**=versions, **ln**=lanes, **pn**=panes, **op**=operators, **win**=windows,
-**ms**=milliseconds, **inst**=instruments.
+**ms**=milliseconds, **inst**=instruments, **vmi**=VM instructions.
 
 ## Record / buffer capacities
 
@@ -32,12 +32,20 @@ Dimensions: **B**=bytes, **rec**=records/frames, **fld**=fields, **st**=stages,
 | Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
 |---|---|---|---|---|---|---|---|---|---|
 | `MAX_STAGES` | 8 | st | per record | capacity | `stage_count > MAX_STAGES` → `inputs_failed`, never truncated (consumed) | 8 × `Stage` descriptor on the step | a bounded pipeline depth; a longer chain is a graph of nodes | larger variant | `pipeline::…over_cap_stage…` |
+| `DECISION_STAGE_COST` | 100_000 | vmi | per decision stage | policy default | n/a — recorded, not consulted | none | the `max_cost` field the stage format requires; a decision stage's real bounds are the per-program costs inside its own container, enforced by `run_decision` | tracks the format | `tools/e2e/inline-decision.sh` |
 | `INGRESS_BUF` | `PAYLOAD_MAX` (8192) | B | per module (pipeline) | capacity | publish payload > ceiling → OVERSIZE refusal, frame consumed (consumed: yes, counted) | one intake buffer | a sink for any producer of the exchange surface takes the contract's whole payload; the decoded record is still one `REC_BUF` frame | tracks the contract | `tools/e2e/pipeline-chain.sh`, `examples/reverser/reverser_pi5.yaml` (build fact check) |
 | `MAX_INFLIGHT` | 8 | rec | per module | capacity | window full → no record admitted until the destination answers (backpressure, consumed: no) | one counter; the frames live downstream | publishes unacknowledged at once on the exchange surface | larger variant | `tools/e2e/pipeline-chain.sh` (more records than the window, all delivered) |
 | `MAX_VERSIONS` | 8 | ver | per module | capacity | reload adding a 9th version → reload rejected, active table unchanged | version table in `VBIN_BUF` | concurrent blue/green + a few pinned generations | larger variant | `pipeline::hot_reload…` |
 | `VERSION_TAG_CAP` | 24 | B | per version | capacity | tag > 24 B → reload rejected (control msg, not a record) | 24 B × versions | a version label, not a payload | fix-forward | `version_core` suites |
 | `VBIN_BUF` | 8192 | B | per module | capacity | candidate table > 8 KiB → reload rejected, active unchanged | one active + one candidate = 16 KiB | the compiled version table (all stages of all versions) | larger variant | `pipeline_lifecycle` reload |
 | `PROG_BUF` | 2048 | B | per program | capacity | program > 2 KiB → load fault (`faulted`) | per encoder/decoder slot | one compiled stage/encoder/decoder program | larger variant | pipeline load faults |
+
+## Decision
+
+| Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
+|---|---|---|---|---|---|---|---|---|---|
+| `CONT_BUF` | 20480 | B | per module | capacity | container past the buffer → `param_overflow` → FAULT; the node names it and refuses input | one container + its hex = 60 KiB state | a full `MAX_RULE` decision table, so the arm count is the bound an author meets | larger variant, in state | `decision` load faults, `tools/e2e/fault.sh` |
+| `HEX_BUF` | 40960 | B | per module | capacity | as `CONT_BUF` — the hex is what the param carries | see `CONT_BUF` | hex of a max container | tracks `CONT_BUF` (2x) | `decision` load faults |
 
 ## Aggregation
 
@@ -60,7 +68,10 @@ Dimensions: **B**=bytes, **rec**=records/frames, **fld**=fields, **st**=stages,
 |---|---|---|---|---|---|---|---|---|---|
 | `UPROC_BUF` | 32768 | B | per document | capacity | `.uproc` source > 32 KiB → refused before author (does not hang) | source staging | a full IdP `.uproc` (the largest example document, ~25.5 KiB) | larger variant | `chronicle_cli` author suites |
 | `ARGV_BUF` | 65536 | B | per invocation | capacity | argv record > 64 KiB → bounded retry then ERROR, applet gets no argv | argv staging (2 × `UPROC_BUF`) | the hex of a max document as one argv record | tracks `UPROC_BUF` (2×) | `chronicle_cli` parse suites |
-| `MAX_RULE` | 8 | rec | per decision (author) | capacity | 9th rule arm → author reject | 2 × 2 KiB stack arrays | a decision table sized off the PIC stack budget | larger variant | `chronicle_cli` decision authoring |
+| `MAX_RULE` | 32 | rec | per decision (author) | capacity | 33rd rule arm → author reject | 2 × 16 KiB in module STATE (`RuleCode`), not the stack | a state machine's arm count follows its states: entry and exit conditions over a handful of states reach the twenties without padding | raise with the buffers in state, never on a PIC frame | `chronicle_cli` decision authoring |
+| `RULE_CODE` | 512 | B | per rule program (author) | capacity | a `when` or outcome compiling past 512 B → author reject | `2 × MAX_RULE × RULE_CODE` = 32 KiB in state | one arm's predicate or constructed outcome; the outcome is the long one, since a pass-through arm sets every field of its record | larger variant, in state | `chronicle_cli` decision authoring |
+| `BIN_BUF` | 16384 | B | per artefact (author) | capacity | artefact past the buffer → author reports and refuses | 3 work buffers in module state | one sealed artefact: its container, its lowered code, and the digest-free encoding the two-pass seal needs | larger variant, in state | `chronicle_cli` author suites |
+| `OUT_BUF` | `2 * BIN_BUF + 4096` (36864) | B | per invocation | capacity | reply past the buffer → "too large to print", exit 1 | stdout staging in state | an artefact printed as HEX (2x) plus the YAML `graph` wraps it in; the `stdout` port takes one whole reply as a record | tracks `BIN_BUF` (2x) | `chronicle_cli` output suites, `tools/e2e/cli.sh` |
 
 ## Observability
 
@@ -84,6 +95,7 @@ MAX_WIN_PER_EVENT | modules/common/agg_core.rs | 8
 COLL_CAP | modules/common/agg_core.rs | 16
 KEY_CAP | modules/common/agg_core.rs | 48
 MAX_STAGES | modules/app/pipeline/mod.rs | 8
+DECISION_STAGE_COST | modules/common/lower_core.rs | 100_000
 MAX_INFLIGHT | modules/app/pipeline/mod.rs | 8
 INGRESS_BUF | modules/app/pipeline/mod.rs | PAYLOAD_MAX
 MAX_BUILD_FIELDS | modules/common/vm_core.rs | 32
@@ -91,7 +103,9 @@ MAX_VERSIONS | modules/common/version_core.rs | 8
 VERSION_TAG_CAP | modules/common/version_core.rs | 24
 MAX_LOCALS | modules/common/vm_core.rs | 8
 STAGE_SCRATCH_CAP | modules/common/pipeline_core.rs | 512
-MAX_RULE | modules/common/author_core.rs | 8
+MAX_RULE | modules/common/author_core.rs | 32
+RULE_CODE | modules/common/author_core.rs | 512
+BIN_BUF | modules/common/author_core.rs | 16384
 EMIT_FRAME_MAX | modules/app/aggregation/mod.rs | 512
 EMIT_Q_CAP | modules/app/aggregation/mod.rs | 256 * (2 + EMIT_FRAME_MAX)
 MAX_SNAPSHOT | modules/app/aggregation/mod.rs | 40960
@@ -100,6 +114,9 @@ VBIN_BUF | modules/app/pipeline/mod.rs | 8192
 PROG_BUF | modules/app/pipeline/mod.rs | 2048
 ARGV_BUF | modules/app/chronicle_cli/mod.rs | 65536
 UPROC_BUF | modules/app/chronicle_cli/mod.rs | 32768
+OUT_BUF | modules/app/chronicle_cli/mod.rs | 2 * tc::BIN_BUF + 4096
+HEX_BUF | modules/app/decision/mod.rs | 40960
+CONT_BUF | modules/app/decision/mod.rs | 20480
 TLM_INTERVAL_MS | modules/common/telemetry_core.rs | 5000
 ACCT_METRIC_COUNT | modules/common/accounting_core.rs | 14
 ```

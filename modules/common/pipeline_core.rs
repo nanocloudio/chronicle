@@ -39,6 +39,55 @@ pub struct Stage<'a> {
     /// the graph, so retry and compensation are graph-level concerns — see the
     /// note on `run_stages`.
     pub on_failure: Option<u8>,
+    /// Which executor runs this stage's `code`.
+    ///
+    /// NOT carried in the stage container: the wire format is
+    /// `[count][route][cost][len][code]`, so a recorded graph and an emitted
+    /// `ir_stages` hex mean the same thing whatever kinds accompany them. A
+    /// caller that runs mixed kinds supplies them alongside the container
+    /// (see the pipeline module's `stage_kinds` param); `stage_at` reports
+    /// `STAGE_KIND_COMPUTE`, so a container read on its own is all compute.
+    pub kind: u8,
+}
+
+/// The stage's `code` is transformation bytecode for the expression VM.
+pub const STAGE_KIND_COMPUTE: u8 = 0;
+/// The stage's `code` is a DECISION container — first-hit routing over the
+/// record. Structurally the same step as a compute stage (decode the frame,
+/// evaluate, encode the result), so it threads through the same executor
+/// rather than occupying a node of its own.
+pub const STAGE_KIND_DECISION: u8 = 1;
+
+/// How one stage is evaluated.
+///
+/// A trait rather than a `match` inside this core, because the decision
+/// executor lives in `decision_core` and this file is mounted by modules that
+/// have no reason to carry it (`aggregation`, `expression`, `chronicle_cli`).
+/// Generic dispatch monomorphises, so a PIC build gets a direct call and no
+/// pointer table — which a static dispatch table could not survive.
+pub trait StageEval {
+    fn eval(
+        &self,
+        stage: &Stage,
+        src: &[u8],
+        dst: &mut [u8],
+        spent: &mut u64,
+    ) -> Result<usize, PipeError>;
+}
+
+/// The default: every stage is transformation bytecode.
+pub struct ComputeOnly;
+
+impl StageEval for ComputeOnly {
+    fn eval(
+        &self,
+        stage: &Stage,
+        src: &[u8],
+        dst: &mut [u8],
+        spent: &mut u64,
+    ) -> Result<usize, PipeError> {
+        run_stage_metered(stage, src, dst, spent)
+    }
 }
 
 /// The route byte meaning "no failure route" — abort instead of routing.
@@ -148,6 +197,7 @@ pub fn stage_at(container: &[u8], index: usize) -> Option<Stage<'_>> {
             return Some(Stage {
                 code: &container[off..off + len],
                 max_cost: cost,
+                kind: STAGE_KIND_COMPUTE,
                 on_failure: if route == ROUTE_NONE {
                     None
                 } else {
@@ -278,7 +328,9 @@ pub const STAGE_SCRATCH_CAP: usize = 512;
 /// Run one stage: decode `src`, evaluate, and serialize the constructed message
 /// into `dst`. Returns the encoded length.
 /// [`run_stage`] that adds the stage program's VM instructions to `spent`.
-fn run_stage_metered(
+/// Public so a caller supplying its own [`StageEval`] can delegate the
+/// compute case rather than reimplementing it.
+pub fn run_stage_metered(
     stage: &Stage,
     src: &[u8],
     dst: &mut [u8],
@@ -362,6 +414,24 @@ pub fn run_stages_metered(
     out: &mut [u8],
     spent: &mut u64,
 ) -> Result<usize, PipeError> {
+    run_stages_with(&ComputeOnly, stages, input, buf_a, buf_b, out, spent)
+}
+
+/// [`run_stages_metered`] with the per-stage evaluator supplied.
+///
+/// This is the one executor: failure routing, the bounded route walk and the
+/// buffer ping-pong are identical whatever a stage runs. A caller that mixes
+/// compute and decision stages threads them through HERE rather than through
+/// a channel, so a chain that routes mid-way is one graph node.
+pub fn run_stages_with<E: StageEval>(
+    ev: &E,
+    stages: &[Stage],
+    input: &[u8],
+    buf_a: &mut [u8],
+    buf_b: &mut [u8],
+    out: &mut [u8],
+    spent: &mut u64,
+) -> Result<usize, PipeError> {
     *spent = 0;
     if stages.is_empty() {
         if input.len() > out.len() {
@@ -390,11 +460,11 @@ pub fn run_stages_metered(
         // same bytes the FAILED stage read: the failure produced no output, so
         // there is nothing newer to hand it.
         let res = if !started {
-            run_stage_metered(stage, input, buf_a, spent)
+            ev.eval(stage, input, buf_a, spent)
         } else if latest_is_a {
-            run_stage_metered(stage, &buf_a[..cur_len], buf_b, spent)
+            ev.eval(stage, &buf_a[..cur_len], buf_b, spent)
         } else {
-            run_stage_metered(stage, &buf_b[..cur_len], buf_a, spent)
+            ev.eval(stage, &buf_b[..cur_len], buf_a, spent)
         };
         match res {
             Ok(n) => {

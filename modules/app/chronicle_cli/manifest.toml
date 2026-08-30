@@ -54,11 +54,15 @@ content_type = "OctetStream"
 buffer_size  = 33024
 
 # stdout → cli_out.bytes_in.
+#
+# Sized to take a full `OUT_BUF` reply (36864 B) as one record. A channel
+# smaller than the buffer feeding it does not truncate the write, it refuses
+# it — the applet then delivers nothing and exits 0, which reads as success.
 [[ports]]
 name         = "stdout"
 direction    = "output"
 content_type = "TextPlain"
-buffer_size  = 8192
+buffer_size  = 40960
 
 # exit code [i32 LE] → cli_out.exit_in.
 [[ports]]

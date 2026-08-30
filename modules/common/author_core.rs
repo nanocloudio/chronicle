@@ -178,7 +178,58 @@ pub fn append_release_reason(out: &mut [u8], at: usize, e: ReleaseError) -> usiz
 pub const MAX_ARGV: usize = 24;
 pub const MAX_SET: usize = 8;
 
-pub const BIN_BUF: usize = 2048;
+/// The compile work buffers one `.uproc` artefact is assembled in: the
+/// container, the lowered code, and the digest-free encoding the two-pass
+/// seal needs. All three live in module STATE (`chronicle_cli::State`), never
+/// on the PIC stack, so the bound costs state rather than a frame.
+///
+/// Sized for the largest artefact kind, which is a decision: a packed
+/// container grows with its arms, and the shipping examples measure 74-138
+/// bytes per arm depending on how many fields the outcome constructs. A full
+/// `MAX_RULE` table is therefore ~4.5 KB at the richer end, so 16 KiB leaves
+/// the arm count as the bound an author meets rather than the buffer.
+pub const BIN_BUF: usize = 16384;
+
+/// Rule arms in ONE decision.
+///
+/// A decision is how a document expresses a state machine, and a state
+/// machine's arm count follows its states rather than its author's restraint:
+/// a lifecycle with a handful of states, each with an entry and an exit
+/// condition, reaches the twenties without padding. 32 is that shape with
+/// headroom, and the arms live in `RuleCode` in module state, so the bound
+/// costs state and not a PIC frame.
+pub const MAX_RULE: usize = 32;
+
+/// Bytecode one arm's `when` or outcome program may compile to.
+///
+/// 512 bytes because the long arm is not the predicate but the outcome: a
+/// pass-through arm in a chained decision constructs every field of its
+/// record, and a predicate testing a discriminant against several values
+/// compiles longer than one testing it against a single value.
+pub const RULE_CODE: usize = 512;
+
+/// The per-rule compile buffers, in module state (`2 * MAX_RULE * RULE_CODE`
+/// = 32 KiB) rather than on the stack, which is why raising the bound costs
+/// state and not a PIC frame.
+pub struct RuleCode {
+    pub wcode: [[u8; RULE_CODE]; MAX_RULE],
+    pub ocode: [[u8; RULE_CODE]; MAX_RULE],
+}
+
+impl RuleCode {
+    pub const fn new() -> Self {
+        Self {
+            wcode: [[0u8; RULE_CODE]; MAX_RULE],
+            ocode: [[0u8; RULE_CODE]; MAX_RULE],
+        }
+    }
+}
+
+impl Default for RuleCode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub fn print_digest(out: &mut [u8], d: &[u8; 32]) -> (usize, i32) {
     let mut dhex = [0u8; 64];
@@ -191,12 +242,13 @@ pub fn print_digest(out: &mut [u8], d: &[u8; 32]) -> (usize, i32) {
 }
 
 pub fn emit_hex_buf(cont: &[u8], w: usize, out: &mut [u8]) -> (usize, i32) {
-    let mut hexed = [0u8; 2 * BIN_BUF];
-    let Some(hl) = hex_encode(&cont[..w], &mut hexed) else {
+    // Encoded straight into `out`, which is module state. Going through a
+    // `2 * BIN_BUF` stack buffer would tie a PIC frame to the artefact bound,
+    // doubling the frame every time the artefact grew.
+    let Some(hl) = hex_encode(&cont[..w], out) else {
         return (append(out, 0, b"error: container too large to print\n"), 1);
     };
-    let mut p = append(out, 0, &hexed[..hl]);
-    p = append(out, p, b"\n");
+    let p = append(out, hl, b"\n");
     (p, 0)
 }
 
@@ -369,6 +421,7 @@ pub fn author_document(
     st_code: &mut [u8],
     st_cont: &mut [u8],
     st_scratch: &mut [u8],
+    st_rules: &mut RuleCode,
     st_out: &mut [u8],
 ) -> (usize, i32) {
     let doc = match uproc_parse(src, &mut *arena) {
@@ -500,15 +553,17 @@ pub fn author_document(
         let Ok(plen) = uproc_params_text(src, d.param_name, d.input_type, &mut params) else {
             return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
         };
-        const MAX_RULE: usize = 8;
         if d.n_rules as usize > MAX_RULE {
             return (
                 append(&mut *st_out, 0, b"error: too many rules for this node\n"),
                 1,
             );
         }
-        let mut wcode = [[0u8; 256]; MAX_RULE];
-        let mut ocode = [[0u8; 256]; MAX_RULE];
+        // Caller-owned, in module state — the same rule the document buffers
+        // follow. `MAX_RULE * RULE_CODE` per program is far past what a PIC
+        // frame can hold, so a stack array here would cap the arm count at
+        // the frame rather than at the declared bound.
+        let RuleCode { wcode, ocode } = st_rules;
         let mut wlen = [0usize; MAX_RULE];
         let mut olen = [0usize; MAX_RULE];
         let mut wcost = [0u64; MAX_RULE];

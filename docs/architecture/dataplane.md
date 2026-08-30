@@ -10,7 +10,7 @@ emits the params.
 | Module | Role | Param(s) |
 |--------|------|----------|
 | `app/expression` | one checked-CEL Expression | `program`, `max_cost` |
-| `app/pipeline` | staged Transformations + encode/decode + versioning | `ir_stages` (or `versions`), `encode`, `decode` |
+| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode` |
 | `app/aggregation` | event-time stateful engine | `ir_def` |
 | `app/decision` | first-hit rule container | `decision` |
 | `app/chronicle_cli` | the toolchain CLI applet (`fluxor exec chronicle`) | — |
@@ -52,8 +52,8 @@ input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶
   program that parses a raw protocol reply into a record frame before the stages.
 - **version select**: the record's `X-Module-Version` selector (field 255) resolves
   to one of the loaded [versions](versioning.md); unknown ⇒ fail closed.
-- **stages**: an ordered chain of Transformation bytecode. Each stage runs on the
-  evaluator; its constructed message is *serialized* as the next stage's input
+- **stages**: an ordered chain of stage programs (see [stage kinds](#stage-kinds)).
+  Each stage's constructed message is *serialized* as the next stage's input
   (serialize-at-the-boundary), so stages compose with no shared mutable state.
 - **encode** (optional `encode` param): a [byte-serialization](connectors.md)
   program that renders the final record as wire bytes (e.g. a Redis `SET`).
@@ -62,6 +62,34 @@ The stage table is a param container — `[nstages:u8]{[cost:u32][len:u16][code]
 not baked, so one pipeline binary runs any pipeline. An `ir_stages` param lowers
 at load into a single default-version table; a `versions` param supplies a
 ready-made multi-version table.
+
+### Stage kinds
+
+A stage's `code` is Transformation bytecode by default. The optional
+`stage_kinds` param — one hex byte per stage, parallel to the container —
+names a different executor for a stage:
+
+| Kind | `code` is | Executor |
+|---|---|---|
+| `00` compute | Transformation bytecode | the expression evaluator |
+| `01` decision | a [Decision](model.md) container | the first-hit policy driver |
+
+A Decision is one input, one output and the same decode/evaluate/encode step a
+compute stage is; only the program format differs. Running it as a stage makes
+a chain that routes mid-way a single node rather than
+`pipeline -> decision -> pipeline`, so the two channel hops either side of the
+decision are not paid — the saving the [hop register](hop_register.md) counts.
+
+The kinds ride *alongside* the container rather than inside it, so the stage
+format is unchanged and a container read on its own is all compute. Each kind
+is validated at load by its own scanner — an unknown opcode fails a compute
+stage, a malformed container fails a decision stage — and a stage whose kind is
+not declared is scanned as compute, so a decision body can never be admitted
+unchecked.
+
+A decision stage's body is copied through the lowering verbatim rather than
+transcoded, and its arms carry their own cost bounds; see `DECISION_STAGE_COST`
+in the [limit register](limit_register.md).
 
 The pipeline also speaks the ordered-ack exchange surface in both directions:
 wire `publish_out`/`ack_in` and results leave as correlated publishes to any

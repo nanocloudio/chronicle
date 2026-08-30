@@ -181,6 +181,16 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
     Ok((end, ops))
 }
 
+/// The `max_cost` field recorded for a decision stage.
+///
+/// The stage format carries a per-stage instruction budget and a decision
+/// needs a value in that field, but it is not the bound that governs the
+/// stage: a decision container declares a cost for every `when` and every
+/// outcome program, and `run_decision` enforces each of those as it walks the
+/// arms. A decision stage's work is therefore bounded by its own container,
+/// and this value is recorded rather than consulted.
+pub const DECISION_STAGE_COST: u64 = 100_000;
+
 /// Transcode an IR-stages container into the bytecode-stages container that
 /// `stage_at`/`run_stages` consume, lowering each stage at load.
 ///
@@ -195,6 +205,24 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
 /// wire. Bounds-checked and panic-free; a stage whose IR does not lower fails the
 /// whole transcode (the pipeline then loads nothing rather than a partial table).
 pub fn lower_stages(ir_container: &[u8], out: &mut [u8]) -> Result<usize, LowerError> {
+    lower_stages_kinded(ir_container, &[], out)
+}
+
+/// [`lower_stages`] where a stage's KIND decides whether its body is lowered.
+///
+/// A compute stage's body is flat IR and is transcoded to bytecode. A DECISION
+/// stage's body is already a decision container — a different program format
+/// the expression lowerer would mangle — so it is copied through verbatim and
+/// the stage's declared cost is preserved.
+///
+/// `kinds` is parallel to the container and may be shorter or empty; an
+/// unnamed stage is compute, so a container alone lowers exactly as
+/// [`lower_stages`] does.
+pub fn lower_stages_kinded(
+    ir_container: &[u8],
+    kinds: &[u8],
+    out: &mut [u8],
+) -> Result<usize, LowerError> {
     let n = *ir_container.first().ok_or(LowerError::Truncated)? as usize;
     if out.is_empty() {
         return Err(LowerError::Overflow);
@@ -202,7 +230,7 @@ pub fn lower_stages(ir_container: &[u8], out: &mut [u8]) -> Result<usize, LowerE
     out[0] = n as u8;
     let mut ip = 1usize; // cursor in the IR container
     let mut wp = 1usize; // write cursor in the bytecode container
-    for _ in 0..n {
+    for ip_stage in 0..n {
         // The failure route rides through the lowering unchanged: it is policy,
         // not code, so there is nothing to lower.
         let route = *ir_container.get(ip).ok_or(LowerError::Truncated)?;
@@ -219,7 +247,20 @@ pub fn lower_stages(ir_container: &[u8], out: &mut [u8]) -> Result<usize, LowerE
         if wp + 7 > out.len() {
             return Err(LowerError::Overflow);
         }
-        let (clen, cost) = {
+        let is_decision = kinds
+            .get(ip_stage)
+            .is_some_and(|k| *k == STAGE_KIND_DECISION);
+        let (clen, cost) = if is_decision {
+            // Verbatim: the body is a decision container, not flat IR, so
+            // there is nothing for the expression lowerer to transcode. Its
+            // arms carry their own cost bounds (see `DECISION_STAGE_COST`).
+            let dst = out.get_mut(wp + 7..).ok_or(LowerError::Overflow)?;
+            if flat.len() > dst.len() {
+                return Err(LowerError::Overflow);
+            }
+            dst[..flat.len()].copy_from_slice(flat);
+            (flat.len(), DECISION_STAGE_COST)
+        } else {
             let dst = out.get_mut(wp + 7..).ok_or(LowerError::Overflow)?;
             lower_flat(flat, dst)?
         };

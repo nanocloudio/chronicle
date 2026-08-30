@@ -18,7 +18,7 @@ emits are the baseline (14) plus its own, verified by
 | aggregation | bcm2712 | assigned_in | input | 64 | 256 | 25 |
 | aggregation | bcm2712 | leader_in | input | 64 | 256 | 25 |
 | chronicle_cli | bcm2712 | args | input |  | 33024 |  |
-| chronicle_cli | bcm2712 | stdout | output |  | 8192 |  |
+| chronicle_cli | bcm2712 | stdout | output |  | 40960 |  |
 | chronicle_cli | bcm2712 | exit | output |  | 16 |  |
 | decision | bcm2712 | record_in | input | 4096 | 4096 | 21 |
 | decision | bcm2712 | result_out | output | 4096 | 4096 | 21 |

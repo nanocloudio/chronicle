@@ -1,0 +1,66 @@
+// HTTP load benchmark: the transformation under measurement.
+//
+// Three graphs share this document so the ONLY difference between them is how
+// many chronicle nodes the request crosses:
+//
+//   baseline.yaml   http answers from a static route      0 engine nodes
+//   one_node.yaml   http -> pipeline -> http              1 node, 0 hops
+//   two_node.yaml   http -> pipeline -> pipeline -> http  2 nodes, 1 hop
+//
+// Subtracting gives the two costs separately: (one_node - baseline) is what a
+// pipeline costs on the request path, and (two_node - one_node) is what one
+// channel hop costs. Neither is visible in the host microbenchmark, which
+// measures stage execution with no scheduler and no channels.
+module bench.http {
+
+  // wave's HttpRequest, projected. `stream_id` is wave's monotonic request
+  // GENERATION and the response must echo it, or the answer matches no slot
+  // and is dropped.
+  message bench.Request {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    method: int = 3;
+    path: string = 4;
+  }
+
+  // What the response encoder needs. The BODY is a literal in the encode
+  // program rather than a field: the point of measurement is the engine and
+  // the hop, so the payload is held identical to the baseline route's body
+  // and never travels through the VM.
+  message bench.Reply {
+    conn_id: int = 1;
+    stream_id: int = 2;
+    status: int = 3;
+  }
+
+  enum OK = 200;
+
+  // Deliberately trivial. A heavier transformation would measure the VM, which
+  // the release microbenchmark already prices at 98.6 ns for three opcodes.
+  transformation respond(r: bench.Request) -> bench.Reply {
+    bench.Reply { conn_id: r.conn_id, stream_id: r.stream_id, status: OK }
+  }
+
+  // The two-node split: each node runs one half, so the pair differs from the
+  // single node by exactly one channel hop.
+  transformation pass(r: bench.Request) -> bench.Request {
+    bench.Request {
+      conn_id: r.conn_id, stream_id: r.stream_id,
+      method: r.method, path: r.path
+    }
+  }
+
+  pipeline serve(req: bench.Request) -> bench.Reply {
+    call replied = respond(req);
+    return replied;
+  }
+
+  // The first half of the two-node split: identity, so the pair does the same
+  // work as the single node and differs only by the channel between them.
+  pipeline half(req: bench.Request) -> bench.Request {
+    call passed = pass(req);
+    return passed;
+  }
+
+  entry serve = serve;
+}

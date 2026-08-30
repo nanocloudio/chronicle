@@ -249,6 +249,7 @@ use tc::{
     ROUTE_NONE,
     // The deployment half: document -> plan -> graph, all on device.
     STAGE_EFFECT,
+    STAGE_KIND_COMPUTE,
     VERSION_DIGEST_LEN,
 };
 
@@ -264,34 +265,29 @@ const MAX_STAGES: usize = 8;
 const ARGV_BUF: usize = 65536;
 /// Largest `.uproc` document this CLI will author, in bytes of source.
 ///
-/// Raised 16384 -> 32768 when the identity provider grew the code-exchange
-/// and authorization operations: the introspect + token dispatch alone was
-/// 13.3 KB, and each further OIDC junction is another message set, decision
-/// and pipeline. The 2x `ARGV_BUF` relationship is preserved.
+/// Sized for a whole protocol surface rather than a single operation: the
+/// reference identity provider carries introspect, token, authorization-code
+/// and exchange in one document, and every junction it adds is another
+/// message set, decision and pipeline. `ARGV_BUF` is twice this, because the
+/// argv record is the document as hex.
 ///
-/// Separate from [`BIN_BUF`], which also sizes stack arrays — work buffers
-/// deliberately live in module state, not on the PIC stack, so the document
-/// bound must not drag `2 * BIN_BUF` stack allocations up with it.
-///
-/// It was `BIN_BUF`, and `examples/oci_registry/registry.uproc` is **1967
-/// bytes** — 96% of it. An OCI registry is a far simpler protocol surface
-/// than the identity provider `C13`/`C14` call for, so the bound was
-/// already the binding constraint on what a `.uproc` could express, and the
-/// next real application would have hit it immediately.
-///
-/// Raised rather than worked around, because both alternatives are worse.
-/// Splitting the document breaks the four-file application shape the
-/// examples establish. Pushing configuration out into referenced params
-/// helps and is not enough on its own: even a dispatch-only IdP `.uproc`
-/// has a decision per protocol junction — authorize, redeem, token,
-/// refresh, revoke, introspect, userinfo, logout, consent — where the
-/// registry has a handful.
-///
-/// The cost is module state on a device that has plenty: `chronicle_cli`,
-/// `pipeline` and `decision` are all `hardware_targets = ["bcm2712"]`, so
-/// there is no constrained target paying for this.
+/// Splitting a document is the alternative and it is worse: it breaks the
+/// four-file application shape the examples establish. Moving configuration
+/// into referenced params helps but does not reach far enough on its own,
+/// since a dispatch-only document still needs a decision per junction —
+/// authorize, redeem, token, refresh, revoke, introspect, userinfo, logout,
+/// consent. The cost is module state on a device that has plenty:
+/// `chronicle_cli`, `pipeline` and `decision` are all
+/// `hardware_targets = ["bcm2712"]`.
 const UPROC_BUF: usize = 32768;
-const OUT_BUF: usize = 4096;
+/// The CLI's stdout buffer, in module state.
+///
+/// Every artefact prints as HEX — twice its bytes — and `graph` wraps its
+/// output in YAML besides, so this tracks `BIN_BUF` at 2x with room for the
+/// wrapper. Sizing it independently would put a second, lower ceiling on
+/// artefacts that compiled perfectly well, reported as an output error rather
+/// than as the bound it actually is.
+const OUT_BUF: usize = 2 * tc::BIN_BUF + 4096;
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
 /// it early; an empty argv — no `--` — never arrives, so we fall through).
 const ARGV_WAIT: u32 = 2000;
@@ -335,25 +331,26 @@ struct State {
     scratch: [u8; BIN_BUF],
     frame: [u8; 512],
     out: [u8; OUT_BUF],
-    // `.uproc` declaration arena. In module state, not on the stack: the arrays
-    // total several KiB and a PIC frame cannot hold them. Table sizes were
-    // raised when the reference IdP grew introspect + token + authorization-code
-    // + exchange into one document: 80 message fields across 13 messages, 33
-    // decision rules across 8 junctions — the examples that set the originals
-    // had a handful of each.
-    // total several KiB and a PIC frame cannot hold them alongside the compile
-    // buffers each artefact kind needs.
+    // `.uproc` declaration arena. In module state, not on the stack: the
+    // arrays total several KiB and a PIC frame cannot hold them alongside the
+    // compile buffers each artefact kind needs.
+    //
+    // The tables are sized for a document that routes a whole protocol
+    // surface — the reference identity provider declares 80 message fields
+    // across 13 messages and 33 decision rules across 8 junctions.
     u_messages: [tc::MessageDecl; 24],
     u_fields: [tc::FieldDecl; 128],
-    // 32, not 16. A `decision` matches on a TYPED DISCRIMINANT another module
-    // produced, so a document that routes a protocol names every value of
-    // every discriminant it routes on — kagi's `verify_err` alone is twelve.
-    // 16 was not sized for a workload; it fit the examples that existed.
+    // A `decision` matches on a TYPED DISCRIMINANT another module produced,
+    // so a document that routes a protocol names every value of every
+    // discriminant it routes on — kagi's `verify_err` alone is twelve.
     u_enums: [tc::EnumDecl; 48],
     u_expressions: [tc::FnDecl; 16],
     u_transformations: [tc::FnDecl; 24],
     u_decisions: [tc::DecisionDecl; 16],
     u_rules: [tc::RuleDecl; 48],
+    /// Per-rule compile buffers for `author`. In state, not on the stack —
+    /// see `author_core::RuleCode`.
+    u_rulecode: tc::RuleCode,
     u_resources: [tc::ResourceDecl; 8],
     u_pipelines: [tc::PipelineDecl; 16],
     u_stages: [tc::StageDecl; 48],
@@ -760,6 +757,7 @@ fn cmd_author(s: &mut State, hex: &[u8]) -> (usize, i32) {
         &mut s.code,
         &mut s.cont,
         &mut s.scratch,
+        &mut s.u_rulecode,
         &mut s.out,
     )
 }
@@ -1687,6 +1685,7 @@ fn cmd_eval(s: &mut State, ir_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
         code: &[],
         max_cost: 0,
         on_failure: None,
+        kind: STAGE_KIND_COMPUTE,
     }; MAX_STAGES];
     let n = stage_count(&s.prog[..plen]).min(MAX_STAGES);
     let prog = &s.prog[..plen];

@@ -1,3 +1,20 @@
+# TELEMETRY: chronicle's engines emit instruments a collector can read.
+#
+# The `decision` node is here only to GENERATE signal — it is the same
+# first-hit routing as `examples/decision/`. What is being demonstrated is
+# `observe`: fluxor's read-only telemetry-ring drain, which subscribes to the
+# ring (TLM_SUBSCRIBE / TLM_DRAIN / TLM_STATS) and renders records as text.
+#
+# `observe` has NO PORTS. Every signal reaches it on the kernel telemetry ring
+# rather than a channel, which is why nothing wires to it and why a module
+# needs no cooperation to be observable — it emits its instruments and the
+# drain sees them.
+#
+# This is NOT the OTLP exporter. That is fluxor's separate `otel` module, which
+# forwards over the network; `observe` renders locally and originates nothing.
+#
+#   printf '\x01\x01\x01\x08\x00\xd0\x07\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/telemetry_probe/linux.yaml
 target: linux
 tick_us: 100
 platform:

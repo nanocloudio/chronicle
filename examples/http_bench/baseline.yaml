@@ -1,0 +1,59 @@
+# HTTP LOAD BENCHMARK — BASELINE, no engine on the path
+#
+# Three graphs differ ONLY in how many chronicle nodes a request crosses.
+# Everything else — conn_guard, tls, the http server, the response bytes — is
+# held identical to wave's `examples/rig/pi5_https.yaml`, whose numbers this
+# sits beside:
+#
+#   baseline   http answers from a static route      0 engine nodes
+#   one_node   http -> pipeline -> http              1 node, 0 hops
+#   two_node   http -> pipeline -> pipeline -> http  2 nodes, 1 HOP
+#
+# (one_node - baseline) prices a pipeline on the request path.
+# (two_node - one_node) prices ONE channel hop: a channel write, a channel
+# read and a scheduler dispatch. The host microbenchmark sees neither — it
+# runs stages with no scheduler and no channels.
+#
+# The TLS chain is wired EXPLICITLY. `platform: net:` injects the board's net
+# stack (rp1_gem, conn_guard, ip) and stops there; it does not connect tls or
+# http. A graph that omits these edges boots clean, reports healthy telemetry,
+# and refuses every connection because nothing ever bound.
+target: pi5
+tick_us: 50
+
+platform:
+  net: {}
+  debug:
+    to: net
+    monitor: true
+
+modules:
+  - name: conn_guard
+    rate_limit_per_ip: 200
+    rate_window_ms: 100
+  - name: tls
+    mode: 1
+    verify_peer: 0
+    cert_file: "/tmp/server_cert.der"
+    key_file:  "/tmp/server_key.der"
+    ecdh_bits_per_step: 32
+  - name: http
+    port: 443
+    routes:
+      # Answered by http itself: the control for both pipeline graphs. The
+      # body is byte-identical to what they encode.
+      - path: "/"
+        body: "<html><body><h1>chronicle http bench</h1><pre>0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF</pre></body></html>"
+
+wiring:
+  # The transport chain, exactly as wave's rig graph wires it.
+  - from: ip.net_out
+    to: tls.cipher_in
+  - from: tls.cipher_out
+    to: ip.net_in
+    buffer_bytes: 131072
+  - from: tls.clear_out
+    to: http.net_in
+  - from: http.net_out
+    to: tls.clear_in
+    buffer_bytes: 32768

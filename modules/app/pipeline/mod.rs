@@ -48,6 +48,7 @@ use exchange::{
 /// BACKPRESSURE: at the limit the pipeline stops admitting records rather than
 /// running ahead of a destination that has not confirmed anything.
 const MAX_INFLIGHT: u32 = 8;
+
 /// One framed publish at this module's ceiling: the 3-byte envelope, the
 /// contract's fixed overhead, and a whole result frame (this module sends no
 /// key). What `publish_out` declares as `max_record`.
@@ -170,6 +171,8 @@ mod pipe {
     use super::abi::SyscallTable;
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
+    // The decision executor, so a decision can be a STAGE rather than a node.
+    include!("../../common/decision_core.rs");
     include!("../../common/hex_core.rs");
     include!("../../common/ser_core.rs");
     include!("../../common/deser_core.rs");
@@ -181,12 +184,93 @@ mod pipe {
     include!("../../common/syschan_core.rs");
     include!("../../common/pipeline_reload_core.rs");
 }
+
+/// Validate every stage of every version with the scanner its kind names.
+///
+/// Returns true when any stage is bad. A compute stage is scanned for unknown
+/// opcodes and truncation; a decision stage is scanned as a decision
+/// container. Skipping either would admit a program this build cannot run.
+fn scan_kinded_versions(vbin: &[u8], kinds: &[u8]) -> bool {
+    let Some(vt) = parse_version_table(vbin) else {
+        return true;
+    };
+    let mut v = 0usize;
+    while let Some(e) = vt.entry(v) {
+        let prog = e.prog;
+        let ns = stage_count(prog);
+        let mut i = 0usize;
+        while i < ns {
+            let Some(st) = stage_at(prog, i) else {
+                return true;
+            };
+            let decision = kinds.get(i).is_some_and(|k| *k == STAGE_KIND_DECISION);
+            let bad = if decision {
+                scan_decision_container(st.code).is_err()
+            } else {
+                scan_code(st.code).is_err()
+            };
+            if bad {
+                return true;
+            }
+            i += 1;
+        }
+        v += 1;
+    }
+    false
+}
+
+/// Runs each stage with the executor its kind names.
+///
+/// A DECISION is one input, one output and the same decode/evaluate/encode
+/// shape as a compute stage; only the program format differs. Threading it
+/// here makes a chain that routes mid-way ONE node instead of
+/// `pipeline -> decision -> pipeline`, so the two channel hops either side of
+/// the decision are not paid.
+struct KindedEval;
+
+impl StageEval for KindedEval {
+    fn eval(
+        &self,
+        stage: &Stage,
+        src: &[u8],
+        dst: &mut [u8],
+        spent: &mut u64,
+    ) -> Result<usize, PipeError> {
+        if stage.kind != STAGE_KIND_DECISION {
+            return run_stage_metered(stage, src, dst, spent);
+        }
+        let mut fields = [Field {
+            number: 0,
+            value: Value::Null,
+        }; MAX_PIPE_FIELDS];
+        let nf = decode_frame(src, &mut fields)?;
+        let params = [Message {
+            fields: &fields[..nf],
+        }];
+        let mut builder = Builder::new();
+        let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
+        let mut scratch = Scratch::new(&mut sbuf);
+        let mut w = 0u64;
+        let fired =
+            run_decision_scratch_metered(stage.code, &params, &mut builder, &mut scratch, &mut w);
+        *spent += w;
+        match fired {
+            // Which branch fired is an audit fact the standalone `decision`
+            // module reports on its own instrument. Inline, the outcome record
+            // IS the report: the next stage sees what a downstream node would.
+            Ok(_) => encode_frame_scratch(&builder.message(), &scratch, dst),
+            Err(_) => Err(PipeError::NotConstructed),
+        }
+    }
+}
 use pipe::{
-    admit_frame, decode_frame, drain_all, encode_frame, eval_bytes, eval_decode, frame_len,
-    hex_decode, lower_stages, parse_version_table, pipeline_reload, run_stages_metered,
-    scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
-    Builder, Field, Message, Mode, Pending, Stage, Staged, SysChan, Value, ACCT_IS_GAUGE,
-    ACCT_METRIC_COUNT, MAX_PIPE_FIELDS,
+    admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
+    eval_decode, frame_len, hex_decode, lower_stages_kinded, parse_version_table, pipeline_reload,
+    run_decision_scratch_metered, run_stage_metered, run_stages_metered, run_stages_with,
+    scan_code, scan_decision_container, scan_version_table, stage_at, stage_count,
+    version_selector_from_frame, Accounting, Admit, Builder, Field, Message, Mode, Pending,
+    PipeError, Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
+    MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_SCRATCH_CAP,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -200,13 +284,13 @@ const ENC_BUF: usize = 4096;
 /// One record, in bytes: the read buffer, both stage ping-pong buffers and
 /// the write buffer.
 ///
-/// 4096, not 512. A `pipeline` carries whatever record its graph carries, and
-/// 512 was not sized for a workload — it fit the examples that existed. A
-/// record that overruns it is not truncated, it is DROPPED: `channel_read`
-/// stops at the buffer, the codec then reads a length the rest of the record
-/// was going to satisfy, fails, and the record vanishes with a counter. From
-/// the client that is a request that never answers, which is the hardest
-/// possible shape to diagnose from the outside.
+/// A `pipeline` carries whatever record its graph carries, and the failure
+/// mode when one overruns is why the bound is generous: the record is not
+/// truncated, it is DROPPED. `channel_read` stops at the buffer, the codec
+/// then reads a length the rest of the record was going to satisfy, fails,
+/// and the record vanishes with a counter. From the client that is a request
+/// that never answers, which is the hardest possible shape to diagnose from
+/// the outside.
 ///
 /// A single compact JWS is ~350 bytes, and an HTTP envelope carrying one
 /// carries the path and header block beside it. `pipeline` is
@@ -248,6 +332,11 @@ struct ModuleState {
     // scanned HERE, and copied over `vbin` only on success, so a rejected update
     // never touches the active generation.
     vbin_cand: [u8; VBIN_BUF],
+    /// Declared stage kinds, parallel to the stage container. Empty means
+    /// every stage is compute — the historical meaning of a container alone.
+    stage_kinds: [u8; MAX_STAGES],
+    stage_kinds_len: u8,
+
     /// One retained output frame, drained before any new input is admitted.
     pending: Pending,
 
@@ -373,6 +462,35 @@ define_params! {
 
     // A shipped IR-stages container (hex), lowered to a bytecode-stages container
     // at load (each stage's cost re-derived).
+    // Which executor runs each stage, one hex byte per stage, parallel to
+    // `ir_stages`. `00` compute, `01` decision. Absent = all compute, so every
+    // existing graph means exactly what it did before.
+    //
+    // Declared here rather than inside the stage container because that
+    // container's bytes are recorded in a frozen corpus and in every emitted
+    // graph: changing its shape would invalidate answers that cannot be
+    // regenerated.
+    6, stage_kinds, str, 0 => |s, d, len| {
+        let mut raw = [0u8; MAX_STAGES * 2];
+        let n = if len > raw.len() { raw.len() } else { len };
+        let mut i = 0usize;
+        while i < n {
+            raw[i] = *d.add(i);
+            i += 1;
+        }
+        let mut out = [0u8; MAX_STAGES];
+        if let Some(nb) = hex_decode(&raw[..n], &mut out) {
+            s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_STAGES];
+            let mut k = 0usize;
+            while k < nb && k < MAX_STAGES {
+                s.stage_kinds[k] = out[k];
+                k += 1;
+            }
+            s.stage_kinds_len = nb as u8;
+        } else {
+            s.param_overflow = true;
+        }
+    };
     5, ir_stages, str, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.hex_len as usize) < HEX_BUF {
@@ -438,6 +556,8 @@ pub extern "C" fn module_new(
         s.vbin_len = 0;
         s.vbin_cand = [0u8; VBIN_BUF];
         s.pending = Pending { off: 0, len: 0 };
+        s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_STAGES];
+        s.stage_kinds_len = 0;
         s.publish_chan = dev_channel_port(sys, 1, 1);
         s.ack_chan = dev_channel_port(sys, 0, 1);
         s.corr_next = 1;
@@ -484,7 +604,11 @@ pub extern "C" fn module_new(
                     fault = b"[pipeline] FAULT: ir_stages param is not valid hex";
                     None
                 }
-                Some(flen) => match lower_stages(&s.ir_scratch[..flen], &mut s.prog) {
+                Some(flen) => match lower_stages_kinded(
+                    &s.ir_scratch[..flen],
+                    &s.stage_kinds[..s.stage_kinds_len as usize],
+                    &mut s.prog,
+                ) {
                     Err(_) => {
                         fault = b"[pipeline] FAULT: ir_stages container failed to lower";
                         None
@@ -549,8 +673,22 @@ pub extern "C" fn module_new(
         // once — never per-record. (`encode`/`decode` are ser/rd byte-VM
         // programs with their own opcode space; they carry no CALL and are
         // validated by their own evaluators' fail-closed paths.)
-        if s.vbin_len > 0 && scan_version_table(&s.vbin[..s.vbin_len as usize]).is_err() {
-            fault = b"[pipeline] FAULT: a stage needs an opcode/builtin not in this build";
+        // A DECISION stage's body is a decision container, not VM code, so the
+        // opcode scan would reject it for a fault it does not have. Each kind
+        // is validated by its own scanner; neither is skipped.
+        let kinded = s.stage_kinds_len > 0;
+        if s.vbin_len > 0 {
+            let bad = if kinded {
+                scan_kinded_versions(
+                    &s.vbin[..s.vbin_len as usize],
+                    &s.stage_kinds[..s.stage_kinds_len as usize],
+                )
+            } else {
+                scan_version_table(&s.vbin[..s.vbin_len as usize]).is_err()
+            };
+            if bad {
+                fault = b"[pipeline] FAULT: a stage needs an opcode/builtin not in this build";
+            }
         }
         if s.param_overflow {
             fault = b"[pipeline] FAULT: a param exceeded its buffer and was truncated";
@@ -873,6 +1011,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         code: &[],
                         max_cost: 0,
                         on_failure: None,
+                        kind: STAGE_KIND_COMPUTE,
                     }; MAX_STAGES];
                     let mut ok = true;
                     for (i, st) in stages.iter_mut().enumerate().take(ns) {
@@ -881,13 +1020,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             None => ok = false,
                         }
                     }
+                    // Kinds are declared alongside the container, not in it,
+                    // so an absent or short vector leaves stages COMPUTE.
+                    for (i, st) in stages.iter_mut().enumerate().take(ns) {
+                        if i < s.stage_kinds_len as usize {
+                            st.kind = s.stage_kinds[i];
+                        }
+                    }
                     if !ok {
                         s.acct.input_failed();
                         0
                     } else {
                         {
                             let mut spent = 0u64;
-                            let r = run_stages_metered(
+                            let r = run_stages_with(
+                                &KindedEval,
                                 &stages[..ns],
                                 frame_in,
                                 &mut s.buf_a,

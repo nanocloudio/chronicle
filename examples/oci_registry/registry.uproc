@@ -15,15 +15,22 @@ module oci.registry {
   // opaque bytes, so no parsing is needed.
   message oci.S3Call {
     conn_id: int = 1;
-    op: int = 2;
-    key: string = 3;
+    stream_id: int = 2;
+    op: int = 3;
+    key: string = 4;
   }
 
-  // Its answer; conn_id returns via the connector's correlation id.
+  // Its answer. BOTH ids return via the connector's correlation id: wave
+  // stamps `stream_id` as a monotonic request GENERATION and matches the
+  // response on `(conn_id, stream_id)`, so an answer carrying only conn_id
+  // matches nothing once the counter has moved past its first request — the
+  // response is dropped and the client hangs. The correlation slot is four
+  // bytes, which is exactly the two u16s.
   message oci.S3Reply {
     conn_id: int = 1;
-    status: int = 2;
-    body: string = 3;
+    stream_id: int = 2;
+    status: int = 3;
+    body: string = 4;
   }
 
   enum GET = 1;      // wave's wire/method.rs
@@ -34,9 +41,15 @@ module oci.registry {
   // a seeded object, not a branch, so the chain never forks.
   decision to_s3(req: oci.Request) -> oci.S3Call {
     when req.method == GET ->
-      oci.S3Call { conn_id: req.conn_id, op: S3_GET, key: req.path };
+      oci.S3Call {
+        conn_id: req.conn_id, stream_id: req.stream_id,
+        op: S3_GET, key: req.path
+      };
     default ->
-      oci.S3Call { conn_id: req.conn_id, op: S3_HEAD, key: req.path };
+      oci.S3Call {
+        conn_id: req.conn_id, stream_id: req.stream_id,
+        op: S3_HEAD, key: req.path
+      };
   }
 
   // Identity stages: a codec-only node has no program and fails closed with
@@ -49,7 +62,10 @@ module oci.registry {
   }
 
   transformation pass_call(c: oci.S3Call) -> oci.S3Call {
-    oci.S3Call { conn_id: c.conn_id, op: c.op, key: c.key }
+    oci.S3Call {
+      conn_id: c.conn_id, stream_id: c.stream_id,
+      op: c.op, key: c.key
+    }
   }
 
   pipeline serve(req: oci.Request) -> oci.S3Call {

@@ -65,6 +65,7 @@ scripts = [
   "tools/ci/limit-register.sh",
   "tools/ci/core-coverage.sh",
   "tools/ci/resource-summary.sh",
+  "tools/ci/hop-count.sh",
   # Behavioural drivers: each builds a graph bundle and drives the real .fmod
   # artefacts through the fluxor-linux runtime, asserting real output.
   "tools/e2e/*.sh",

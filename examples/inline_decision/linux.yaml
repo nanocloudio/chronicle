@@ -1,0 +1,35 @@
+# A DECISION AS A PIPELINE STAGE — the same routing the `decision` module does,
+# executed inside the pipeline node rather than beside it.
+#
+# A decision is one input, one output, and the same decode/evaluate/encode step
+# a compute stage is; only the program format differs. Run as a stage, a chain
+# that routes mid-way is one node instead of `pipeline -> decision -> pipeline`,
+# and the two channel hops either side of the decision are not paid.
+#
+# The decision container rides in the stage container's `code` slot and
+# `stage_kinds` names the executor. The stage container's own shape is
+# untouched (`[count][route][cost][len][code]`), so the same bytes mean the
+# same thing to a reader that knows nothing about kinds.
+#
+# Same program and same input as `examples/decision/`, so the two must agree:
+#
+#   printf '\x01\x01\x01\x08\x00\xd0\x07\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/inline_decision/linux.yaml | xxd   # 2000 -> 100
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: pipeline
+    params:
+      # One IR stage: [count=01][route=ff none][len][decision container].
+      # No cost field — lowering adds it; a decision stage is copied verbatim
+      # rather than transcoded, because its body is not flat IR.
+      ir_stages: "01ff4300014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+      # Stage 0 is a DECISION, not transformation bytecode.
+      stage_kinds: "01"
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

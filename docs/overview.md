@@ -35,6 +35,7 @@ The authoritative references for how the engine works.
 - [architecture/versioning.md](architecture/versioning.md) — multiple versions per module, `X-Module-Version` selection, hot reload, release manifests, fleet propagation
 - [architecture/limit_register.md](architecture/limit_register.md) — every capacity bound, its failure mode, and the CI gate that proves the register matches the code
 - [architecture/resource_summary.md](architecture/resource_summary.md) — generated per-module port and instrument summary for compose-time admission
+- [architecture/hop_register.md](architecture/hop_register.md) — generated count of engine→engine channel hops in every shipping graph
 - [bytecode_policy.md](bytecode_policy.md) — what the VM is for, the no-control-flow fence, and the pinned CEL builtin surface
 
 ## Guides
