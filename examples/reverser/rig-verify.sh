@@ -75,6 +75,32 @@ if [ "${1:-}" != "--check" ]; then
     || { echo "   (no telemetry checkpoint seen — falling back to a settle wait)"; sleep 20; }
 
   # Schema: inbound FIRST (fresh FAT32 each netboot → table ids 1 and 2).
+  #
+  # READINESS-PROBE, then DDL ONCE. The storage tier (consensus election +
+  # WAL replay + cold NVMe first touch) can lag the http listener by minutes
+  # on a fresh netboot — but retrying the CREATEs against an unready tier is
+  # WORSE than failing: a refused CREATE can still burn a catalog table id,
+  # and the CDC pump's keyrange is pinned to `inbound` being table id 1 — a
+  # burned id kills the reversed leg silently (observed: `[cdc] tmot=` with
+  # both pipelines healthy). So the wait probes with a SELECT, which
+  # allocates nothing, and the CREATEs run exactly once, against a tier that
+  # has already answered.
+  STORAGE_OK=0
+  for attempt in $(seq 60); do
+    OUT="$(python3 "$HERE/sql.py" "$DUT_IP" 5432 "SELECT msg FROM inbound" 2>&1 | tr -d '\0')" \
+      && { STORAGE_OK=1; break; }
+    case "$OUT" in
+      # POSITIVE evidence only: an executor that answered about the TABLE is
+      # up (the table may simply not exist yet). Everything else — storage
+      # unavailable, connection refused, timeouts — keeps waiting; treating
+      # "any other error" as readiness declared victory on a refused connect.
+      *"no such table"*|*"unknown table"*|*"relation"*|*"not found"*) STORAGE_OK=1; break ;;
+      *) ;;
+    esac
+    [ $((attempt % 6)) = 0 ] && echo "   (storage not ready — probe $attempt/60: $(echo "$OUT" | head -c 60))"
+    sleep 5
+  done
+  [ "$STORAGE_OK" = 1 ] || die "storage tier never became ready"
   python3 "$HERE/sql.py" "$DUT_IP" 5432 \
     "CREATE TABLE IF NOT EXISTS inbound (msg TEXT PRIMARY KEY)" \
     "CREATE TABLE IF NOT EXISTS reversed (ts BIGINT PRIMARY KEY, msg TEXT)" \
@@ -99,3 +125,36 @@ for _ in $(seq 150); do
   sleep 0.2
 done
 die "reversed message '$WANT' never appeared on /messages"
+
+# ── Telemetry acceptance (rfc_observability_surface §12.8 phase 1) ─────────
+# With fluxor-collect running on this host against the graph's id-table:
+#
+#   fluxor id-table examples/reverser/reverser_pi5.yaml -o /tmp/reverser.idtable.json
+#   fluxor-collect --id-table /tmp/reverser.idtable.json &
+#
+# drive load and assert the request-latency histogram is live with its p99
+# INSIDE the declared ladder (not pinned to +Inf) — the exact unsound-ladder
+# failure the per-instrument bounds exist to prevent. Skipped (not failed)
+# when no collector is listening: the reverser verification above stands on
+# its own, and telemetry acceptance needs the collector by design.
+if curl -sf -m 2 "http://127.0.0.1:9464/metrics" >/dev/null 2>&1; then
+  echo "── telemetry: driving 100 requests for histogram mass"
+  for i in $(seq 100); do
+    curl -sf -m 5 "http://$DUT_IP/reverse?msg=load-$i" >/dev/null || die "load request $i failed"
+  done
+  echo "   waiting one emit cadence"
+  sleep 7
+  M="$(curl -sf "http://127.0.0.1:9464/metrics")" || die "collector scrape failed"
+  echo "$M" | grep -q "fluxor_requests_total{" || die "requests_total absent from the scrape"
+  TOTAL="$(echo "$M" | grep 'fluxor_request_latency_us_count{' | grep -oE '[0-9]+$' | head -1)"
+  [ -n "$TOTAL" ] && [ "$TOTAL" -ge 100 ] || die "latency histogram count '$TOTAL' < 100"
+  INF="$(echo "$M" | grep 'fluxor_request_latency_us_bucket{.*le="+Inf"' | grep -oE '[0-9]+$' | head -1)"
+  MID="$(echo "$M" | grep 'fluxor_request_latency_us_bucket{.*le="100000"' | grep -oE '[0-9]+$' | head -1)"
+  [ -n "$INF" ] && [ -n "$MID" ] || die "latency buckets absent"
+  # p99 mid-ladder: ≥99% of requests at or under the 100 ms bound.
+  [ $((MID * 100)) -ge $((INF * 99)) ] \
+    || die "p99 above 100ms (le=100000: $MID of $INF) — ladder or DUT regression"
+  echo "   telemetry PASS: $TOTAL requests, p99 inside the ladder (≤100ms: $MID/$INF)"
+else
+  echo "── telemetry: no collector on :9464 — acceptance step skipped (see header)"
+fi

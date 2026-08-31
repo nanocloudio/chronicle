@@ -28,16 +28,15 @@
 # bare-metal-pi5-disk.yaml, allocator/pump from the linux tier). Modules
 # resolve from the store by CHRONICLE's pins (lattice + clustor + wave).
 target: pi5
-# 2000, not the bench rigs' 1000: the step-deadline ceiling is 16 x tick_us,
-# and this graph IDLES FOR HOURS with cdc_pump checkpointing — each ~384
-# checkpoint puts trigger a whole-memtable flush to FAT32, whose latency
-# grows as run files accumulate. At tick 1000 a late flush crossed 16 ms and
-# the kernel TERMINATED kv_state_worker ("storage unavailable" while the
-# front half still accepts). A pump scan page costs ~8-18 ms on this
-# FAT32/NVMe stack (cursor positioning dominates); tick 2000 gives the
-# 32 ms burst ceiling that clears it, 500 drain-commands/s of queue
-# throughput, and the store's merge-at-3-runs bounds run growth. The
-# real fix is chunking the version-scan drain (lattice task #24).
+# 2000, not the bench rigs' 1000: per-request latency is roughly pipeline
+# depth x tick_us, and this graph is the application path AND its storage
+# tier on one core. The storage tier does not need a larger tick — every
+# store action whose natural size is the table's, not the command's (flush,
+# compaction, the CDC version scan, a paged SQL read) runs as one bounded
+# slice per step — so the tick is sized for the request path alone. What
+# remains above it is the device's tail (a FAT32/NVMe cache flush stalls a
+# synchronous FS call 35-150 ms), declared below as `tolerate`: recorded,
+# never fatal.
 tick_us: 2000
 
 scheduler:
@@ -48,6 +47,13 @@ platform:
   debug:
     to: net
     monitor: true
+    # Telemetry export (phase-1 silicon acceptance): fxtl-compact batches to
+    # fluxor-collect on the workstation (host.toml collector_ip), which
+    # resolves names/bounds/dims from `fluxor id-table` over the SAME roots
+    # the build injected (fluxor.toml [observability] id_table_dirs) and
+    # serves Prometheus text on :9464.
+    export_telemetry: udp
+    export_dst_port: 4317
 
 modules:
   # ── Bare-metal storage stack (the FS contract WAL + LSM use) ────
@@ -57,13 +63,23 @@ modules:
     queue_depth: 32
   - name: fat32
     path: /
-    # Demo clean-slate: truncate the root dir and reclaim orphaned .WAL/.LSM
-    # spans from prior runs, so every boot measures the same system AND the
-    # catalog allocator starts at table id 1 (the pump's keyrange depends on
-    # `inbound` being the first CREATE — see lattice_reverser.yaml).
-    clean_root: 1
+    # The store is PERSISTENT across boots: the WAL replays and the LSM
+    # manifest is recovered, so a reboot serves what the last boot committed
+    # and the catalog keeps its table ids (the pump's keyrange depends on
+    # `inbound` being table 1 — see lattice_reverser.yaml — which the first
+    # CREATE on a fresh volume establishes and every later boot preserves).
+    # Nothing here names or wipes a volume; the example runs on any Pi 5 with
+    # an NVMe FAT32 volume.
+    #
+    # A first durable write on a cold volume forces a segment create — a
+    # one-shot tens-of-ms synchronous FS operation. That is a legitimate
+    # device tail, not a budget this module asks to hold every step, so it
+    # is declared as one: `tolerate` records the overrun and keeps the
+    # module running. A step deadline sized to it would ask the domain to
+    # reserve a budget it can never honour at a 2 ms tick — the deadline is a
+    # detection threshold, not a reservation.
+    fault_policy: tolerate
     init_free_hint: 20000
-    clear_free_region: 4096
 
   # ── Relational front ────────────────────────────────────────────
   - name: pg_edge_anchor
@@ -81,18 +97,19 @@ modules:
       # the bare-metal FS contract).
       state_store: 1
       root_path: 1
-    # REQUIRED for state_store: 1 (default 2 ms deadline kills the module on
-    # its first flush — bare-metal-pi5-disk.yaml has that autopsy). 24/32 ms,
-    # not that config's 12/16: the CDC pump's SCAN_VERSIONS drain reads
-    # spilled run files in ONE step, and this rig MEASURED a 17.6 ms drain
-    # (n=1 spill=1 blocks=31 reads=93) terminating the worker at the 16 ms
-    # ceiling — "storage unavailable" with a healthy front half. 32 ms is
-    # this tick's validator ceiling (16 x tick_us); the pump's page_limit
-    # below bounds the drain from the other side. The REAL fix is chunking
-    # the drain like the flush — a lattice substrate follow-on.
-    step_deadline_us: 24000
+    # The worker's own work is bounded per step by construction: flush and
+    # compaction run 32 records per step, the CDC version scan two run
+    # blocks per step (the page is held between slices), paged SQL reads
+    # resume from a position memo, point reads seek through the run index,
+    # and a run block is one FS call. 8 ms is the detection threshold for a
+    # step that carries several run-backed lookups on this FAT32/NVMe stack
+    # (~0.2 ms per block); a step past it is a device tail — a cache flush
+    # stalling a synchronous FS call for 35-150 ms — which `tolerate`
+    # records and survives. The burst deadline is pinned at the validator's
+    # 16 x tick_us ceiling so the default x8 does not exceed it.
+    step_deadline_us: 8000
     step_deadline_burst_us: 32000
-    fault_policy: skip
+    fault_policy: tolerate
   - name: lattice_apply_bridge
 
   # ── MVCC timestamp authority (commit_ts IS the reverser's sequence) ─
@@ -121,20 +138,23 @@ modules:
       voter_count: 1
       heartbeat_interval_ms: 150
   - name: durability
-    # Async durable-write path + fail-closed deadline, tuned on this rig —
-    # bare-metal-pi5-relational.yaml carries the measurements.
-    step_deadline_us: 12000
-    step_deadline_burst_us: 16000
-    fault_policy: skip
+    # Async durable-write path (FS_WRITE_ASYNC + submit/poll fences): the
+    # step never blocks on an fsync, and its cold one-shots (segment create,
+    # boot replay) return Burst and are covered by the burst deadline. What
+    # can still exceed the default 2 ms detection threshold is the device
+    # tail behind a synchronous FS call, which no deadline can budget for;
+    # it is recorded and the module keeps running.
+    fault_policy: tolerate
     params:
       fsync_mode: 1
       group_window_ms: 0
       group_max_pending: 8
       fence_depth: 8
-      # FAT32 root, 8.3 segment names; fresh WAL each boot (demo rig — the
-      # crash-recovery scenarios are elsewhere and must NOT skip replay).
+      # FAT32 root, 8.3 segment names. The WAL replays at boot: the store
+      # is persistent, and a replayed tail is what keeps the recovered run
+      # set, the memtable and the timestamp clock consistent with each
+      # other.
       root_path: 1
-      skip_replay: 1
       segment_bytes: 4194304
       self_id: 0
       voter_count: 1
@@ -156,14 +176,12 @@ modules:
       resolved_interval_ms: 5000
       claim_interval_ms: 5000
       retention_budget_ms: 60000
-      # A PATIENT pump. Each scan page costs the worker one ~8-18 ms drain
-      # step (cursor positioning dominates, so SMALL pages only multiply
-      # the fixed cost — page_limit stays at the default 16). Under an
-      # insert burst a page reply queues behind SQL commands; the default
-      # 2 s stall grace then RE-ISSUED the page, and the retries starved
-      # the executor into a livelock (telemetry: the identical 7.9 ms
-      # drain repeating forever, SQL timing out behind it — the rig
-      # soak's "storage dead at burst 3"). 15 s lets a burst drain.
+      # A PATIENT pump. A scan page over a large table is answered across
+      # many steps (the worker walks two run blocks per step and holds the
+      # page between slices), and under an insert burst its slices share
+      # the tick with the SQL commands. A 2 s grace would report the feed
+      # stalled while a page is simply still paging; 15 s is longer than
+      # any page's walk at this tick. page_limit stays at the default 16.
       stall_grace_ms: 15000
 
 
@@ -374,7 +392,7 @@ wiring:
     to: consensus.wal_flushed
   - from: durability.installed_local
     to: consensus.snapshot_installed
-  - from: consensus.wal_compact
+  - from: consensus.log_maintenance
     to: durability.compact_before
   - from: durability.quorum_durable
     to: consensus.durable

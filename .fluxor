@@ -1,0 +1,3 @@
+# Marks this directory as a fluxor project root for cwd-independent
+# discovery (fluxor id-table / build from another repo resolve the
+# [observability] id_table_dirs against THIS root, not their cwd).

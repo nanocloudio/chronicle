@@ -192,7 +192,7 @@ wiring:
     to: consensus.wal_flushed
   - from: durability.installed_local
     to: consensus.snapshot_installed
-  - from: consensus.wal_compact
+  - from: consensus.log_maintenance
     to: durability.compact_before
   - from: durability.metrics
     to: operations.ingest

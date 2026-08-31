@@ -19,6 +19,25 @@ pub mod rd {
     pub const REST: u8 = 0x78; // push all remaining bytes from the cursor to the end
     pub const H2MSG: u8 = 0x79; // walk HTTP/2 frames from the cursor to the first DATA frame, push its gRPC Length-Prefixed-Message payload (the response protobuf)
     pub const PBFIELD: u8 = 0x7A; // field:u32 LE — pop a protobuf message (Bytes), scan for that field number, push its value (len-delimited → Bytes, varint/fixed → Int, absent → Null)
+    /// `delim:u8` — like [`UNTIL`], but TOLERANT of exhaustion.
+    ///
+    /// `UNTIL` fails with `Truncated` when the delimiter is not there, which
+    /// makes a program that reads N delimited fields a program that only works
+    /// on input with exactly N of them. That is why splitting a VARIABLE-ARITY
+    /// sequence — a URL path, a CSV row, a header block, a SIP request line —
+    /// has needed a domain module rather than a decode program: not the absence
+    /// of iteration, but the absence of a reader that can run out.
+    ///
+    /// Three cases, none an error:
+    ///   * delimiter found — push the bytes before it and consume it (as `UNTIL`)
+    ///   * input remains but no delimiter — push the REMAINDER, cursor to the end
+    ///   * cursor already at the end — push EMPTY
+    ///
+    /// So `UNTIL_OPT` repeated N times reads up to N fields and pads the rest
+    /// with empty, which is exactly what a flat record wants: field numbers stay
+    /// stable and a consumer distinguishes "absent" by emptiness rather than by
+    /// the program having failed.
+    pub const UNTIL_OPT: u8 = 0x7B;
 }
 
 /// Read one protobuf base-128 varint at `pos` in `buf`; returns `(value, next)`.
@@ -155,6 +174,21 @@ pub fn eval_decode<'a>(
                 }
                 let slice = &input[start..pos];
                 pos += 1; // skip the delimiter
+                push!(Value::Bytes(slice));
+            }
+            rd::UNTIL_OPT => {
+                let delim = *code.get(pc).ok_or(EvalError::Truncated)?;
+                pc += 1;
+                let start = pos;
+                while pos < input.len() && input[pos] != delim {
+                    pos += 1;
+                }
+                let slice = &input[start..pos];
+                if pos < input.len() {
+                    pos += 1; // consume the delimiter
+                }
+                // No `Truncated`: running out IS one of the outcomes. An empty
+                // push at the end of input is what pads a short sequence.
                 push!(Value::Bytes(slice));
             }
             rd::TAKE => {

@@ -77,13 +77,6 @@ substitutions and zero logic changes:
   a switch). This was built for this example and is the general mechanism
   for composing a client module against its own board's listener.
 
-**Known limit (lattice task #24)**: the store's version-scan drain is not
-yet chunked, so once the first memtable spill exists (~240 messages total)
-the pump's page walks saturate the FAT32 read path and SQL starves — the
-board serves ~240 messages per boot, then needs a re-netboot (~3 min,
-`clean_root` resets state). The fix (suspend/resume the scan across steps,
-like the flush) is filed with full rig evidence.
-
 Two size levers keep the image under the Pi 5 netboot ceiling (~3.6 MB —
 images crossing it boot silent-dead with the appended module/config payload
 unreadable; found by bisection on this bench): wave http's `app` variant

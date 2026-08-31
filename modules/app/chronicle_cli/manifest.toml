@@ -47,11 +47,16 @@ default  = true
 name         = "args"
 direction    = "input"
 content_type = "OctetStream"
-# 2 x UPROC_BUF: the document travels as one hex argument, and an argv
-# record that exceeds the CHANNEL is never delivered at all — the applet
-# waits for argv that cannot arrive (cli_in now bounds the retry and logs,
-# but the fix is a channel the record fits).
-buffer_size  = 33024
+# 2 x UPROC_BUF + slack: the document travels as ONE hex argument, and an argv
+# record that exceeds the CHANNEL is never delivered at all — the applet waits
+# for argv that cannot arrive (cli_in bounds the retry and logs, but the fix is
+# a channel the record fits).
+#
+# This had drifted: `ARGV_BUF` in mod.rs was 65536 while this stayed at 33024,
+# so a document the module could hold was refused by the channel in front of
+# it — and the symptom is the applet printing its HELP and exiting 0, which
+# reads as a usage mistake rather than a bound. The two move together.
+buffer_size  = 131328
 
 # stdout → cli_out.bytes_in.
 #

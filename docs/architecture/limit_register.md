@@ -66,8 +66,8 @@ Dimensions: **B**=bytes, **rec**=records/frames, **fld**=fields, **st**=stages,
 
 | Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
 |---|---|---|---|---|---|---|---|---|---|
-| `UPROC_BUF` | 32768 | B | per document | capacity | `.uproc` source > 32 KiB → refused before author (does not hang) | source staging | a full IdP `.uproc` (the largest example document, ~25.5 KiB) | larger variant | `chronicle_cli` author suites |
-| `ARGV_BUF` | 65536 | B | per invocation | capacity | argv record > 64 KiB → bounded retry then ERROR, applet gets no argv | argv staging (2 × `UPROC_BUF`) | the hex of a max document as one argv record | tracks `UPROC_BUF` (2×) | `chronicle_cli` parse suites |
+| `UPROC_BUF` | 65536 | B | per document | capacity | `.uproc` source > 64 KiB → refused before author (does not hang) | source staging | one document carrying a whole protocol surface: discovery, authn, mTLS, authz, admission and CRUD on one request path | larger variant, in state | `chronicle_cli` author suites |
+| `ARGV_BUF` | `2 * UPROC_BUF` (131072) | B | per invocation | capacity | argv record past the buffer → bounded retry then ERROR, applet gets no argv | argv staging | the hex of a max document as one argv record; DERIVED so the two cannot drift apart and leave a document that compiles but never reaches the applet | tracks `UPROC_BUF` (2x) | `chronicle_cli` parse suites |
 | `MAX_RULE` | 32 | rec | per decision (author) | capacity | 33rd rule arm → author reject | 2 × 16 KiB in module STATE (`RuleCode`), not the stack | a state machine's arm count follows its states: entry and exit conditions over a handful of states reach the twenties without padding | raise with the buffers in state, never on a PIC frame | `chronicle_cli` decision authoring |
 | `RULE_CODE` | 512 | B | per rule program (author) | capacity | a `when` or outcome compiling past 512 B → author reject | `2 × MAX_RULE × RULE_CODE` = 32 KiB in state | one arm's predicate or constructed outcome; the outcome is the long one, since a pass-through arm sets every field of its record | larger variant, in state | `chronicle_cli` decision authoring |
 | `BIN_BUF` | 16384 | B | per artefact (author) | capacity | artefact past the buffer → author reports and refuses | 3 work buffers in module state | one sealed artefact: its container, its lowered code, and the digest-free encoding the two-pass seal needs | larger variant, in state | `chronicle_cli` author suites |
@@ -112,8 +112,8 @@ MAX_SNAPSHOT | modules/app/aggregation/mod.rs | 40960
 SNAP_HEX | modules/app/aggregation/mod.rs | 2 * MAX_SNAPSHOT
 VBIN_BUF | modules/app/pipeline/mod.rs | 8192
 PROG_BUF | modules/app/pipeline/mod.rs | 2048
-ARGV_BUF | modules/app/chronicle_cli/mod.rs | 65536
-UPROC_BUF | modules/app/chronicle_cli/mod.rs | 32768
+ARGV_BUF | modules/app/chronicle_cli/mod.rs | 2 * UPROC_BUF
+UPROC_BUF | modules/app/chronicle_cli/mod.rs | 65536
 OUT_BUF | modules/app/chronicle_cli/mod.rs | 2 * tc::BIN_BUF + 4096
 HEX_BUF | modules/app/decision/mod.rs | 40960
 CONT_BUF | modules/app/decision/mod.rs | 20480

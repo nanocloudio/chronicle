@@ -78,3 +78,17 @@ scripts = [
 # crates, where inline tests were idiomatic; there are no host crates now.)
 forbid_inline_tests = ["modules"]
 mode                = "strict"
+
+# Manifest roots for the telemetry id-table (names, histogram bounds,
+# dimension domains): chronicle graphs COMPOSE store-resolved modules from
+# these sibling checkouts, and both the build's digest/bounds injection and
+# `fluxor id-table` resolve against the SAME list, so the digest handshake
+# holds with name-complete rows.
+[observability]
+id_table_dirs = [
+  "../fluxor/modules",
+  "../wave/modules",
+  "../lattice/modules",
+  "../clustor/modules",
+  "../quantum/modules",
+]

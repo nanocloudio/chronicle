@@ -262,7 +262,7 @@ const MAX_STAGES: usize = 8;
 // argv record is twice the document plus the subcommand. The two constants
 // move TOGETHER or an over-bound document stops being a compile error and
 // becomes an argv record the channel never delivers.
-const ARGV_BUF: usize = 65536;
+const ARGV_BUF: usize = 2 * UPROC_BUF;
 /// Largest `.uproc` document this CLI will author, in bytes of source.
 ///
 /// Sized for a whole protocol surface rather than a single operation: the
@@ -279,7 +279,15 @@ const ARGV_BUF: usize = 65536;
 /// consent. The cost is module state on a device that has plenty:
 /// `chronicle_cli`, `pipeline` and `decision` are all
 /// `hardware_targets = ["bcm2712"]`.
-const UPROC_BUF: usize = 32768;
+///
+/// The sizing case is one request path carrying discovery, authn, mTLS,
+/// authz, admission and CRUD — an API plane's whole protocol surface in a
+/// single document, which measures ~33 KB. [`ARGV_BUF`] is DERIVED from this
+/// rather than restated, because the two drifting apart is the failure this
+/// bound exists to prevent: a document that clears the compile check but
+/// becomes an argv record the channel never delivers, leaving the applet to
+/// print its help and exit 0.
+const UPROC_BUF: usize = 65536;
 /// The CLI's stdout buffer, in module state.
 ///
 /// Every artefact prints as HEX — twice its bytes — and `graph` wraps its
