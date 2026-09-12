@@ -107,6 +107,13 @@ modules:
     suite: 2   # Ed25519
 
   - name: token_mint
+    params:
+      # The key-custody floor this deployment claims. `token_mint` refuses to
+      # construct undeclared: where a signing key may live is a deployment
+      # decision, and a default would make the weaker choice silently. An
+      # example on a dev box claims `development`; a real deployment claims
+      # `production` and is held to that floor.
+      posture: development
 
   - name: security_state
     params:

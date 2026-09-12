@@ -1430,7 +1430,7 @@ kind = "module"
 name = "http"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:37756c877b50b42ec6a8e8f96978cda22120964b244d41f5718a1a08c94f0b4a"
+digest = "sha256:9f02a822759abd832f8f89e21b790b05a0e3d161990366508eecab995917a88e"
 reference = "bcm2712/http:0.0.1"
 
 [[artifact]]
@@ -1438,7 +1438,7 @@ kind = "module"
 name = "http-app"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:55c8c12ac5f09dcb23f0307d057e519a28966f42bf9ad4a4ff51eb0bbe38c223"
+digest = "sha256:3c88a37754968eeaba149762b48d600e79d2f857c8fcb39ac886fd0389c2b741"
 reference = "bcm2712/http-app:0.0.1"
 
 [[artifact]]
@@ -1446,7 +1446,7 @@ kind = "module"
 name = "http-exchange"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:ecad8dfaa84177cd1740954ceaf823a9bc80fb0957667d82ea3a70cc2896de28"
+digest = "sha256:de036cc27eb59ec07fccae4c0880cc70e36d66aa87f15a0f57cf9a2ff1743c06"
 reference = "bcm2712/http-exchange:0.0.1"
 
 [[artifact]]
@@ -1454,7 +1454,7 @@ kind = "module"
 name = "http-h1_exchange"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:01e4d5566cff5eba12625e0acefc8de59e2be9845b3daa9134b6579db51f8ce5"
+digest = "sha256:71072ade1876c653e8710142f7cc6d8b52b552a7f4688bd2a4c16b119acc5bf6"
 reference = "bcm2712/http-h1_exchange:0.0.1"
 
 [[artifact]]
@@ -1462,7 +1462,7 @@ kind = "module"
 name = "http-h2"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:2db12396b219e89e704d0ebff0757365b188bf44741fd2dac370928855ac1b7c"
+digest = "sha256:3a9d38c067c129ef8557fee4667747644a3b69dd6aca0a849f5f72b6dc2b0001"
 reference = "bcm2712/http-h2:0.0.1"
 
 [[artifact]]
@@ -1470,7 +1470,7 @@ kind = "module"
 name = "http-web"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:ebc1f382bb21ae7e39aae6e9eadc1cc1cf06d191cd9a8f3769d01c24f14b6859"
+digest = "sha256:96e3550478b71bfdab18131c3248eed66a60b05c874f965203f61627730d13f6"
 reference = "bcm2712/http-web:0.0.1"
 
 [[artifact]]
@@ -1478,7 +1478,7 @@ kind = "module"
 name = "http_echo_app"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:31b51bf540dd5d4505bce3ac0a629f207ce28461c83ae02b909372e69d451e1d"
+digest = "sha256:54463e1f5796bc9c7132796430e6dbd94d555cdce73bb748a36b111124addd10"
 reference = "bcm2712/http_echo_app:0.0.1"
 
 [[artifact]]
@@ -1486,7 +1486,7 @@ kind = "module"
 name = "jitter"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:a08f296e04d0ca393f34c0417e2422bb6b6903e6ce0facdaa33c35666dfe12bc"
+digest = "sha256:de6d66901ba25f161622843d201bd3b2ce640dc4e2ae572a8882ffbca3b89cdd"
 reference = "bcm2712/jitter:0.0.1"
 
 [[artifact]]
@@ -1494,7 +1494,7 @@ kind = "module"
 name = "mail"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:88bdc2b5b74b708e8c12cb290b68489134417b1618c6efc547f01cf853e95457"
+digest = "sha256:6df71946b46c5b1fc1f2d8983746e2a70c49e3038eb1a03ab46c451f1007b103"
 reference = "bcm2712/mail:0.0.1"
 
 [[artifact]]
@@ -1502,7 +1502,7 @@ kind = "module"
 name = "rtcp"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:3db32d9468b2da798b7cec6090f07a593887ae28f794aa6e421e825df872d1b5"
+digest = "sha256:7bf17de102167c2d923b217d2e181cd7f0b4f8a8baf9dfc90c0b31be16dd36d1"
 reference = "bcm2712/rtcp:0.0.1"
 
 [[artifact]]
@@ -1510,7 +1510,7 @@ kind = "module"
 name = "rtp"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:ba5921ab0bfde2d7e6b718d95fb62593385a69158d121e36f8fe2b3f846f96a7"
+digest = "sha256:a36f213b185913f9139e0528bdf0cc764f304ebf4451fb3e3ed49be67528b787"
 reference = "bcm2712/rtp:0.0.1"
 
 [[artifact]]
@@ -1518,7 +1518,7 @@ kind = "module"
 name = "s3"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:e754f880e0bfe749c00d1d11686cea8e8eb156bfa6a86fe587d92cae06b932ef"
+digest = "sha256:9ec346156ac27a2e23070e4be1981bc5dfd7ff09986701b143ca285c90e05207"
 reference = "bcm2712/s3:0.0.1"
 
 [[artifact]]
@@ -1526,7 +1526,7 @@ kind = "module"
 name = "sip"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:ae4bf3faa26c89af0521d4755e88c2e2af01555274805e6990d94c8052df692b"
+digest = "sha256:b219fb0327e29cf5b92716f3e9645b1785ce277ecc896a4cd0cfdd93142a2bbd"
 reference = "bcm2712/sip:0.0.1"
 
 [[artifact]]
@@ -1534,7 +1534,7 @@ kind = "module"
 name = "smtp"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:c6c4b1d90fe66ab01ea793ff7a711b0afd69064cf58b7a2a08ef5e7f4ba62571"
+digest = "sha256:96d21e2a528d664e7249cbfbb4e8f8bfff9e43b2d3cab54b9340721202a114b2"
 reference = "bcm2712/smtp:0.0.1"
 
 [[artifact]]
@@ -1542,7 +1542,7 @@ kind = "module"
 name = "stun"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:453117135515809aafe4e8e34a5bd5d3bc180d617f2169d9ab6bf20673f68d00"
+digest = "sha256:ea069ff419e601b6b474619e74fb51977adb03a18e18eda9f4bc0575c7e1f4cf"
 reference = "bcm2712/stun:0.0.1"
 
 [[artifact]]
@@ -1550,7 +1550,7 @@ kind = "module"
 name = "websocket"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:29062b24e5dabc626eb399991cca85c8af88393b8d7cffe224a88056619bfc1f"
+digest = "sha256:1ca640932dbf18c96e07c4abf9be62ca63419c0f55f93694447f94e7674226b8"
 reference = "bcm2712/websocket:0.0.1"
 
 [[artifact]]
@@ -1558,7 +1558,7 @@ kind = "module"
 name = "ws_echo_worker"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:219eaa3eedc40085dc43f24368cffa165033b0d01a73418542e90c5037d5db98"
+digest = "sha256:c739aced6dcd93d139ec0e60d4668bf3282daf91767683bd4c55c21a14306837"
 reference = "bcm2712/ws_echo_worker:0.0.1"
 
 [[artifact]]
@@ -1566,7 +1566,7 @@ kind = "module"
 name = "ws_stream"
 project = "wave"
 target = "bcm2712"
-digest = "sha256:5ebd47248ebcfc5aed7909b71691fbdfdf4be4fffab02e571202d2fa3a08bb5f"
+digest = "sha256:91e63bff2f878c24e48bcee4f1e638dc5bbae7f3c871a1f54153fc8b7eb96585"
 reference = "bcm2712/ws_stream:0.0.1"
 
 [[artifact]]
@@ -1582,7 +1582,7 @@ kind = "runtime"
 name = "fluxor-linux"
 project = "fluxor"
 target = "aarch64-unknown-linux-gnu"
-digest = "sha256:8691aa074d8a3064d7a9f628e842880ef423a46b9cb5948061a0818be72c4baa"
+digest = "sha256:65156df62d8e6ea8eb7954fdb34f7906204975721e69aa562fe4301e254dca1c"
 reference = "fluxor/run/fluxor-linux-aarch64-unknown-linux-gnu:0.0.1"
 
 [[artifact]]
@@ -1638,5 +1638,5 @@ reference = "quantum/src/quantum-common:0.0.1"
 kind = "source"
 name = "wave-common"
 project = "wave"
-digest = "sha256:42ab0532ccb606e7548179650aa32f60e2bfaf03be0aa28aae355a9cd8aedde7"
+digest = "sha256:a9ac12aa1581e8245badb05cab1a1994954dc1f5d4fba29d79220e089dc292dc"
 reference = "wave/src/wave-common:0.0.1"
