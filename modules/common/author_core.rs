@@ -28,14 +28,22 @@ pub fn parse_i64(b: &[u8]) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
+/// Split a NUL-separated argv record into `(start, end)` spans over `rec`.
+///
+/// Returns the number of arguments PRESENT, not the number stored: arguments
+/// past `MAX_ARGV` are counted and not written, so a caller comparing the
+/// result against `MAX_ARGV` refuses an over-long argv rather than acting on a
+/// silently truncated one. Same discipline as `split_on`.
 pub fn split_argv(rec: &[u8], out: &mut [(usize, usize); MAX_ARGV]) -> usize {
     let mut n = 0;
     let mut start = 0;
     let mut i = 0;
-    while i <= rec.len() && n < out.len() {
+    while i <= rec.len() {
         if i == rec.len() || rec[i] == 0 {
             if i > start {
-                out[n] = (start, i);
+                if n < out.len() {
+                    out[n] = (start, i);
+                }
                 n += 1;
             }
             start = i + 1;
@@ -113,6 +121,12 @@ pub fn split_qualified(n: &[u8]) -> (&[u8], &[u8]) {
     (&[], n)
 }
 
+/// Split a comma-separated argument into slices over `arg`.
+///
+/// Returns the number of items PRESENT, not the number stored: items past
+/// `out`'s capacity are counted and not written, so a caller comparing the
+/// result against `out.len()` refuses an over-long list rather than acting on a
+/// silently truncated one. Same discipline as `split_on`.
 pub fn split_csv<'a>(arg: &'a [u8], out: &mut [&'a [u8]]) -> usize {
     if arg == b"-" || arg.is_empty() {
         return 0;
@@ -120,10 +134,12 @@ pub fn split_csv<'a>(arg: &'a [u8], out: &mut [&'a [u8]]) -> usize {
     let mut n = 0;
     let mut start = 0;
     let mut i = 0;
-    while i <= arg.len() && n < out.len() {
+    while i <= arg.len() {
         if i == arg.len() || arg[i] == b',' {
             if i > start {
-                out[n] = &arg[start..i];
+                if n < out.len() {
+                    out[n] = &arg[start..i];
+                }
                 n += 1;
             }
             start = i + 1;
@@ -136,6 +152,9 @@ pub fn split_csv<'a>(arg: &'a [u8], out: &mut [&'a [u8]]) -> usize {
 pub fn split_digests(arg: &[u8], out: &mut [[u8; 32]]) -> Option<usize> {
     let mut items = [b"".as_slice(); MAX_SET];
     let n = split_csv(arg, &mut items);
+    if n > items.len() || n > out.len() {
+        return None; // more digests than the set holds — refuse, never truncate
+    }
     for k in 0..n {
         if items[k].len() != 64 || hex_decode(items[k], &mut out[k]) != Some(32) {
             return None;
@@ -533,16 +552,17 @@ pub fn author_document(
         let Ok((_, digest)) = sealed else {
             return (append(&mut *st_out, 0, b"error: seal failed\n"), 1);
         };
-        if nrefs < MAX_ART {
-            rdigest[nrefs] = digest;
-            rsym[nrefs] = d.name.of(src);
-            rkind[nrefs] = if is_expr {
-                KIND_EXPRESSION
-            } else {
-                KIND_TRANSFORMATION
-            };
-            nrefs += 1;
+        if nrefs >= MAX_ART {
+            return (append(&mut *st_out, 0, b"error: too many artefacts\n"), 1);
         }
+        rdigest[nrefs] = digest;
+        rsym[nrefs] = d.name.of(src);
+        rkind[nrefs] = if is_expr {
+            KIND_EXPRESSION
+        } else {
+            KIND_TRANSFORMATION
+        };
+        nrefs += 1;
         out_p = emit(&mut *st_out, out_p, d.name.of(src), &digest);
     }
 
@@ -666,12 +686,13 @@ pub fn author_document(
         ) else {
             return (append(&mut *st_out, 0, b"error: seal failed\n"), 1);
         };
-        if nrefs < MAX_ART {
-            rdigest[nrefs] = digest;
-            rsym[nrefs] = d.name.of(src);
-            rkind[nrefs] = KIND_DECISION;
-            nrefs += 1;
+        if nrefs >= MAX_ART {
+            return (append(&mut *st_out, 0, b"error: too many artefacts\n"), 1);
         }
+        rdigest[nrefs] = digest;
+        rsym[nrefs] = d.name.of(src);
+        rkind[nrefs] = KIND_DECISION;
+        nrefs += 1;
         out_p = emit(&mut *st_out, out_p, d.name.of(src), &digest);
     }
 
@@ -945,7 +966,10 @@ pub fn author_document(
             symbol: &[],
             required: false,
         }; MAX_BIND];
-        let nb = (doc.n_resources).min(MAX_BIND);
+        if doc.n_resources as usize > MAX_BIND {
+            return (append(&mut *st_out, 0, b"error: too many resources\n"), 1);
+        }
+        let nb = doc.n_resources as usize;
         for (k, r) in arena.resources.iter().take(nb).enumerate() {
             let r = *r;
             binds[k] = BindingSpec {
@@ -961,7 +985,10 @@ pub fn author_document(
             digest: &[],
         }; MAX_BIND];
         let mut ne = 0usize;
-        for k in 0..doc.n_entries.min(MAX_BIND) {
+        if doc.n_entries as usize > MAX_BIND {
+            return (append(&mut *st_out, 0, b"error: too many entries\n"), 1);
+        }
+        for k in 0..doc.n_entries as usize {
             let e = arena.entries[k];
             // An entry names a pipeline; its digest is the one just sealed.
             let target = e.pipeline.of(src);

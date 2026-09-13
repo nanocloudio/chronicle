@@ -30,7 +30,7 @@ loam = "0.0.1"
 # lattice supplies `pg_client`, the reverser's SQL connector, plus the
 # reverser's storage-tier graph (pg_edge_anchor, cdc_pump, …); clustor is that
 # tier's consensus/WAL substrate. The REVERSER'S composition point is here:
-# lattice must not depend on quantum (CDC RFC), so the application project
+# lattice must not depend on quantum, so the application project
 # that composes lattice's pump with quantum's mqtt_sink pins all three.
 lattice = "0.0.1"
 clustor = "0.0.1"
@@ -38,6 +38,11 @@ clustor = "0.0.1"
 [ci]
 # Module targets `fluxor modules build --all` will produce artefacts for.
 targets = ["bcm2712"]
+
+# Every ceiling-shaped const in a file the limit register names is registered,
+# so an unregistered one is a defect rather than a backlog item. The register
+# says as much in its own admission rule; this makes the build say it too.
+limit_register_coverage = "fail"
 
 # No [ci.cargo]: this project has no cargo crate. Every unit test lives in a
 # module harness, run by `fluxor ci`'s own `module-tests` phase — so a crate-less
@@ -56,10 +61,9 @@ targets = ["bcm2712"]
 # after the strict module build.
 scripts = [
   # Structural gates: what the tree must BE, checkable without running anything.
-  # (Module harness tests are NOT here — `fluxor ci` runs them as its own
-  # `module-tests` phase. A stopgap script that duplicated it lived here until
-  # that phase landed.)
+  # Module harness tests are NOT here; `fluxor ci` runs those itself.
   "tools/ci/shipping-surface.sh",
+  "tools/ci/unsafe-seam.sh",
   "tools/ci/secret-safety.sh",
   "tools/ci/accounting-order.sh",
   "tools/ci/limit-register.sh",
@@ -74,8 +78,8 @@ scripts = [
 [ci.hygiene]
 # `modules/**` are no_std PIC objects that cannot host a test harness, so inline
 # tests there are a real error. Tests belong in `modules/app/*/tests/`, which
-# `fluxor test` builds as ordinary std crates. (This rule once carved out host
-# crates, where inline tests were idiomatic; there are no host crates now.)
+# `fluxor test` builds as ordinary std crates. The rule is unconditional: there
+# is no host crate in this project for an inline test to belong to.
 forbid_inline_tests = ["modules"]
 mode                = "strict"
 

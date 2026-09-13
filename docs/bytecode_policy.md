@@ -10,12 +10,35 @@ increments: **every program terminates, by construction**.
 Exactly one job: **per-record pure compute**, shipped as data.
 
 The requirement is logic-as-data — pipelines are loaded at runtime, delivered
-OTA into a 512 KB slot, and hot-reloaded by version — under constraints that
-rule out the usual answers: `no_std`, no allocator, `forbid(unsafe_code)`, and a
-bounded slice of a 100 µs scheduler tick. A WASM interpreter needs an allocator
-(wasmi) or unsafe FFI (wasm3) and costs 10–100× the footprint; native per-pipeline
-codegen turns every logic edit into a build/sign/flash cycle. A small VM whose
-ISA cannot express non-termination is the smallest thing that satisfies all of it.
+OTA into a 512 KiB slot (`SLOT_SIZE`), and hot-reloaded by version — under
+constraints that rule out the usual answers: `no_std`, no allocator, no `unsafe`
+outside the syscall seam (`tools/ci/unsafe-seam.sh`), and a step short enough to
+sit inside a cooperative scheduler tick. A small VM whose ISA cannot express
+non-termination is the smallest thing that satisfies all of it.
+
+### What the cost bound is, and is not
+
+A program's opcode count is its **work** bound: `lower_flat` returns it and
+`vm_core` meters against it, one unit per dispatched opcode plus a builtin's
+arity. Because the ISA has no backward branch, that count is known before the
+program runs, and exceeding it is `CostExceeded` rather than a long step. This is
+the property the whole design rests on, and it holds on every target.
+
+It is not a time bound, and the register records it in `vmi` (VM instructions)
+rather than microseconds for that reason. The meter's unit is not uniform: a
+`CALL` to `replace` over a 4 KiB operand and a `PUSH_BOOL` are three units apart
+in the meter and orders of magnitude apart on the wire, and the substring family is
+worse than linear — `find` is a naive window walk, so its work is the product of
+its two operands where the meter charges one unit plus arity. What keeps those
+bounded is the operands themselves: a record is at most `REC_BUF`, so every
+builtin is a bounded scan over bounded values, which is enough for termination
+and not enough to predict a duration.
+
+Any microsecond figure for a step is therefore a **measured property of one
+target**, not an enforced one. `fluxor.toml` builds a single target
+(`bcm2712`, Pi 5), so a timing claim here is a claim about that board and
+nothing else. Treat a tick budget as something to measure per target, and the
+opcode count as the thing the runtime actually guarantees.
 
 In scope:
 
@@ -35,6 +58,52 @@ Out of scope, permanently:
 - **Aggregation.** A declarative monoid spec run by a native engine, not
   per-record bytecode.
 - **I/O of any kind.** The VM sees a record and produces a record.
+
+## Why not compile each pipeline to a wasm module instead
+
+Fluxor compiles `.fmod` modules for `wasm32` as a first-class target: the
+envelope is the same across targets and only the code payload changes
+(`../fluxor/docs/architecture/wasm_platform.md`). So the alternative worth
+answering is not "embed an interpreter": an in-process wasm interpreter wants an
+allocator or an unsafe FFI surface, and this tree has neither to give it. It is:
+**AOT-compile each pipeline to a wasm fmod and delete the VM entirely** —
+`vm_core`, `lower_core`, `builtins_core`, the ISA, this document.
+
+Taken seriously, that alternative keeps more than it looks like it should:
+
+- **Termination is still decidable** — not by construction, but a wasm producer
+  Chronicle controls can refuse to emit loops as easily as this ISA can refuse to
+  encode them.
+- **Logic is still data** — a wasm fmod is bytes, content-addressed, delivered
+  OTA like anything else.
+- **No interpreter** — no dispatch loop per record, and no interpreter footprint
+  to defend.
+
+What it does not keep is the reason the VM exists:
+
+- **Per-record version selection.** `version_core` holds up to `MAX_VERSIONS`
+  programs in one module instance and picks one *per record* from a tag in the
+  request (`VERSION_SELECTOR_FIELD`), so blue/green and canary are a property of a
+  single running graph. Swapping an fmod is a graph reconfigure: to serve two
+  versions at once you must run two modules and route between them, which moves
+  the decision from the record to the topology. This is the load-bearing
+  difference, and no amount of wasm tooling recovers it.
+- **The slot budget.** Everything deployable shares one 512 KiB slot
+  (`SLOT_SIZE`). A program is a param bounded by `PROG_BUF` at 2 KiB, and a
+  pipeline holds `MAX_VERSIONS` of them at once. The wasm equivalent is a module
+  per pipeline per version, each carrying whatever codec and string code it uses
+  rather than calling a builtin table the engine already has. Whether that many
+  modules fit the slot is an arithmetic question, and it is the one to answer
+  before reopening this.
+- **The edit loop.** A logic change is a param write. On wasm it is a build —
+  not the full build/sign/flash cycle, since an authoring module could in
+  principle host the codegen, but a toolchain where there is now a table write.
+
+**The summary:** AOT to wasm is a real option, and footprint is not what answers
+it. What keeps the VM is per-record version selection inside one module instance,
+and a slot budget the alternative has not been shown to fit. Those two are what a
+proposal to remove the VM has to address; anything else is arguing against the
+interpreter nobody is proposing.
 
 ## The fence: no branches, no loops, no calls
 
@@ -96,8 +165,8 @@ and bounded outside it.
 The expression language is a CEL subset, so its function library is not
 invented here — it is a **pinned subset of CEL's standard library and its
 versioned extension libraries** (`cel-go/ext`), adopted per extension and
-gated per extension as top-level module features (fluxor RFC
-module_variants). The `full` variant (default, emits the unsuffixed `.fmod`)
+gated per extension as top-level module features (Fluxor module variants).
+The `full` variant (default, emits the unsuffixed `.fmod`)
 carries all of them; later variants may compose subsets for constrained
 targets. A program calling a builtin its engine build lacks fails closed at
 runtime (`BadBuiltin`) — the load-time analogue is `LowerError::BadTag` for
@@ -120,7 +189,7 @@ content; `replace` has no limit overload; `charAt` returns a 1-byte slice.
 **Exclusions, each traceable to one principle:** `split`, `join`, `lists`,
 `sets`, `two_var_comprehensions`, `optional` — no collection or optional
 types in the VM; `matches`, `ext.regex` — no unbounded matching engine in a
-WCET-bounded PIC (pattern extraction is a compiled-module capability, per
+work-bounded PIC (pattern extraction is a compiled-module capability, per
 the crypto precedent); `format`, `quote` — printf machinery, weak
 power-to-weight; `ext.protos` — the codec layer (`pb_core`, `PBFIELD`)
 already owns that problem at the right layer.

@@ -15,7 +15,7 @@ cd "$here" || exit 1
 # (3) Syscall-bound cores that cannot run in a host harness (they need a live
 #     SyscallTable); each is covered end to end by a production wrapper E2E.
 declare -A EXEMPT=(
-  [syschan_core.rs]="the one production Chan impl over SyscallTable (the only unsafe); host-driven via the ScriptChan fake, exercised live by every *_e2e graph"
+  [syschan_core.rs]="the one production Chan impl over SyscallTable (one of five cores on the seam — see tools/ci/unsafe-seam.sh); host-driven via the ScriptChan fake, exercised live by every *_e2e graph"
   [telemetry_core.rs]="emit helpers over dev_telemetry_* syscalls; covered end to end by tools/e2e/telemetry.sh, which asserts emitted VALUES through a subscribed consumer"
 )
 # (4) Cores that require provider-fake suites and that

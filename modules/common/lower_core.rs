@@ -60,10 +60,24 @@ pub enum LowerError {
 }
 
 /// Lower a flat, post-order checked-IR stream into VM bytecode in `out`. Returns
-/// `(bytecode_len, opcode_count)` — the opcode count is the static cost bound the
-/// runtime enforces, identical to the compiler's `max_cost`. Pure, allocation-free,
-/// and panic-free: this is the exact bytecode the host `lower_ir` produces, which
-/// the differential fuzzer proves.
+/// `(bytecode_len, opcode_count)` — the opcode count is the static WORK bound the
+/// runtime enforces, identical to the compiler's `max_cost`.
+///
+/// Work, not time. The meter in `vm_core::eval_scratch` charges one unit per
+/// dispatched opcode plus a builtin's arity, so the count bounds how many
+/// instructions may execute — which is what makes termination decidable before a
+/// program runs. It is not a cycle estimate: a `CALL` to `replace` over a 4 KiB
+/// operand and a `PUSH_BOOL` sit three units apart in the meter and orders of
+/// magnitude apart on the wire. What bounds the former is its operands, not the
+/// meter: every builtin is a bounded scan over values that are themselves bounded
+/// (a record is at most `REC_BUF`), so the program still terminates — it simply
+/// does not terminate in a time this number predicts. The gap is widest across
+/// the substring family (`contains`, `indexOf`, `replace`, …), whose `find` is a
+/// naive window walk costing the PRODUCT of its two operands. Anything wanting a
+/// duration must measure it on the target.
+///
+/// Pure, allocation-free, and panic-free: this is the exact bytecode the host
+/// `lower_ir` produces, which the differential fuzzer proves.
 pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerError> {
     let mut pc: usize = 0;
     let mut end: usize = 0;

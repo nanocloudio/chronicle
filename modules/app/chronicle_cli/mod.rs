@@ -1344,6 +1344,9 @@ fn cmd_activate(s: &mut State, arec: &[u8], argv: &[(usize, usize)], argc: usize
     let mut caps = [b"".as_slice(); MAX_SET];
     let (ca, cb) = argv[3];
     let ncaps = split_csv(&arec[ca..cb], &mut caps);
+    if ncaps > caps.len() {
+        return (append(&mut s.out, 0, b"error: too many capabilities\n"), 1);
+    }
 
     let mut arts = [[0u8; 32]; MAX_SET];
     let (aa, ab) = argv[4];
@@ -1360,6 +1363,9 @@ fn cmd_activate(s: &mut State, arec: &[u8], argv: &[(usize, usize)], argc: usize
     let mut binds = [b"".as_slice(); MAX_SET];
     let (ba, bb) = argv[6];
     let nbinds = split_csv(&arec[ba..bb], &mut binds);
+    if nbinds > binds.len() {
+        return (append(&mut s.out, 0, b"error: too many bindings\n"), 1);
+    }
 
     let node = NodeState {
         capabilities: &caps[..ncaps],
@@ -1420,7 +1426,10 @@ fn cmd_verify(s: &mut State, arec: &[u8], argv: &[(usize, usize)], argc: usize) 
     // Trusted keys, decoded into a bounded table.
     const MAX_TRUSTED: usize = 8;
     let mut trusted = [[0u8; 32]; MAX_TRUSTED];
-    let n = (argc - 2).min(MAX_TRUSTED);
+    if argc - 2 > MAX_TRUSTED {
+        return (append(&mut s.out, 0, b"error: too many trusted keys\n"), 1);
+    }
+    let n = argc - 2;
     for k in 0..n {
         let (c, d) = argv[2 + k];
         let mut kb = [0u8; 32];
@@ -1641,7 +1650,7 @@ fn cmd_check(s: &mut State, ir_hex: &[u8]) -> (usize, i32) {
             p = append(&mut s.out, p, b" stage(s), ");
             p = append_u32(&mut s.out, p, plen as u32);
             p = append(&mut s.out, p, b" bytecode byte(s)\n");
-            for i in 0..n.min(MAX_STAGES) {
+            for i in 0..n {
                 if let Some(st) = stage_at(&s.prog[..plen], i) {
                     p = append(&mut s.out, p, b"  stage ");
                     p = append_u32(&mut s.out, p, i as u32);
@@ -1695,7 +1704,10 @@ fn cmd_eval(s: &mut State, ir_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
         on_failure: None,
         kind: STAGE_KIND_COMPUTE,
     }; MAX_STAGES];
-    let n = stage_count(&s.prog[..plen]).min(MAX_STAGES);
+    let n = stage_count(&s.prog[..plen]);
+    if n > MAX_STAGES {
+        return (append(&mut s.out, 0, b"error: too many stages\n"), 1);
+    }
     let prog = &s.prog[..plen];
     for (i, slot) in stages.iter_mut().enumerate().take(n) {
         match stage_at(prog, i) {
@@ -1870,7 +1882,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             arec[..alen].copy_from_slice(&s.arec[..alen]);
             let argc = split_argv(&arec[..alen], &mut argv);
 
-            let (olen, code): (usize, i32) = if argc == 0 {
+            let (olen, code): (usize, i32) = if argc > MAX_ARGV {
+                // Counted past the buffer by `split_argv`, so this is the real
+                // argument count: refuse rather than run a truncated command.
+                (append(&mut s.out, 0, b"error: too many arguments\n"), 1)
+            } else if argc == 0 {
                 (cmd_help(&mut s.out), 0)
             } else {
                 let (s0, e0) = argv[0];
