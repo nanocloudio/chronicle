@@ -60,7 +60,7 @@ modules:
 
   - name: pg_client
     params:
-      endpoint: "${REV_PG_ENDPOINT:-7f000001483c}"
+      authority: "127.0.0.1:${REV_PG_PORT:-15432}"
       user: "lattice"
       database: "lattice"
       cid_len: 4

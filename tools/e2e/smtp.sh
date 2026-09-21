@@ -30,7 +30,7 @@ done
 if [ -z "${SMTP_PORT:-}" ]; then
   no smtp "sink did not start"
 elif build_graph examples/smtp_sink/linux.yaml \
-       "s|endpoint: \"[0-9a-f]*\"|endpoint: \"$(endpoint_hex "$SMTP_PORT")\"|"; then
+       "s|authority: \"127.0.0.1:[0-9]*\"|authority: \"127.0.0.1:$SMTP_PORT\"|"; then
   status=$(run_text "" 8)
   # The sink serves until killed; poll for the delivered message.
   for _ in $(seq 1 20); do

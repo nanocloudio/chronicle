@@ -382,7 +382,12 @@ pub fn version_apply_ir(
     w += VERSION_DIGEST_LEN;
     bin[w] = tag_len as u8;
     w += 1;
-    bin[w..w + tag_len].copy_from_slice(tag);
+    // `tag_len` and `tag.len()` are the same number by construction, but not
+    // one the compiler folds: a slice copy it cannot prove equal carries a
+    // panic path, and a module image links none.
+    for (dst, src) in bin[w..].iter_mut().zip(tag).take(tag_len) {
+        *dst = *src;
+    }
     w += tag_len;
     bin[w..w + 2].copy_from_slice(&(plen as u16).to_le_bytes());
     bin[0] += 1;

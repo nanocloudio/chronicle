@@ -18,7 +18,7 @@ platform:
 modules:
   - name: smtp
     params:
-      endpoint: "7f000001112b"          # 127.0.0.1:11025 ([ip:4][port:2 LE])
+      authority: "127.0.0.1:11025"
       helo: "chronicle.local"
       mail_from: "ops@chronicle.local"
       rcpt_to: "inbox@example.com"

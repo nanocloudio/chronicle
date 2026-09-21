@@ -87,7 +87,7 @@ modules:
   # an HTTP request with a consensus-durable write.
   - name: pg_client
     params:
-      endpoint: "${REV_PG_ENDPOINT:-7f000001483c}" # [ip:4][port:2 LE] = 127.0.0.1:15432
+      authority: "127.0.0.1:${REV_PG_PORT:-15432}"
       user: "lattice"
       database: "lattice"
       cid_len: 4

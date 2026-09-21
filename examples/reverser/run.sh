@@ -29,9 +29,7 @@ REV_A_PORT="${REV_A_PORT:-15100}"
 REV_C_PORT="${REV_C_PORT:-15102}"
 REV_PG_PORT="${REV_PG_PORT:-15432}"
 REV_BROKER_PORT="${REV_BROKER_PORT:-9090}"
-# pg_client's endpoint is [ip:4][port:2 LE] hex — derived, single knob.
-REV_PG_ENDPOINT="$(printf '7f000001%02x%02x' $((REV_PG_PORT & 0xff)) $((REV_PG_PORT >> 8)))"
-export REV_A_PORT REV_C_PORT REV_PG_PORT REV_BROKER_PORT REV_PG_ENDPOINT
+export REV_A_PORT REV_C_PORT REV_PG_PORT REV_BROKER_PORT
 
 RUNTIME="${FLUXOR_LINUX:-$FLUXOR/target/aarch64-unknown-linux-gnu/release/fluxor-linux}"
 

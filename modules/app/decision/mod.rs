@@ -115,7 +115,10 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    1, decision, str, 0 => |s, d, len| {
+    // `str_chunked`: the hex arrives as TLV entries of at most 255 bytes
+    // under the same tag and this handler APPENDS each one. A decision
+    // table is routinely longer than one entry.
+    1, decision, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.hex_len as usize) < HEX_BUF {
             s.hex[s.hex_len as usize] = *d.add(i);

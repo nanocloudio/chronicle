@@ -500,6 +500,11 @@ pub fn run_stages_with<E: StageEval>(
     if cur_len > out.len() {
         return Err(PipeError::Encode); // don't silently clip the final frame
     }
-    out[..cur_len].copy_from_slice(final_frame);
+    // Copied element by element: the two branches above give `final_frame`
+    // a length the compiler cannot fold into one value, and a slice copy it
+    // cannot prove equal carries a panic path a module image links none of.
+    for (dst, src) in out.iter_mut().zip(final_frame) {
+        *dst = *src;
+    }
     Ok(cur_len)
 }

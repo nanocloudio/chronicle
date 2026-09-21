@@ -8,11 +8,8 @@
 # The client auto-issues a GET / on stream 1 at startup; the response body is
 # forwarded on the module's out[1] (file_ctrl) channel, which we pipe to stdout.
 #
-# host_ip is the target IPv4 packed so that linux_net's CMD_CONNECT parse yields
-# the right address: the module sends host_ip.to_le_bytes(), the net provider
-# reads it back with from_le_bytes() and applies to_be() for sin_addr — so
-# host_ip must be the address in NATIVE integer order, 127.0.0.1 = 0x7F000001 =
-# 2130706433 (NOT the byte-reversed 0x0100007F).
+# `authority` is where the client dials and the `Host:` it sends: one value,
+# written as `host[:port]`.
 #
 # Verified live on bcm2712 against _h2c_server.yaml (fluxor http.fmod in server
 # mode). Client trace: connected (h2c) -> preface sent -> request sent -> headers
@@ -30,8 +27,7 @@ modules:
   - name: http
     mode: 1          # client
     protocol: 1      # HTTP/2 cleartext (h2c)
-    host_ip: 2130706433   # 127.0.0.1 (0x7F000001, native order)
-    port: 9082
+    authority: "127.0.0.1:9082"
     path: "/"
 wiring:
   - from: http.net_out

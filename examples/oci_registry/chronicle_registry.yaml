@@ -108,11 +108,8 @@ modules:
   # compute an HMAC. Points at tier 1.
   - name: s3
     params:
-      # `endpoint` is `[ip:4][port:2 LE]` packed as hex, so the port cannot be
-      # interpolated as a decimal — `run.sh` derives S3_ENDPOINT from S3_PORT
-      # and exports both, keeping S3_PORT the single knob.
-      endpoint: "${S3_ENDPOINT:-7f0000019c4a}"
-      host: "${S3_HOST:-127.0.0.1:19100}"
+      # One value: where the connection goes and the `Host:` it carries.
+      authority: "${S3_HOST:-127.0.0.1:19100}"
       access_key: "minioadmin"
       secret: "minioadmin"
       region: "us-east-1"

@@ -24,24 +24,12 @@ REGISTRY_PORT="${REGISTRY_PORT:-15000}"
 STATE="${STATE:-/tmp/oci-registry}"
 BUCKET="${BUCKET:-registry}"
 
-# The graph reads `${REGISTRY_PORT}`, `${S3_ENDPOINT}` and `${S3_HOST}` — fluxor
-# substitutes `${VAR:-default}` before parsing the YAML, so the ports are set in
-# exactly one place: here.
-#
-# `s3`'s `endpoint` is `[ip:4][port:2 LE]` packed as hex, which a decimal
-# port cannot be interpolated into, so it is DERIVED rather than duplicated. A
-# second literal would be a second source of truth, and the two would drift the
-# first time someone moved the port.
+# The graph reads `${REGISTRY_PORT}` and `${S3_HOST}` — fluxor substitutes
+# `${VAR:-default}` before parsing the YAML, so the ports are set in exactly
+# one place: here.
 S3_IP="${S3_IP:-127.0.0.1}"
-S3_ENDPOINT="$(printf '%02x%02x%02x%02x%02x%02x' \
-  "${S3_IP%%.*}" \
-  "$(echo "$S3_IP" | cut -d. -f2)" \
-  "$(echo "$S3_IP" | cut -d. -f3)" \
-  "${S3_IP##*.}" \
-  "$((S3_PORT & 0xff))" \
-  "$((S3_PORT >> 8))")"
 S3_HOST="$S3_IP:$S3_PORT"
-export REGISTRY_PORT S3_ENDPOINT S3_HOST
+export REGISTRY_PORT S3_HOST
 
 LOAM_SERVER="$LOAM/target/aarch64-unknown-linux-gnu/release/loam-server"
 RUNTIME="${FLUXOR_LINUX:-$FLUXOR/target/aarch64-unknown-linux-gnu/release/fluxor-linux}"

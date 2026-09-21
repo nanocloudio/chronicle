@@ -32,8 +32,7 @@ modules:
       ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
   - name: mqtt_sink
     params:
-      broker_ip: 2130706433    # 127.0.0.1
-      broker_port: 11883
+      authority: "127.0.0.1:11883"
       client_id: "chronicle-egress"
       topic: "cu/orders"
 

@@ -182,7 +182,9 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    1, def, str, 0 => |s, d, len| {
+    // `str_chunked`: the hex arrives as TLV entries of at most 255 bytes
+    // under the same tag and this handler APPENDS each one.
+    1, def, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.hex_len as usize) < HEX_BUF {
             s.hex[s.hex_len as usize] = *d.add(i);
@@ -194,7 +196,11 @@ define_params! {
     // Higher-level IR-`def` (a shipped checked IR) lowered to bytecode at load.
     // Guard on len>0: set_defaults() fires every closure, so an absent param
     // must not flip `is_ir` and route a bytecode `def` through `lower_def`.
-    3, ir_def, str, 0 => |s, d, len| {
+    // `str_chunked`: the value arrives as TLV entries of at most 255
+    // bytes under the same tag and this handler APPENDS each one, which is
+    // what a lowered IR-`def` needs — a flat `str` is refused past one
+    // entry at build time.
+    3, ir_def, str_chunked, 0 => |s, d, len| {
         if len > 0 {
             s.is_ir = true;
             let mut i = 0usize;
@@ -209,7 +215,9 @@ define_params! {
     // A checkpoint (hex of AggState::snapshot) to resume from. Guard on len>0:
     // set_defaults() fires every closure, so an absent param must not flip
     // has_state and try to restore from empty bytes.
-    4, state, str, 0 => |s, d, len| {
+    // `str_chunked`: a restored snapshot arrives as TLV entries of at most
+    // 255 bytes under the same tag and this handler APPENDS each one.
+    4, state, str_chunked, 0 => |s, d, len| {
         if len > 0 {
             s.has_state = true;
             let mut i = 0usize;

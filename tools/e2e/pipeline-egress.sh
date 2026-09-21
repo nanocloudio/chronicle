@@ -26,7 +26,7 @@ done
 
 if [ -z "${MQTT_PORT:-}" ]; then
   no egress "broker did not start"
-elif build_graph examples/pipeline_egress/linux.yaml "s|broker_port: [0-9]*|broker_port: $MQTT_PORT|"; then
+elif build_graph examples/pipeline_egress/linux.yaml "s|authority: \"127.0.0.1:[0-9]*\"|authority: \"127.0.0.1:$MQTT_PORT\"|"; then
   # {1:"ord-7", 2:250} -> pipeline doubles -> SinkPublish -> mqtt_sink PUBLISH.
   # The payload on the wire is the RECORD FRAME, not a hand-rendered string:
   # the pipeline never rendered an MQTT publish.

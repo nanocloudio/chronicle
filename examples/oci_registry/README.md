@@ -17,7 +17,7 @@ Ports and state are one knob each, so two registries can run side by side:
 S3_PORT=19222 REGISTRY_PORT=15333 STATE=/tmp/oci-alt ./run.sh --verify
 ```
 
-The graph reads `${REGISTRY_PORT}`, `${S3_ENDPOINT}` and `${S3_HOST}` — fluxor
+The graph reads `${REGISTRY_PORT}` and `${S3_HOST}` — fluxor
 substitutes `${VAR:-default}` before parsing the YAML, so a bare
 `fluxor build` still works on the defaults. `s3_client`'s `endpoint` is
 `[ip:4][port:2 LE]` packed as hex, which a decimal port cannot be interpolated

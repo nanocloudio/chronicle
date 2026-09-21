@@ -86,9 +86,6 @@ print(s.getsockname()[1])
 s.close()'
 }
 
-# `[ip:4][port:2 LE]` — the endpoint param form, for 127.0.0.1:<port>.
-endpoint_hex() { printf '7f000001%02x%02x' $(($1 & 0xff)) $((($1 >> 8) & 0xff)); }
-
 # build_graph <yaml> [sed-expr…]: copy the example to a run-unique name, apply
 # any substitutions (ports), build its bundle, export CFG/MODS for run_*.
 # The copy is what makes the bundle path unique — `fluxor run` keys the output

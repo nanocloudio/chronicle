@@ -46,7 +46,8 @@ PY
 
 if [ -z "${HTTP_PORT:-}" ]; then
   no exchange "origin did not start"
-elif build_graph examples/http_exchange/linux.yaml "s|port: 18080|port: $HTTP_PORT|"; then
+elif build_graph examples/http_exchange/linux.yaml \
+       "s|authority: \"127.0.0.1:[0-9]*\"|authority: \"127.0.0.1:$HTTP_PORT\"|"; then
   got=$(run_hex "$REQ_HEX" 12)
   for _ in $(seq 1 20); do
     [ -s "$req_file" ] && break

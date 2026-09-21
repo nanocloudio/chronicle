@@ -31,8 +31,7 @@ modules:
     mode: 1              # client
     protocol: 1          # HTTP/2 cleartext (h2c)
     grpc: 1              # content-type: application/grpc + te: trailers
-    host_ip: 2130706433  # 127.0.0.1
-    port: 9000
+    authority: "127.0.0.1:9000"
     path: "/grpcbin.GRPCBin/DummyUnary"
     request_body: [0, 0, 0, 0, 4, 10, 2, 104, 105]  # LPM: [0][len=4][0a 02 "hi"]
 wiring:

@@ -61,7 +61,7 @@ modules:
       self_id: 0
       peer_count: 1
       listen_port: ${REV_PEER_PORT:-29090}
-      peer0_port: ${REV_PEER_PORT:-29090}
+      peer0: "127.0.0.1:${REV_PEER_PORT:-29090}"
   - name: gateway
     params:
       self_id: 0
@@ -96,8 +96,7 @@ modules:
       retention_budget_ms: 60000
   - name: mqtt_sink
     params:
-      broker_ip: ${REV_BROKER_IP:-2130706433} # u32 of 127.0.0.1
-      broker_port: ${REV_BROKER_PORT:-9090}
+      authority: "${REV_BROKER_HOST:-127.0.0.1}:${REV_BROKER_PORT:-9090}"
       client_id: "reverser-cdc"
       topic: "lattice/cdc/feed1"
   - name: compaction_coordinator

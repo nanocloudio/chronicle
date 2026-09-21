@@ -430,7 +430,9 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    2, encode, str, 0 => |s, d, len| {
+    // `str_chunked`: the encode program arrives as TLV entries of at most
+    // 255 bytes under the same tag and this handler APPENDS each one.
+    2, encode, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.enc_hex_len as usize) < HEX_BUF {
             s.enc_hex[s.enc_hex_len as usize] = *d.add(i);
@@ -491,7 +493,9 @@ define_params! {
             s.param_overflow = true;
         }
     };
-    5, ir_stages, str, 0 => |s, d, len| {
+    // `str_chunked`: the stage list arrives as TLV entries of at most 255
+    // bytes under the same tag and this handler APPENDS each one.
+    5, ir_stages, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.hex_len as usize) < HEX_BUF {
             s.hex[s.hex_len as usize] = *d.add(i);
@@ -815,8 +819,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let msg = core::slice::from_raw_parts(s.ctrl_buf.as_ptr(), cn as usize);
                     match pipeline_reload(active, &mut s.vbin_cand, VBIN_BUF, msg) {
                         Ok(nu) => {
-                            let src = core::slice::from_raw_parts(s.vbin_cand.as_ptr(), nu);
-                            s.vbin[..nu].copy_from_slice(src);
+                            // A raw copy: a slice copy whose lengths the
+                            // compiler cannot prove equal carries a panic
+                            // path, and a module image links none.
+                            core::ptr::copy_nonoverlapping(
+                                s.vbin_cand.as_ptr(),
+                                s.vbin.as_mut_ptr(),
+                                nu,
+                            );
                             s.vbin_len = nu as u16;
                             s.reloads = s.reloads.wrapping_add(1);
                             dev_log(sys, 3, b"[pipeline] reload".as_ptr(), 17);
@@ -1079,8 +1089,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }];
             match eval_bytes(enc, &params, &mut s.enc_out, 100_000) {
                 Ok(m) => {
-                    let src = core::slice::from_raw_parts(s.enc_out.as_ptr(), m);
-                    s.out_buf[..m].copy_from_slice(src);
+                    // As above: raw, so no panic path is linked in.
+                    core::ptr::copy_nonoverlapping(s.enc_out.as_ptr(), s.out_buf.as_mut_ptr(), m);
                     m
                 }
                 Err(_) => {

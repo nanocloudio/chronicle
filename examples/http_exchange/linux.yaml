@@ -35,8 +35,7 @@ modules:
     params:
       mode: 1              # client
       protocol: 0          # HTTP/1.1
-      host_ip: 2130706433  # 127.0.0.1
-      port: 18080
+      authority: "127.0.0.1:18080"
 
 wiring:
   - from: cli_in.stdin_out

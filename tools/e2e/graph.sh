@@ -88,12 +88,12 @@ case "$out" in
 esac
 
 # A numeric param is emitted UNQUOTED: a provider's u32 decoder rejects
-# `"167772161"`, and which params are numeric is the provider's fact.
-BIND_NUM='orders_store,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,broker_ip=#167772161;topic=orders'
+# `"250"`, and which params are numeric is the provider's fact.
+BIND_NUM='orders_store,mqtt,mqtt_sink,0.1.0,publish_in,ack_out,n,keepalive_s=#250;topic=orders'
 out=$(cli graph "$eff" process bcm2712 "$BIND_NUM" 2>/dev/null)
 case "$out" in
-  *"broker_ip: 167772161"*) ok "a numeric param is emitted unquoted" ;;
-  *) no graph "expected an unquoted broker_ip, got: '$(printf '%s' "$out" | grep broker_ip | head -1)'" ;;
+  *"keepalive_s: 250"*) ok "a numeric param is emitted unquoted" ;;
+  *) no graph "expected an unquoted keepalive_s, got: '$(printf '%s' "$out" | grep keepalive_s | head -1)'" ;;
 esac
 
 # A decision splits the compute run, so the graph gets a SECOND pipeline node

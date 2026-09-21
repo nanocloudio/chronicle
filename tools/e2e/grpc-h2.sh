@@ -11,6 +11,7 @@ modules_ready || { no grpc-h2 "fluxor modules build failed"; finish; exit; }
 
 H2_PORT=$(free_port)
 PORT_SUB="s|port: [0-9]*|port: $H2_PORT|"
+AUTH_SUB="s|authority: \"127.0.0.1:[0-9]*\"|authority: \"127.0.0.1:$H2_PORT\"|"
 
 # The server graph runs for the duration; the client is a one-shot.
 if ! start_graph examples/grpc_h2/_h2c_server.yaml "$PORT_SUB"; then
@@ -19,7 +20,7 @@ fi
 SERVER_PID=$GRAPH_PID
 wait_port "$H2_PORT" 30
 
-if build_graph examples/grpc_h2/linux.yaml "$PORT_SUB"; then
+if build_graph examples/grpc_h2/linux.yaml "$AUTH_SUB"; then
   got=$(run_text "" 8)
   if want "$got" "Hello from Fluxor h2c"; then
     ok "grpc-h2 (composed wave http.fmod client: preface/SETTINGS/HPACK -> body)"
