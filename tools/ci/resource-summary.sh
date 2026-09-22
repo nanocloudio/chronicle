@@ -24,6 +24,12 @@ memory/step budgets and the constants behind these capacities live in
 emits are the baseline (14) plus its own, verified by
 `tools/ci/accounting-order.sh`.
 
+A capacity written `4096 (rp2040 512)` is declared per target: the first figure is
+the default and each parenthesised pair overrides it for that silicon, resolved
+when the module is packed. An engine whose record buffer is keyed on the state
+arena declares the matching ceiling here, so the advertised contract and the
+buffer behind it are one number on every target rather than two that can disagree.
+
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
 HDR
@@ -32,13 +38,35 @@ HDR
     tgt=$(grep -oE 'hardware_targets *= *\[[^]]*\]' "$man" | grep -oE '"[a-z0-9_]+"' | tr -d '"' | paste -sd, -)
     # instrument count = entries in the metrics array
     nmet=$(awk '/metrics *= *\[/{g=1} g{n+=gsub(/"[^"]+"/,"&")} g&&/\]/{print n; exit}' "$man")
-    # each port: name, direction, max_record, buffer_size
+    # each port: name, direction, max_record, buffer_size.
+    #
+    # A capacity is either flat (`max_record = 4096`) or a per-target table
+    # (`max_record = { default = 4096, rp2040 = 512 }`), which fluxor resolves at
+    # pack time for the silicon being packed. `cap()` renders the table as its
+    # default followed by the overrides, so a reader sees every target's real
+    # ceiling; stripping non-digits would run the numbers together into one
+    # meaningless integer.
     awk -v mod="$m" -v tgt="$tgt" -v nm="$nmet" '
+      function cap(line,   body, n, parts, i, kv, k, v, def, extra) {
+        if (line !~ /\{/) { gsub(/[^0-9]/, "", line); return line }
+        body = line; sub(/^[^{]*\{/, "", body); sub(/\}.*$/, "", body)
+        n = split(body, parts, ",")
+        def = ""; extra = ""
+        for (i = 1; i <= n; i++) {
+          if (split(parts[i], kv, "=") != 2) continue
+          k = kv[1]; v = kv[2]
+          gsub(/[^a-z0-9_]/, "", k); gsub(/[^0-9]/, "", v)
+          if (k == "default") def = v
+          else extra = extra (extra == "" ? "" : ", ") k " " v
+        }
+        if (def == "") def = "—"
+        return (extra == "") ? def : def " (" extra ")"
+      }
       /\[\[ports\]\]/{inport=1; name=dir=mr=bs=""}
       inport&&/name *=/{gsub(/.*= *"|".*/,""); name=$0}
       inport&&/direction *=/{gsub(/.*= *"|".*/,""); dir=$0}
-      inport&&/max_record *=/{gsub(/[^0-9]/,"",$0); mr=$0}
-      inport&&/buffer_size *=/{gsub(/[^0-9]/,"",$0); bs=$0; 
+      inport&&/max_record *=/{mr=cap($0)}
+      inport&&/buffer_size *=/{bs=cap($0)
         printf "| %s | %s | %s | %s | %s | %s | %s |\n", mod, tgt, name, dir, mr, bs, nm; inport=0}
     ' "$man"
   done
@@ -46,6 +74,43 @@ HDR
   echo "Generated from \`modules/app/*/manifest.toml\`. Steady-state modules also"
   echo "declare a per-step budget of one record plus pending-output drain,"
   echo "and report \`work_units\` (VM instructions / stages / emissions consumed)."
+  echo ""
+  cat <<'SHDR'
+## Resident state, per target
+
+MEASURED off the built artefacts, not declared: each `.fmod` carries the figure
+`pack` read from the SDK's `declare_module_state_bytes!` static, in 64-byte
+units. This is what compose-time admission charges against the target's state
+arena (`targets/silicon/<id>.toml` `state_arena_kb`), so a module that grows has
+to say so in the same change that grows it.
+
+A dash means the target shelf is not built in this tree; `n/a` means the module
+does not declare that target.
+
+| Module | bcm2712 | rp2350 | rp2040 |
+|---|---:|---:|---:|
+SHDR
+  for man in modules/app/*/manifest.toml; do
+    m=$(basename "$(dirname "$man")")
+    row="| $m |"
+    for t in bcm2712 rp2350 rp2040; do
+      if ! grep -qE "hardware_targets *= *\[[^]]*\"$t\"" "$man"; then
+        row="$row n/a |"; continue
+      fi
+      f="target/fluxor/$t/modules/$m.fmod"
+      if [ -f "$f" ]; then
+        v=$(fluxor inspect "$f" 2>/dev/null | grep -oE 'state: [0-9]+' | grep -oE '[0-9]+')
+        row="$row ${v:-0} |"
+      else
+        row="$row — |"
+      fi
+    done
+    echo "$row"
+  done
+  echo ""
+  echo "State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB."
+  echo "A deployment may declare a lower capacity for itself, in which case the"
+  echo "lower of the two binds at load."
 }
 
 if [ "$mode" = "--check" ]; then

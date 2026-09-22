@@ -21,6 +21,33 @@
 /// Maximum fields a pipeline record frame may carry (matches the builder bound).
 pub const MAX_PIPE_FIELDS: usize = MAX_BUILD_FIELDS;
 
+/// The largest compiled artefact container an engine will hold, per arena tier.
+///
+/// These live here, in the core every engine and the authoring CLI `include!`s,
+/// because they are the numbers both halves must agree on and neither owns. An
+/// engine that sized its own param buffer independently would be guessing at what
+/// the authoring path can produce, and a guess in the generous direction buys a
+/// buffer no artefact can fill — unreachable by construction, since the container
+/// is assembled in `author_core::BIN_BUF` and cannot leave it larger than that.
+///
+/// TIERED, because one number cannot serve both ends of a 4000× range in arena.
+/// On a target with arena to spare the bound IS `author_core::BIN_BUF`: the
+/// engine loads anything the authoring path can assemble, which is the strongest
+/// form of the agreement and the one that needs no estimate to be right. On an
+/// RP2040-class target the arena decides instead, and the honest consequence is
+/// that a rich table is not deployable there — a fact about that target, not a
+/// budget every other target should be held to.
+///
+/// The floor was once the only bound, set from an estimate of 32 arms at 74–138
+/// bytes each. Arms cost more than that when they carry a full outcome: a
+/// 29-arm lifecycle table measures 7894 bytes, about 272 bytes an arm, so the
+/// floor cannot hold even 23 arms of that shape. `author_core::BIN_BUF` asserts
+/// it is at least the full tier, so the two cannot cross.
+pub const MAX_CONTAINER_BIN_FULL: usize = 16384;
+
+/// The same bound on a 64 KiB-arena target (RP2040 class).
+pub const MAX_CONTAINER_BIN: usize = 6144;
+
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
 

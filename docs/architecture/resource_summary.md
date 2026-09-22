@@ -8,30 +8,62 @@ memory/step budgets and the constants behind these capacities live in
 emits are the baseline (14) plus its own, verified by
 `tools/ci/accounting-order.sh`.
 
+A capacity written `4096 (rp2040 512)` is declared per target: the first figure is
+the default and each parenthesised pair overrides it for that silicon, resolved
+when the module is packed. An engine whose record buffer is keyed on the state
+arena declares the matching ceiling here, so the advertised contract and the
+buffer behind it are one number on every target rather than two that can disagree.
+
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
-| aggregation | bcm2712 | record_in | input | 4096 | 4096 | 25 |
-| aggregation | bcm2712 | result_out | output | 4096 | 4096 | 25 |
-| aggregation | bcm2712 | barrier_in | input | 64 | 256 | 25 |
-| aggregation | bcm2712 | checkpoint_out | output | 40960 | 40960 | 25 |
-| aggregation | bcm2712 | proposal_out | output | 512 | 512 | 25 |
-| aggregation | bcm2712 | assigned_in | input | 64 | 256 | 25 |
-| aggregation | bcm2712 | leader_in | input | 64 | 256 | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | barrier_in | input | 64 | 256 | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | checkpoint_out | output | 40960 (rp2040 4096) | 40960 (rp2040 4096) | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | proposal_out | output | 512 | 512 | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | assigned_in | input | 64 | 256 | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | leader_in | input | 64 | 256 | 25 |
 | chronicle_cli | bcm2712 | args | input |  | 131328 |  |
 | chronicle_cli | bcm2712 | stdout | output |  | 40960 |  |
 | chronicle_cli | bcm2712 | exit | output |  | 16 |  |
-| decision | bcm2712 | record_in | input | 4096 | 4096 | 21 |
-| decision | bcm2712 | result_out | output | 4096 | 4096 | 21 |
-| expression | bcm2712 | record_in | input | 4096 | 4096 | 17 |
-| expression | bcm2712 | result_out | output | 4096 | 4096 | 17 |
-| pipeline | bcm2712 | record_in | input | 4096 | 4096 | 26 |
-| pipeline | bcm2712 | result_out | output | 4096 | 4096 | 26 |
-| pipeline | bcm2712 | publish_out | output | 4112 | 16448 | 26 |
-| pipeline | bcm2712 | ack_in | input | 12 | 512 | 26 |
-| pipeline | bcm2712 | publish_in | input | 8720 | 34880 | 26 |
-| pipeline | bcm2712 | ack_out | output | 12 | 512 | 26 |
-| pipeline | bcm2712 | control | ctrl_input | 4096 | 4096 | 26 |
+| decision | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 21 |
+| decision | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 21 |
+| expression | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
+| expression | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
+| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | publish_out | output | 4112 (rp2040 528) | 16448 (rp2040 2112) | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | ack_in | input | 12 | 512 | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | publish_in | input | 8720 | 34880 | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | ack_out | output | 12 | 512 | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 26 |
+| sensor_intake | bcm2712,rp2350,rp2040 | sample | input | 24 | 240 |  |
+| sensor_intake | bcm2712,rp2350,rp2040 | record_out | output | 96 | 960 |  |
 
 Generated from `modules/app/*/manifest.toml`. Steady-state modules also
 declare a per-step budget of one record plus pending-output drain,
 and report `work_units` (VM instructions / stages / emissions consumed).
+
+## Resident state, per target
+
+MEASURED off the built artefacts, not declared: each `.fmod` carries the figure
+`pack` read from the SDK's `declare_module_state_bytes!` static, in 64-byte
+units. This is what compose-time admission charges against the target's state
+arena (`targets/silicon/<id>.toml` `state_arena_kb`), so a module that grows has
+to say so in the same change that grows it.
+
+A dash means the target shelf is not built in this tree; `n/a` means the module
+does not declare that target.
+
+| Module | bcm2712 | rp2350 | rp2040 |
+|---|---:|---:|---:|
+| aggregation | 312512 | 202816 | 23744 |
+| chronicle_cli | 394176 | n/a | n/a |
+| decision | 57536 | 57536 | 19648 |
+| expression | 10432 | 10432 | 3264 |
+| pipeline | 78144 | 78144 | 53568 |
+| sensor_intake | 320 | 256 | 256 |
+
+State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB.
+A deployment may declare a lower capacity for itself, in which case the
+lower of the two binds at load.

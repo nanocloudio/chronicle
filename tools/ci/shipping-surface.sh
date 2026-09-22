@@ -5,10 +5,10 @@
 # fluxor SDK. A device running them needs no cargo, no crates, and no Linux build
 # host — that is the whole point of the project.
 #
-# There is no longer any host code at all: the differential oracles were retired
-# into golden corpora, each beside the harness that reads it, and the last crate
-# is gone. This gate keeps it that way — the cheapest way to lose the property is for someone
-# to add a crate "just for a helper" and start including from it.
+# The tree carries no host code at all: the differential oracles live as golden
+# corpora, each beside the harness that reads it, and there is no crate. This gate
+# keeps it that way — the cheapest way to lose the property is for someone to add
+# a crate "just for a helper" and start including from it.
 #
 # Deliberately structural, not behavioural: it asserts what the runtime CANNOT
 # reach, which no amount of passing tests would reveal.
@@ -29,9 +29,11 @@ hits=$(msrc | xargs grep -hn 'include!' 2>/dev/null | grep -c 'crates/' || true)
   || no surface "$hits module include!(s) reach into crates/"
 
 # 2. Modules may only include from `modules/common` (the shared cores) or
-#    `target/fluxor` (the SDK). Anything else is a new, unreviewed path in.
+#    `target/fluxor` (the SDK). Anything else is a new, unreviewed path in. A
+#    bare sibling filename is a core including a core — the `common` root.
 roots=$(msrc | xargs grep -hoE 'include!\("[^"]+"' 2>/dev/null \
-  | sed 's/.*include!("//' | sed 's|^\(\.\./\)*||' | cut -d/ -f1 | sort -u | tr '\n' ' ')
+  | sed 's/.*include!("//' | sed 's|^\(\.\./\)*||' | sed 's|^[^/]*\.rs"$|common|' \
+  | cut -d/ -f1 | sort -u | tr '\n' ' ')
 case "$(printf '%s' "$roots" | tr -s ' ')" in
   "common target "|"target common ") ok "modules include only shared cores and the fluxor SDK" ;;
   *) no surface "unexpected include roots: '$roots'" ;;

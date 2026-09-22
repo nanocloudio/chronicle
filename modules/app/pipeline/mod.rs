@@ -293,12 +293,38 @@ const ENC_BUF: usize = 4096;
 /// the outside.
 ///
 /// A single compact JWS is ~350 bytes, and an HTTP envelope carrying one
-/// carries the path and header block beside it. `pipeline` is
-/// `hardware_targets = ["bcm2712"]`, so no constrained target pays for this.
-const REC_BUF: usize = 4096;
+/// carries the path and header block beside it.
+///
+/// Which is why the bound is DERIVED from the state arena rather than fixed: the
+/// records that justify a generous ceiling are the ones a constrained target
+/// cannot receive. Three 4 KiB record buffers plus two 8 KiB version tables would
+/// be half of a 64 KiB arena, and a JWS inside an HTTP envelope cannot reach a
+/// graph with no room for an HTTP stack beside this module. Five hundred and
+/// twelve bytes is a sensor record and a decision outcome, which is what such a
+/// graph carries.
+///
+/// A CAPACITY choice rather than a variant, because the drop-not-truncate failure
+/// mode is identical at either size: an overrun is refused and counted the same
+/// way, so the two builds differ in what they can hold and in nothing else. The
+/// manifest declares the matching `max_record` per target, so the advertised
+/// ceiling and the buffer behind it cannot disagree.
+///
+/// `expression` and `decision` carry the same bound, and must: the three sit on
+/// one channel family, so a node that admitted more than its downstream would
+/// pass records that node must then refuse. `limit_register.md` records the
+/// coupling and the gate holds the three to one derivation.
+const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const REC_BUF: usize = if TINY { 512 } else { 4096 };
 /// Backing buffer for the version table (holds every loaded version's program;
 /// mutable for hot reload). Larger than one program so several versions coexist.
-const VBIN_BUF: usize = 8192;
+///
+/// Held in TWO copies (active + candidate) so a reload can be staged and
+/// rejected without disturbing what is running, so this constant costs twice
+/// what it says. On a 64 KiB arena that is a quarter of everything for a
+/// blue/green capability a sensor node does not exercise — such a node is
+/// reconfigured by OTA, not by hot-swapping program versions under load — so it
+/// carries one program's worth plus headroom instead.
+const VBIN_BUF: usize = if TINY { 3072 } else { 8192 };
 /// Control-message scratch for the `ctrl_input` port (hot-reload ops).
 const CTRL_BUF: usize = 4096;
 
@@ -465,8 +491,8 @@ define_params! {
     // A shipped IR-stages container (hex), lowered to a bytecode-stages container
     // at load (each stage's cost re-derived).
     // Which executor runs each stage, one hex byte per stage, parallel to
-    // `ir_stages`. `00` compute, `01` decision. Absent = all compute, so every
-    // existing graph means exactly what it did before.
+    // `ir_stages`. `00` compute, `01` decision. Absent means all compute, which is
+    // what a graph that names no executors is asking for.
     //
     // Declared here rather than inside the stage container because that
     // container's bytes are recorded in a frozen corpus and in every emitted
@@ -511,6 +537,11 @@ define_params! {
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
+
+// The same figure as data, so `pack` records this engine's resident footprint
+// in its manifest and a graph's state-arena demand is summable at compose time
+// rather than discovered when the device fails to load it.
+declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

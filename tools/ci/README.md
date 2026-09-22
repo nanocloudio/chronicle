@@ -22,7 +22,10 @@ gate that fails the build when the prose goes stale.**
 
 ## Shape 1: a hand-written register, parsed against source
 
-Used by `limit-register.sh`, against `docs/architecture/limit_register.md`.
+Used by `fluxor ci`'s `limit-register` phase, against
+`docs/architecture/limit_register.md`. Not a script here: every project carrying
+a register is subject to the same gate, so it lives in the tool rather than being
+reimplemented per project.
 
 A *register* is a human-readable document that a machine can also read. It carries
 prose — rationale, failure mode, change rule, which tests cover it — because a
@@ -30,8 +33,18 @@ bare list of numbers teaches nobody why a bound is what it is. Inside it sits on
 fenced block in a trivially parseable format:
 
 ```
-NAME | path/to/source.rs | expected-right-hand-side
+NAME | path/to/source.rs | expected-right-hand-side | profile
 ```
+
+The profile field is optional and is what a per-silicon register needs: a
+constant declared behind several `cfg` predicates gets one row per profile, and
+the gate derives each declaration's profile from the predicates that actually
+guard it. Chronicle omits it — see the register's own Profiles section for why —
+and fluxor's register carries it on every row.
+
+A second fenced block, `limit-constraints`, records RELATIONSHIPS between limits
+and checks each is still the condition of a live `assert!`. Values alone cannot
+express "these two must agree", and that is precisely what a retune breaks.
 
 The gate extracts the block, and for each row finds `const NAME ... = <rhs>;` at
 the recorded path and compares the right-hand side textually after collapsing

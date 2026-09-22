@@ -17,6 +17,8 @@ the saving — stages serialize between themselves inside a node too.
 | `examples/aggregation/on_count.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/on_processing.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/raft_checkpoint.yaml` | 3 | 12 | 0 |
+| `examples/arena_budget/fits.yaml` | 2 | 3 | 0 |
+| `examples/arena_budget/tight.yaml` | 2 | 3 | 0 |
 | `examples/composed/linux.yaml` | 2 | 3 | 1 |
 | `examples/decision/linux.yaml` | 1 | 2 | 0 |
 | `examples/expression/id.yaml` | 1 | 2 | 0 |
@@ -45,6 +47,9 @@ the saving — stages serialize between themselves inside a node too.
 | `examples/reverser/reverser_b.yaml` | 6 | 9 | 3 |
 | `examples/reverser/reverser_c.yaml` | 6 | 10 | 2 |
 | `examples/reverser/reverser_pi5.yaml` | 31 | 59 | 7 |
+| `examples/sensor_rules/linux.yaml` | 2 | 3 | 0 |
+| `examples/sensor_rules/pico.yaml` | 3 | 2 | 0 |
+| `examples/sensor_rules/pico_windowed.yaml` | 3 | 2 | 0 |
 | `examples/smtp_sink/linux.yaml` | 1 | 3 | 0 |
 | `examples/telemetry_probe/linux.yaml` | 2 | 2 | 0 |
 

@@ -3,15 +3,19 @@
 // the Fluxor `.fmod` module at `modules/app/expression/mod.rs` — one source of
 // truth for the runtime, whether it runs on the host (tests) or on device.
 //
-// Opcode set (Phase 2): parameter load, field selection, constants, comparison,
-// arithmetic, logical ops, and message construction — enough to lower the spec's
-// Expression, Transformation (message construction), and Decision (predicate +
-// constructed outcome) examples. Phase 3 adds `CALL` into the pinned CEL
-// extension builtin table (builtins_core.rs, included below so every consumer
-// of this file gets the table with no extra include) and `cel.bind` locals.
+// The opcode set covers parameter load, field selection, constants, comparison,
+// arithmetic, logical ops, message construction, `CALL` into the pinned CEL
+// extension builtin table, and `cel.bind` locals — which is what it takes to
+// lower an Expression, a Transformation (message construction) and a Decision
+// (predicate plus constructed outcome).
+//
+// `builtins_core.rs` is included below rather than left to each consumer, so
+// every mount of this file gets the builtin table with no second include and no
+// way for the two to be mounted at different revisions.
 
-// (path via ../common so the shipping-surface gate sees the one allowed root)
-include!("../common/builtins_core.rs");
+// A sibling include, relative to this file, so it resolves both in
+// modules/common/ and in a consumer's flat `chronicle-common` source tree.
+include!("builtins_core.rs");
 
 /// A runtime value. Strings/bytes/messages borrow from the input, so the
 /// evaluator allocates nothing.
@@ -495,8 +499,9 @@ fn as_i128(v: Value<'_>) -> Option<i128> {
 // are three stack machines that all honour the same immediate/arithmetic ops, and
 // the first two also share the value-load ops. These helpers hold that logic once;
 // each VM tries them before its own opcodes. `None` means "not my opcode — the VM
-// handles it"; `Some(result)` is the handled outcome. They advance `pc` and the
-// stack exactly as the inline arms did, so behaviour is unchanged.
+// handles it"; `Some(result)` is the handled outcome. Each advances `pc` and the
+// stack exactly as a VM's own arm would, so which VM honours an op is invisible to
+// a program.
 
 /// PUSH_I64, ADD, SUB, MUL — honoured by all three VMs.
 #[inline]

@@ -31,16 +31,56 @@
 // window start, so a late event for a reclaimed window is dropped, never
 // reopened. `windows_for` matches the host pane assignment exactly.
 
+// ── Capacities, supplied by the mounting site ───────────────────────────────
+//
+// The four `AGG_CAP_*` constants below are DECLARED BY WHOEVER MOUNTS THIS CORE,
+// before the `include!`. Nothing here chooses them.
+//
+// They are the dominant term in the mounting module's state, not a detail: the
+// emission queue, the snapshot staging buffer and its hex decode are all
+// `MAX_LANES x MAX_PANES` products, so they scale as the product of two of these
+// and together they outweigh every other buffer the engine holds. What a target
+// can afford for them is a property of that target's state arena, which this core
+// cannot see.
+//
+// Nor does it read `abi::config` to find out. This core is mounted by the host
+// test harness as well as by the engine, and the harness is an ordinary std crate
+// with no SDK in scope — a reference to `abi::` here would make the core
+// untestable, and capacity arithmetic is the last thing that should be untested.
+//
+// So each mounting site declares them from what it knows: the engine derives them
+// from `abi::config::kernel::STATE_ARENA_SIZE`, and the harness states the
+// capacities its boundary assertions are written against. The names are
+// deliberately prefixed and deliberately unlike the public aliases below, so a
+// mount that omits one gets an unresolved-name error rather than a silent
+// fallback to a default that fits nothing.
+
 /// Maximum distinct keys (lanes) held at once — the bounded-cardinality ceiling.
-pub const MAX_LANES: usize = 16;
+pub const MAX_LANES: usize = AGG_CAP_LANES;
 /// Maximum operators in one aggregation.
-pub const MAX_OPS: usize = 8;
+pub const MAX_OPS: usize = AGG_CAP_OPS;
 /// Maximum live panes (open + finalized-within-horizon windows) per lane.
-pub const MAX_PANES: usize = 8;
+pub const MAX_PANES: usize = AGG_CAP_PANES;
 /// Maximum windows one event can belong to (sliding-window overlap bound).
-pub const MAX_WIN_PER_EVENT: usize = 8;
+///
+/// Cannot exceed the panes a lane holds: an event matching more windows than the
+/// lane can keep would fold into panes that are immediately evicted, which reads
+/// as silently dropped aggregation rather than as the capacity limit it is.
+pub const MAX_WIN_PER_EVENT: usize = AGG_CAP_PANES;
 /// Maximum length of a byte-string partition key.
+///
+/// NOT scaled with the others. A key is an identity, not a quantity: truncating
+/// it would merge two distinct keys into one lane and silently aggregate across
+/// them, and 48 bytes is what a routing key needs regardless of how many of them
+/// a die can hold. A key too long is refused (`AggError::KeyTooLong`).
 pub const KEY_CAP: usize = 48;
+
+// The capacities must be coherent, and a reduced tier is where an incoherent set
+// would first appear. Asserted here so a mount that halves one and forgets
+// another fails the build rather than the aggregation.
+const _: () = assert!(MAX_LANES >= 1 && MAX_PANES >= 1 && MAX_OPS >= 1);
+const _: () = assert!(MAX_WIN_PER_EVENT <= MAX_PANES);
+const _: () = assert!(COLL_CAP >= 1);
 
 /// An aggregation operator.
 ///
@@ -87,7 +127,7 @@ pub const CKPT_VER: u8 = 1;
 /// `MAX_LANES × MAX_PANES` array, so every value here costs 1 KiB of module
 /// state. Saturation is COUNTED (`coll_overflows`), never silently absorbed — an
 /// operator whose result stopped being exact says so.
-pub const COLL_CAP: usize = 16;
+pub const COLL_CAP: usize = AGG_CAP_COLL;
 
 /// A bounded, sorted-ascending multiset of `i64` — the single structure behind
 /// all three collection operators. Distinct inserts uniquely and reports its

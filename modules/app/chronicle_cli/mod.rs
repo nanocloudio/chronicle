@@ -1796,6 +1796,11 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<State>() as u32
 }
 
+// The same figure as data, so `pack` records this engine's resident footprint
+// in its manifest and a graph's state-arena demand is summable at compose time
+// rather than discovered when the device fails to load it.
+declare_module_state_bytes!(State);
+
 #[no_mangle]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}

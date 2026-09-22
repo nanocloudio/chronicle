@@ -37,11 +37,24 @@ clustor = "0.0.1"
 
 [ci]
 # Module targets `fluxor modules build --all` will produce artefacts for.
-targets = ["bcm2712"]
+# Every engine but `chronicle_cli` builds for all three: the CLI is a host
+# authoring tool and asks a 394 KB arena, which no MCU has.
+#
+# The RP shelves are not optional. Chronicle ships modules for them, so CI has to
+# build them or the per-target figures in docs/architecture/resource_summary.md go
+# stale without anyone noticing — and those figures are what compose-time admission
+# charges a graph against.
+targets = ["bcm2712", "rp2350", "rp2040"]
 
 # Every ceiling-shaped const in a file the limit register names is registered,
 # so an unregistered one is a defect rather than a backlog item. The register
 # says as much in its own admission rule; this makes the build say it too.
+#
+# The gate is `fluxor ci`'s `limit-register` phase, which every project carrying
+# a register is subject to. It checks three things: that each registered constant
+# still has its recorded right-hand side, that each recorded coupling is still a
+# live `assert!` condition, and that no ceiling-shaped const in a register-named
+# file is unregistered.
 limit_register_coverage = "fail"
 
 # No [ci.cargo]: this project has no cargo crate. Every unit test lives in a
@@ -66,7 +79,6 @@ scripts = [
   "tools/ci/unsafe-seam.sh",
   "tools/ci/secret-safety.sh",
   "tools/ci/accounting-order.sh",
-  "tools/ci/limit-register.sh",
   "tools/ci/core-coverage.sh",
   "tools/ci/resource-summary.sh",
   "tools/ci/hop-count.sh",
@@ -82,6 +94,24 @@ scripts = [
 # is no host crate in this project for an inline test to belong to.
 forbid_inline_tests = ["modules"]
 mode                = "strict"
+
+# The five engines relax `dead_code` / `unused_imports` / `unreachable_patterns`
+# at the crate root, which `lints.md` §4 otherwise forbids in favour of a
+# call-site `#[expect]`. Declared here with the reason rather than suppressed,
+# on the same grounds fluxor's own `modules/` prefix carries: a PIC module
+# `include!`s the whole of `target/fluxor/fluxor-abi/sdk/*` AND the shared
+# device cores in `modules/common/*`, so every engine's compile sees the entire
+# ABI surface and every core while using a subset of each. That is a property
+# of how a PIC module is assembled, not of any one engine, and a call-site
+# attribute cannot state it — the unused items are in textually mounted files
+# the engine does not own.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/app/"
+reason = """Chronicle's engines mount the fluxor SDK and the shared cores in \
+modules/common/* via include!, so each engine's compile sees the whole ABI \
+surface and every core while consuming a subset. Same cause as fluxor's own \
+modules/ prefix; the unused items belong to mounted files, not to the engine, \
+so there is no call site to put an #[expect] on."""
 
 # Manifest roots for the telemetry id-table (names, histogram bounds,
 # dimension domains): chronicle graphs COMPOSE store-resolved modules from

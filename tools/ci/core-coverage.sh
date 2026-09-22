@@ -29,7 +29,12 @@ is_tested() { grep -rql "include!(\"../../../modules/common/$1\")" tests/harness
 is_table() {
   # any include! of this core (any relative path form) from another core that is
   # itself directly tested by a host suite.
-  for host in $(grep -rlE "include!\(\"[^\"]*/$1\"\)" modules/common/*_core.rs 2>/dev/null); do
+  # The directory prefix is OPTIONAL: a core may include a sibling core by bare
+  # filename (`include!("builtins_core.rs")`), which is how vm_core mounts its
+  # builtin table. A pattern that required a slash would miss those and report a
+  # core as UNCLASSIFIED while it is compiled into, and exercised by, a tested
+  # core's suite.
+  for host in $(grep -rlE "include!\(\"([^\"]*/)?$1\"\)" modules/common/*_core.rs 2>/dev/null); do
     [ "$(basename "$host")" = "$1" ] && continue
     is_tested "$(basename "$host")" && return 0
   done

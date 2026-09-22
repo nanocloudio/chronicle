@@ -1,0 +1,67 @@
+# Sensor → EVENT-TIME WINDOWS on a plain Pico (RP2040).
+#
+# Where `pico.yaml` evaluates first-hit rules per reading, this folds readings
+# into windows and emits a result per window:
+#
+#   temp_sensor --SensorSample--> sensor_intake --record--> aggregation
+#
+# The windows are EVENT time, taken from the reading's own `t_micros` rather than
+# from when the record arrived, so a late reading folds into the window it belongs
+# to instead of the one that happened to be open. That is the whole reason the
+# sensor surface carries a timestamp.
+#
+# Occupancy:
+#
+#   aggregation     23,744
+#   sensor_intake      256
+#   temp_sensor         64
+#   total           24,064   36% of 65,536, slack 41,472
+#
+# `aggregation` holds four lanes of four panes here against sixteen of eight on a
+# Pi 5, because its lane, pane, operator and collection ceilings are keyed on the
+# state arena: the emission queue, the snapshot buffer and its hex decode are all
+# products of lanes and panes, so those four numbers dominate the engine's state.
+# Four keys with four live panes each is a real reduction in what this node can
+# hold, not a packing trick — a graph needing more partitions on this die
+# partitions the keyspace across nodes, which is the answer the limit register
+# gives for every other capacity here. Overflow is counted either way:
+# `lane_overflows` means the same thing on an RP2040 as on a Pi 5.
+#
+# CHECKPOINTING IS NOT WIRED, and the arithmetic is why it can be left so. A Pico
+# has no consensus tier to checkpoint into and no durable store to restore from,
+# and an unwired port allocates no channel buffer — which matters here because
+# this die's whole BUFFER arena is 16 KiB. The ports stay on the module rather
+# than being omitted by a variant, because the composer charges nothing for what
+# is not wired; a graph wanting replicated aggregation state runs on a target that
+# has both halves of it.
+#
+# The `ir_def` param is the authoring path's checked IR, lowered at load. This one
+# is the shared example spec (count + sum per key); author a real one with
+#   fluxor exec chronicle -- agg <window> <lateness> <lanes> 0 0 <key_ir> <time_ir> <emit_ir> …
+# The point of the example is the wiring and the occupancy, not the aggregation.
+#
+# `fluxor build` reports occupancy and refuses the graph if it overruns.
+target: pico
+
+modules:
+  - name: temp_sensor
+    interval_ms: 5000
+    sensor_id: 1
+
+  - name: sensor_intake
+
+  - name: aggregation
+    params:
+      ir_def: "64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d000500010100000012010000000500020200000001000000120200000005000202000000020000001203000000050002030000000100000012040000000500020300000002000000120500000013020000000108000500010300000014"
+
+wiring:
+  # `SensorSample` is a framed record envelope, so this edge runs in mailbox mode:
+  # a 24-byte fixed-layout reading handed over in halves would decode plausible
+  # values from the wrong offsets. The composer enforces it rather than trusting
+  # the author to remember.
+  - from: temp_sensor.reading
+    to: sensor_intake.sample
+    buffer_group: 1
+
+  - from: sensor_intake.record_out
+    to: aggregation.record_in

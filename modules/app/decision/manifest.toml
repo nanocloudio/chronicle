@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2040", "rp2350"]
 # Cadence-independent: a pure record transform. It evaluates rules over the
 # record in front of it and never measures time in ticks, so a variable-cadence
 # domain cannot change what it decides — only when it gets to decide it.
@@ -10,13 +10,14 @@ timer_class     = "agnostic"
 
 # Input: one typed record frame (see pipeline_core.rs). The decision evaluates
 # its first-hit rules over this record.
-# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
-# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
-# LEVEL — strings, math, encoders, bindings — so later variants can compose
-# subsets for constrained targets. `full` (default) carries all four and emits
-# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
-# build without a feature rejects that extension's programs FAIL-CLOSED at
-# runtime (BadBuiltin / BadOpcode), never silently.
+# Feature-set variants. The pinned CEL extension surface
+# (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so a variant can compose
+# subsets for constrained targets. `full` is the default and carries all four; it
+# emits the unsuffixed .fmod, so a graph that names the module without naming a
+# variant gets the whole surface. A build without a feature rejects that
+# extension's programs FAIL-CLOSED at runtime (BadBuiltin / BadOpcode), never
+# silently.
 [[variant]]
 name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
@@ -26,8 +27,8 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2040 = 512 }
 
 # Output: the selected outcome as a typed record frame — the first rule whose
 # `when` predicate holds constructs its outcome, else the default outcome.
@@ -35,8 +36,8 @@ buffer_size  = 4096
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2040 = 512 }
 
 [observability]
 # Baseline accounting (ids 0..13, canonical order) front-loaded so index == id,

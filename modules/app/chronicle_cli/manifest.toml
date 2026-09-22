@@ -31,13 +31,14 @@ timer_class      = "agnostic"
 # argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
 # Sized for `seal-module`, the widest form: 4 fixed arguments plus a
 # <kind> <pkg.sym> <digest> triple per contained artefact.
-# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
-# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
-# LEVEL — strings, math, encoders, bindings — so later variants can compose
-# subsets for constrained targets. `full` (default) carries all four and emits
-# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
-# build without a feature rejects that extension's programs FAIL-CLOSED at
-# runtime (BadBuiltin / BadOpcode), never silently.
+# Feature-set variants. The pinned CEL extension surface
+# (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so a variant can compose
+# subsets for constrained targets. `full` is the default and carries all four; it
+# emits the unsuffixed .fmod, so a graph that names the module without naming a
+# variant gets the whole surface. A build without a feature rejects that
+# extension's programs FAIL-CLOSED at runtime (BadBuiltin / BadOpcode), never
+# silently.
 [[variant]]
 name     = "full"
 features = ["strings", "math", "encoders", "bindings"]

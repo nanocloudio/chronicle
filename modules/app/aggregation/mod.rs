@@ -35,6 +35,32 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // the host harness (tests/harness), all in ONE module so cross-references resolve.
 mod agg {
     use super::abi::SyscallTable;
+
+    // The aggregation core's capacities, which this mount supplies (see the
+    // `AGG_CAP_*` note at the top of `agg_core.rs` for why the core does not
+    // choose them itself).
+    //
+    // Keyed on the ARENA, for the same reason this module's own buffers are: it
+    // states why the number differs rather than which die it is for, so a target
+    // added later inherits the right tier without an edit. They are the dominant
+    // term in the module's state, because the emission queue, the snapshot buffer
+    // and its hex decode are all lane×pane products.
+    //
+    // Four keys with four live panes each is a REAL reduction in what a node
+    // holds, not a packing trick. A graph needing more partitions on a 64 KiB die
+    // partitions the keyspace across nodes, which is the answer the limit register
+    // gives for every other capacity here. Overflow is counted and never silent at
+    // either size: `lane_overflows` and `pane_overflows` mean the same thing on an
+    // RP2040 as on a Pi 5.
+    //
+    // `super::ARENA` is the arena constant the module's own buffers are keyed on,
+    // named once at the crate root.
+    use super::ARENA;
+    const AGG_CAP_LANES: usize = if ARENA <= 64 * 1024 { 4 } else { 16 };
+    const AGG_CAP_PANES: usize = if ARENA <= 64 * 1024 { 4 } else { 8 };
+    const AGG_CAP_OPS: usize = if ARENA <= 64 * 1024 { 4 } else { 8 };
+    const AGG_CAP_COLL: usize = if ARENA <= 64 * 1024 { 4 } else { 16 };
+
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
     include!("../../common/agg_core.rs");
@@ -52,34 +78,111 @@ mod agg {
 use agg::{
     admit_frame, agg_op_kind, drain_all, frame_len, hex_decode, ingest, lower_def, read_prog,
     Accounting, Admit, AggSpec, AggState, BarrierGate, Durability, EmitTrigger, Mode, OpSpec,
-    Pending, Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, MAX_OPS,
+    Pending, Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, COLL_CAP, KEY_CAP, MAX_LANES,
+    MAX_OPS, MAX_PANES,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
-const HEX_BUF: usize = 8192;
-const CONT_BUF: usize = 4096;
+/// Capacity tier, from the state arena the target actually has rather than from
+/// a die name — the same derivation `decision` and `pipeline` use.
+///
+/// Three tiers rather than two, because this module's buffers span two orders of
+/// magnitude and the middle one carries its own answer: at the full capacities the
+/// engine asks 312,512 B, which exceeds RP2350's 245,760 B arena as well as
+/// RP2040's 65,536 B. A single MCU tier would therefore have to be the smallest
+/// one, and an RP2350 would hold a fraction of what its arena can afford.
+const ARENA: usize = abi::config::kernel::STATE_ARENA_SIZE;
+/// RP2040 class: the whole arena is 64 KiB.
+const TINY: bool = ARENA <= 64 * 1024;
+/// RP2350 class: an MCU, but not that one.
+const SMALL: bool = ARENA <= 512 * 1024;
+
+/// Pick a capacity for this target's tier.
+///
+/// A named function rather than an `if`-chain per constant: rustfmt expands an
+/// `if / else if / else` across seven lines, and the limit register reads a
+/// constant's right-hand side one line at a time, so every such constant would
+/// register as empty. One call per constant keeps both readable — and says
+/// "this is tiered" once instead of three times.
+const fn by_arena(tiny: usize, small: usize, full: usize) -> usize {
+    if TINY {
+        tiny
+    } else if SMALL {
+        small
+    } else {
+        full
+    }
+}
+
+const HEX_BUF: usize = by_arena(2048, 4096, 8192);
+const CONT_BUF: usize = by_arena(1024, 2048, 4096);
 /// Input event buffer, sized to the port max_record so a whole typed event frame
 /// from an upstream pipeline/decision module is admitted — never a partial.
-const REC_BUF: usize = 4096;
+const REC_BUF: usize = by_arena(512, 1024, 4096);
 /// Largest single emitted window frame retained for delivery. An aggregation
 /// result (a key plus a handful of operator values) is well under this.
-const EMIT_FRAME_MAX: usize = 512;
-/// One event can emit up to `MAX_LANES * MAX_PANES * 2` = 256 frames (every live
-/// pane on an `OnProcessing` trigger, then again on finalization). The emission
-/// queue holds a whole event's output so a full output ring (EAGAIN) never forces
-/// a drop: emissions are captured here during `ingest`, then drained one frame per
-/// step, and the next event is not admitted until the queue empties.
-const EMIT_Q_CAP: usize = 256 * (2 + EMIT_FRAME_MAX);
-/// The largest snapshot `AggState::snapshot` can produce, so EVERY admitted state
-/// is checkpointable. Derived from the capacities: 42 global bytes + 16
-/// lanes × (60 lane bytes + 8 panes × 270) ≈ 35,562; rounded up with margin. The
+///
+/// It is the dominant term in the emission queue, which holds a whole event's
+/// fan-out, so every byte here costs `EMIT_FRAMES_PER_EVENT` bytes of state — 256
+/// of them wherever the lane and pane capacities are at full. That leverage is why
+/// the MCU tiers take 128: at 512 the queue is 131,584 B, and at 128 it is 33,280
+/// B on RP2350 and 4,160 B on RP2040, which is the largest saving available in
+/// this module without narrowing a port.
+///
+/// Keyed on `SMALL` rather than by tier, because an aggregation result is a key
+/// plus a handful of operator values either way; 128 bytes is generous for one and
+/// there is nothing a third size would buy.
+const EMIT_FRAME_MAX: usize = if SMALL { 128 } else { 512 };
+/// Frames one event can emit: every live pane on an `OnProcessing` trigger, then
+/// again on finalization. DERIVED from the lane/pane capacities rather than
+/// written as a number — the queue's contract is that it holds a *whole event's*
+/// fan-out, so a literal here can be cut below the fan-out it is supposed to
+/// bound, silently turning a proven no-drop invariant into a live
+/// `emit_overflow` path. Deriving it means a change to `MAX_LANES` or `MAX_PANES`
+/// carries the queue with it.
+const EMIT_FRAMES_PER_EVENT: usize = MAX_LANES * MAX_PANES * 2;
+/// The emission queue holds a whole event's output so a full output ring (EAGAIN)
+/// never forces a drop: emissions are captured here during `ingest`, then drained
+/// one frame per step, and the next event is not admitted until the queue empties.
+const EMIT_Q_CAP: usize = EMIT_FRAMES_PER_EVENT * (2 + EMIT_FRAME_MAX);
+
+/// The exact bound on what `AggState::snapshot` can produce, from its own wire
+/// layout (`agg_core::snapshot`). Every term is a capacity this module already
+/// declares, so the three cannot drift apart:
+///
+/// - global: `[ver:u8][max_event_time:i64]` + six `u32` counters + `[nlanes:u8]`
+///   + `[processing_clock:u64]`;
+/// - per lane: `[key_is_int:u8][key_len:u16][key…KEY_CAP][finalized_high:i64][npanes:u8]`;
+/// - per pane: `[finalized:u8][window_start:i64]` + `[a:i64][b:i64]×MAX_OPS`
+///   + `[since_emit:u32][coll_len:u8]` + `[i64 × COLL_CAP]`.
+const SNAPSHOT_GLOBAL_BYTES: usize = 1 + 8 + 6 * 4 + 1 + 8;
+const SNAPSHOT_LANE_BYTES: usize = 1 + 2 + KEY_CAP + 8 + 1;
+const SNAPSHOT_PANE_BYTES: usize = 1 + 8 + 16 * MAX_OPS + 4 + 1 + 8 * COLL_CAP;
+// One line, and pinned that way: the limit register extracts a constant's
+// right-hand side per line, so a rustfmt wrap would read as an empty value.
+#[rustfmt::skip]
+const SNAPSHOT_EXACT: usize = SNAPSHOT_GLOBAL_BYTES + MAX_LANES * (SNAPSHOT_LANE_BYTES + MAX_PANES * SNAPSHOT_PANE_BYTES);
+/// The largest snapshot the module will stage, so EVERY admitted state is
+/// checkpointable. `SNAPSHOT_EXACT` plus 15% headroom, rounded up to a 4 KiB
+/// boundary: 40,960 at the full capacities, 4,096 at the tiny tier. The
 /// checkpoint buffer and the `checkpoint_out` record are both sized to this, so a
 /// full snapshot travels as one retained record — delivered atomically, retained
-/// on a full ring (no chunk-reassembly protocol, no loss under EAGAIN). Fits a
-/// `u16` cursor (`Pending`) since it is under 64 KiB.
-const MAX_SNAPSHOT: usize = 40960;
+/// on a full ring, with no chunk-reassembly protocol and no loss under EAGAIN.
+///
+/// The headroom is there because `SNAPSHOT_EXACT` is exact for the LAYOUT, and a
+/// rounded staging buffer costs nothing a 4 KiB granule was not going to spend
+/// anyway.
+const MAX_SNAPSHOT: usize = ((SNAPSHOT_EXACT * 115) / 100).div_ceil(4096) * 4096;
+/// The point of deriving it: a capacity change that outgrows the staging buffer
+/// fails the build instead of returning `None` from `snapshot` at runtime and
+/// skipping every checkpoint.
+const _: () = assert!(MAX_SNAPSHOT >= SNAPSHOT_EXACT);
+/// `Pending` addresses the retained checkpoint record with a `u16` cursor, so a
+/// capacity growth that pushed the snapshot past 64 KiB would wrap it. Asserted
+/// rather than commented, since the cursor width is not visible from here.
+const _: () = assert!(MAX_SNAPSHOT <= u16::MAX as usize);
 /// Hex of a supplied restore checkpoint: twice the decoded snapshot. `state_hex_len`
 /// is `u32` because this exceeds a `u16`.
 const SNAP_HEX: usize = 2 * MAX_SNAPSHOT;
@@ -254,6 +357,11 @@ define_params! {
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
+
+// The same figure as data, so `pack` records this engine's resident footprint
+// in its manifest and a graph's state-arena demand is summable at compose time
+// rather than discovered when the device fails to load it.
+declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

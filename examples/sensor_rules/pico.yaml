@@ -1,0 +1,58 @@
+# Sensor → rules on a plain Pico (RP2040).
+#
+# The whole point of this graph is that NO node names another's format:
+#
+#   temp_sensor --SensorSample--> sensor_intake --record--> decision
+#
+# `temp_sensor` (a fluxor foundation driver) declares the CAPABILITY
+# `sensor.sample` with `quantity = temperature`, and emits the 24-byte
+# `SensorSample` record. It knows nothing about chronicle.
+#
+# `sensor_intake` translates that surface into the chronicle typed record frame —
+# the composition boundary, and the only node that knows both shapes.
+#
+# `decision` evaluates compiled first-hit CEL rules over the record, addressing
+# fields by number (1 value, 2 scale, 3 t_micros, 4 seq, 5 sensor_id, 6 flags).
+# The `decision` param below is the compiler's container; this one is a
+# placeholder that routes every reading to a constant outcome, because the point
+# of the example is the WIRING, not the policy. Author a real table with
+# `fluxor exec chronicle -- decision <ir_hex>`.
+#
+# No network: this is the measurement graph on its own — sensor acquisition, a
+# typed surface, a translation and a rules evaluation, with nothing else competing
+# for the 64 KiB state arena. Swap `decision` for `pipeline` to stage several
+# artefacts, `aggregation` for event-time windows (see pico_windowed.yaml), or add
+# quantum's `mqtt_client` on an RP2350 where the wireless stack fits beside it.
+#
+# Occupancy:
+#
+#   decision        19,648
+#   sensor_intake      256
+#   temp_sensor         64
+#   total           19,968   30% of 65,536, slack 45,568
+#
+# `fluxor build` reports it and refuses the graph if it overruns.
+target: pico
+
+modules:
+  - name: temp_sensor
+    interval_ms: 5000
+    sensor_id: 1
+
+  - name: sensor_intake
+
+  - name: decision
+    params:
+      decision: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+
+wiring:
+  # `SensorSample` is a framed record envelope, so this edge runs in mailbox
+  # mode: a 24-byte fixed-layout reading handed over in halves would decode
+  # plausible values from the wrong offsets and a rule would fire on them. The
+  # composer enforces this rather than trusting the author to remember it.
+  - from: temp_sensor.reading
+    to: sensor_intake.sample
+    buffer_group: 1
+
+  - from: sensor_intake.record_out
+    to: decision.record_in

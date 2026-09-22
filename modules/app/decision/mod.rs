@@ -54,6 +54,30 @@ use dec::{
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
+/// One typed record frame, in and out.
+///
+/// The same bound `expression` and `pipeline` carry, and it has to be: the three
+/// sit on one channel family carrying the same typed records, so a `decision`
+/// holding less than the node feeding it would drop exactly the records that node
+/// had gone to the trouble of carrying. That is a GRAPH-wide constraint, not a
+/// per-module choice — `limit_register.md` records it and the gate holds the three
+/// to one derivation.
+///
+/// DERIVED from the state arena the target has, not from a die name. Where the
+/// whole arena is 64 KiB, two 4 KiB record buffers are an eighth of it, spent on
+/// records a graph that size does not carry: such a node is fed by a sensor
+/// driver, and a reading is tens of bytes. The manifest declares the matching
+/// `max_record` per target, so the advertised ceiling and the buffer behind it are
+/// one number.
+///
+/// Keyed on the arena rather than on `fluxor_silicon` for two reasons. It says the
+/// REASON — this is about how much memory there is, not which part — so a target
+/// added later inherits it without an edit. And it compiles under any toolchain: a
+/// `cfg` the build does not declare trips `unexpected_cfgs` under `-D warnings`,
+/// whereas `abi::config` is in scope in every module.
+const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const REC_BUF: usize = if TINY { 512 } else { 4096 };
+
 /// The decision param, as hex on the way in and as the deserialized container
 /// in use. `HEX_BUF` is twice `CONT_BUF` because hex doubles.
 ///
@@ -63,21 +87,33 @@ include!("../../common/telemetry_core.rs");
 /// param that does overrun is a FAULT: the node names it and refuses input,
 /// because a truncated container decodes to a different policy.
 ///
-/// Both buffers live in module STATE, so they cost state and not a PIC frame.
-const HEX_BUF: usize = 40960;
-const CONT_BUF: usize = 20480;
+/// TAKEN from `pipeline_core` rather than restated, and tiered by arena like
+/// `REC_BUF` above. Restating it is what made this buffer wrong once already:
+/// 20,480 bytes chosen independently of the authoring path. Flattening it to the
+/// RP2040 floor was the same mistake pointing the other way — it refuses tables
+/// this target has the arena to hold, and refuses them at LOAD, where the only
+/// evidence is a policy that decides something else.
+///
+/// On a full-arena target the bound is `author_core::BIN_BUF`, so the engine
+/// loads anything the authoring path can assemble. Both buffers live in module
+/// STATE, so they cost state and not a PIC frame: 48 KiB an instance at the full
+/// tier, against the 256 MiB arena such a target has.
+const CONT_BUF: usize = if TINY {
+    dec::MAX_CONTAINER_BIN
+} else {
+    dec::MAX_CONTAINER_BIN_FULL
+};
+const HEX_BUF: usize = 2 * CONT_BUF;
 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    // 4096, matching `pipeline`'s `REC_BUF`. The two engines sit on the same
-    // channels carrying the same records, so a `decision` that could hold
-    // less than the `pipeline` feeding it would drop exactly the records the
-    // pipeline had just gone to the trouble of carrying.
-    in_buf: [u8; 4096],
-    out_buf: [u8; 4096],
+    // See `REC_BUF`: matched to `pipeline`'s on targets where the two can be
+    // wired, cut where the arena is too small for a record that size to arrive.
+    in_buf: [u8; REC_BUF],
+    out_buf: [u8; REC_BUF],
     /// One retained output frame, drained before any new input is admitted.
     pending: Pending,
     hex: [u8; HEX_BUF],
@@ -134,6 +170,11 @@ define_params! {
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
+
+// The same figure as data, so `pack` records this engine's resident footprint
+// in its manifest and a graph's state-arena demand is summable at compose time
+// rather than discovered when the device fails to load it.
+declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

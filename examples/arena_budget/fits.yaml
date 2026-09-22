@@ -1,0 +1,45 @@
+# ARENA ADMISSION, exercised against the real loader.
+#
+# The same pipeline as sensor_rules/linux.yaml, with a `capacity:` envelope that
+# sizes the state arena DOWN to what the graph actually needs. The envelope is a
+# packaging-time declaration: the composer writes the graph's demand into the
+# image, and the kernel's resource ledger enforces it as the arena's capacity for
+# that deployment, at or below the compiled `STATE_ARENA_SIZE`.
+#
+# The loader carves 57,520 B for `decision` and 272 B for `sensor_intake`. Those
+# are the module state sizes as the loader sees them; the manifests record 57,536
+# and 320, the same figures rounded up to whole 64-byte units. Checking the pair
+# against the loader is what proves the recorded numbers are the loader's own and
+# not an independent estimate that happens to look right.
+#
+# `fits` is sized at the sum of the two, 57,792. `tight` is one byte under it.
+# tools/e2e/arena-budget.sh drives both: the first must load and decide, the
+# second must be REFUSED AT MODULE LOAD, and the refusal must name the envelope
+# rather than the compiled arena — two ceilings guard this pool and a diagnostic
+# that named the wrong one would send a reader to rebuild a kernel over a number
+# that had nothing to do with it.
+#
+# That refusal point is the claim limit_register.md makes about the state arena,
+# "exhaustion is refused at module load, not at the allocation that overruns",
+# and this is where it is checked.
+#
+# This arm is sized at exactly what the two modules need.
+target: linux
+tick_us: 100
+capacity:
+  state_arena: 57792
+platform:
+  cli: {}
+modules:
+  - name: sensor_intake
+  - name: decision
+    params:
+      decision: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+wiring:
+  - from: cli_in.stdin_out
+    to: sensor_intake.sample
+    buffer_group: 1
+  - from: sensor_intake.record_out
+    to: decision.record_in
+  - from: decision.result_out
+    to: cli_out.bytes_in

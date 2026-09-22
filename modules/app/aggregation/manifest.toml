@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 # Cadence-independent: windows are EVENT time carried in the records, the
 # checkpoint interval counts events, and telemetry reads the device clock.
 # Nothing here measures time in ticks, so a variable-cadence domain cannot
@@ -13,13 +13,14 @@ timer_class     = "agnostic"
 # [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload]; the event
 # carries {1: customer_id(str), 2: created_at(i64), 3: amount(i64)}. Multiple
 # frames may arrive concatenated in one read; the module processes each in turn.
-# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
-# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
-# LEVEL — strings, math, encoders, bindings — so later variants can compose
-# subsets for constrained targets. `full` (default) carries all four and emits
-# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
-# build without a feature rejects that extension's programs FAIL-CLOSED at
-# runtime (BadBuiltin / BadOpcode), never silently.
+# Feature-set variants. The pinned CEL extension surface
+# (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so a variant can compose
+# subsets for constrained targets. `full` is the default and carries all four; it
+# emits the unsuffixed .fmod, so a graph that names the module without naming a
+# variant gets the whole surface. A build without a feature rejects that
+# extension's programs FAIL-CLOSED at runtime (BadBuiltin / BadOpcode), never
+# silently.
 [[variant]]
 name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
@@ -29,8 +30,8 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2350 = 1024, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2350 = 1024, rp2040 = 512 }
 
 # Output: one typed record frame per finalized window (a CustomerTotal), emitted
 # when the event-time watermark closes the window.
@@ -38,8 +39,8 @@ buffer_size  = 4096
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2350 = 1024, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2350 = 1024, rp2040 = 512 }
 
 # Optional distributed activation barrier (in[1]): commit horizons from Clustor's
 # `consensus.committed_entries` (MSG_COMMITTED_ENTRY: [term:u64 LE][index:u64 LE]
@@ -67,8 +68,8 @@ direction    = "output"
 content_type = "OctetStream"
 # Sized to the proven maximum AggState snapshot so a full state is checkpointable
 # as one retained record, not silently dropped when it exceeds a small ring.
-max_record   = 40960
-buffer_size  = 40960
+max_record   = { default = 40960, rp2040 = 4096 }
+buffer_size  = { default = 40960, rp2040 = 4096 }
 
 # Producer half of the Clustor binding (raft-propose mode). Wiring proposal_out
 # (out[2]) enables it: the module submits its checkpoint snapshot to

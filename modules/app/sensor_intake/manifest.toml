@@ -1,0 +1,45 @@
+version          = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+# Cadence-independent: a pure per-record translation with no notion of time of
+# its own. The reading's timestamp is carried through, never sampled here, so a
+# variable-cadence domain changes only WHEN a reading is translated.
+timer_class      = "agnostic"
+
+# `SensorSample` → chronicle typed record frame.
+#
+# The composition boundary between fluxor's measurement surface and chronicle's
+# record format. Neither side learns the other's shape: a driver that emitted
+# chronicle frames would be coupled to this engine family, and an engine that
+# decoded `SensorSample` would be coupled to one producer's wire shape and need a
+# second decoder for the next surface.
+#
+# Wire in:  24 fixed bytes, `abi::contracts::sensor`.
+# Wire out: `[count:u8]` then per field `[number:u8][type:u8][len:u16 LE][payload]`
+#           — six i64 fields, numbered 1 value, 2 scale, 3 t_micros, 4 seq,
+#           5 sensor_id, 6 flags.
+
+# Input: one whole reading. `buffer_group` is REQUIRED on the producing edge —
+# `SensorSample` is a framed record envelope, and the composer enforces that — so
+# a 24-byte fixed-layout record is never handed over in halves.
+[[ports]]
+name         = "sample"
+direction    = "input"
+content_type = "SensorSample"
+max_record   = 24
+buffer_size  = 240
+
+# Output: the canonical chronicle record frame every engine here decodes.
+[[ports]]
+name         = "record_out"
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 96
+buffer_size  = 960
+
+[observability]
+exempt = """Per-record translation with no I/O of its own: it declares the \
+baseline accounting taxonomy (succeeded / rejected / failed) plus a short-sample \
+counter and a stall counter, and has no sustained byte stream or effect surface \
+to instrument beyond them."""

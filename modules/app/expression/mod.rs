@@ -60,9 +60,28 @@ use expr::{
 // telemetry primitives it wraps are in scope.
 include!("../../common/telemetry_core.rs");
 
-/// Input and output record buffers, sized to the port max_record so a full typed
-/// frame fits and admission is never a partial acceptance.
-const REC_BUF: usize = 4096;
+/// Input and output record buffers, sized to the port `max_record` so a full
+/// typed frame fits and admission is never a partial acceptance.
+///
+/// DERIVED from the state arena the target has, not from a die name: where the
+/// whole arena is 64 KiB, two 4 KiB record buffers are an eighth of it, spent on
+/// records a graph that size does not carry — such a node is fed by a sensor
+/// driver, and a reading is tens of bytes. The manifest declares the matching
+/// `max_record` per target, so the advertised ceiling and the buffer behind it are
+/// one number.
+///
+/// Keyed on the arena rather than on `fluxor_silicon` because it says the REASON —
+/// how much memory there is, not which part — so a target added later inherits it
+/// without an edit, and because `abi::config` is in scope in every module while an
+/// undeclared `cfg` would trip `unexpected_cfgs` under `-D warnings`.
+///
+/// The same bound `decision` and `pipeline` carry, and it has to be: the three sit
+/// on one channel family carrying the same typed records, so an `expression` that
+/// admitted more than the `decision` downstream would pass records that node must
+/// then refuse. `limit_register.md` records the coupling and the gate holds the
+/// three to one derivation.
+const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const REC_BUF: usize = if TINY { 512 } else { 4096 };
 const HEX_BUF: usize = 1024;
 const CODE_BUF: usize = 512;
 
@@ -152,6 +171,11 @@ define_params! {
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
+
+// The same figure as data, so `pack` records this engine's resident footprint
+// in its manifest and a graph's state-arena demand is summable at compose time
+// rather than discovered when the device fails to load it.
+declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]

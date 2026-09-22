@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 # Cadence-independent: a pure record transform. Stages run over the record in
 # front of them; telemetry reads the device clock, never the tick count.
 timer_class     = "agnostic"
@@ -15,13 +15,14 @@ capabilities = ["stream.ordered_ack.sink"]
 # Input: a typed record frame (see mod.rs / pipeline_core.rs `decode_frame`):
 # [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload], where
 # type 0 = byte string and type 1 = i64 (8 bytes LE).
-# Feature-set variants (fluxor RFC module_variants). The pinned CEL extension
-# surface (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
-# LEVEL — strings, math, encoders, bindings — so later variants can compose
-# subsets for constrained targets. `full` (default) carries all four and emits
-# the unsuffixed .fmod, so every existing graph and pin resolves unchanged. A
-# build without a feature rejects that extension's programs FAIL-CLOSED at
-# runtime (BadBuiltin / BadOpcode), never silently.
+# Feature-set variants. The pinned CEL extension surface
+# (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
+# LEVEL — strings, math, encoders, bindings — so a variant can compose
+# subsets for constrained targets. `full` is the default and carries all four; it
+# emits the unsuffixed .fmod, so a graph that names the module without naming a
+# variant gets the whole surface. A build without a feature rejects that
+# extension's programs FAIL-CLOSED at runtime (BadBuiltin / BadOpcode), never
+# silently.
 [[variant]]
 name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
@@ -31,16 +32,16 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2040 = 512 }
 
 # Output: the final stage's constructed message, in the same typed record frame.
 [[ports]]
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = 4096
-buffer_size  = 4096
+max_record   = { default = 4096, rp2040 = 512 }
+buffer_size  = { default = 4096, rp2040 = 512 }
 
 # Control: hot-reload ops for the version table (add a version / flip the default
 # / remove a drained one). See version_core.rs `vctl`. Optional — a config that
@@ -68,8 +69,8 @@ requires_capability = "stream.ordered_ack"
 # One framed publish at this module's ceiling: the 3-byte envelope, the
 # contract's 13-byte overhead, and a 4096-byte result frame (no key). See
 # `PUB_FRAME_MAX` in mod.rs.
-max_record   = 4112
-buffer_size  = 16448
+max_record   = { default = 4112, rp2040 = 528 }
+buffer_size  = { default = 16448, rp2040 = 2112 }
 
 [[ports]]
 name         = "ack_in"

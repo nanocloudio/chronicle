@@ -1,0 +1,33 @@
+# The sensor pipeline driven on the host: `sensor_intake` → `decision`.
+#
+# `pico.yaml` is the same chain on an RP2040 and cannot be executed without that
+# silicon. Everything in it except the sensor acquisition can be executed here:
+# this feeds a real 24-byte `SensorSample` in on stdin and asserts the decision
+# the rules reach. `temp_sensor`'s acquisition is fluxor's and separately covered;
+# what this graph proves is the composition — that a reading crosses the surface
+# boundary, becomes a chronicle record, and is decided on.
+#
+# The decision routes field 1 (`value`) > 1000 → {1:100}, else → {1:0}; the same
+# container examples/decision/linux.yaml uses. So a 23.5 °C reading (23500
+# millidegrees) decides 100 and a 0.5 °C reading (500) decides 0 — which is also
+# a check that the i64 the adapter writes is the i64 the VM reads.
+#
+#   printf '\x01\x00\x00\xfd\x07\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xcc\x5b\x00\x00\x00\x00\x00\x00' \
+#     | fluxor run examples/sensor_rules/linux.yaml | xxd
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: sensor_intake
+  - name: decision
+    params:
+      decision: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+wiring:
+  - from: cli_in.stdin_out
+    to: sensor_intake.sample
+    buffer_group: 1
+  - from: sensor_intake.record_out
+    to: decision.record_in
+  - from: decision.result_out
+    to: cli_out.bytes_in

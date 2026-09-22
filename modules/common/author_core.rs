@@ -209,6 +209,23 @@ pub const MAX_SET: usize = 8;
 /// the arm count as the bound an author meets rather than the buffer.
 pub const BIN_BUF: usize = 16384;
 
+/// The authoring buffer must be able to assemble anything a runtime engine will
+/// accept. Stated as an assertion because the two numbers live in different
+/// files for good reasons — this one is the tool's work buffer, the other is the
+/// wire bound every engine sizes to — and the relation between them is the only
+/// thing that makes either claim about the other true.
+///
+/// Crossing it in one direction would mean a container an engine admits but the
+/// CLI cannot produce; in the other, an engine sizing for artefacts no author can
+/// emit. Neither is detectable from either file alone.
+///
+/// Held against the FULL tier, which is the one a full-arena engine sizes to:
+/// equality there means such an engine loads anything assembled here. The floor
+/// tier is deliberately below this — an RP2040-class target admits less than the
+/// CLI can produce, and that gap is a property of the target rather than a
+/// mistake, so it is not what this assert guards.
+const _: () = assert!(BIN_BUF >= MAX_CONTAINER_BIN_FULL);
+
 /// Rule arms in ONE decision.
 ///
 /// A decision is how a document expresses a state machine, and a state

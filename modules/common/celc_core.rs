@@ -137,6 +137,33 @@ pub fn celc_compile_ty(
     src: &[u8],
     out: &mut [u8],
 ) -> Result<(usize, CTy), CelcErr> {
+    celc_compile_scoped(schema, params, src, out, false)
+}
+
+/// [`celc_compile_ty`] with the first parameter as the IMPLICIT RECEIVER: a
+/// name that is not a `cel.bind` local or a parameter resolves as a field of
+/// parameter 0, so `size > 4096` means `it.size > 4096` when `params` is
+/// `it:File`. Explicit names still win — a local or a parameter is never
+/// shadowed by a field — and enum constants resolve after fields. The IR is
+/// the same `PATH` a spelled-out path compiles to; only name resolution
+/// differs, so an implicit program lowers, costs and runs exactly like its
+/// explicit spelling.
+pub fn celc_compile_implicit(
+    schema: &[u8],
+    params: &[u8],
+    src: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, CTy), CelcErr> {
+    celc_compile_scoped(schema, params, src, out, true)
+}
+
+fn celc_compile_scoped(
+    schema: &[u8],
+    params: &[u8],
+    src: &[u8],
+    out: &mut [u8],
+    receiver: bool,
+) -> Result<(usize, CTy), CelcErr> {
     let mut p = Celc {
         schema,
         params,
@@ -147,6 +174,7 @@ pub fn celc_compile_ty(
         depth: 0,
         locals: [None; CELC_MAX_LOCALS],
         nlocals: 0,
+        receiver,
     };
     p.skip_ws();
     if p.pos >= p.src.len() {
@@ -220,6 +248,8 @@ struct Celc<'a> {
     /// Live `cel.bind` bindings, innermost last (shadowing = last match wins).
     locals: [Option<Binding>; CELC_MAX_LOCALS],
     nlocals: usize,
+    /// Parameter 0 is the implicit receiver ([`celc_compile_implicit`]).
+    receiver: bool,
 }
 
 impl Celc<'_> {
@@ -633,6 +663,9 @@ impl Celc<'_> {
                 self.put1(idx)?;
                 return Ok((ty?, false));
             }
+            if let Some(found) = self.receiver_path(segs)? {
+                return Ok(found);
+            }
             if let Some(v) = self.lookup_enum(name) {
                 self.put1(ir::INT)?;
                 self.put(&v.to_le_bytes())?;
@@ -641,18 +674,90 @@ impl Celc<'_> {
             return Err(CelcErr::UnknownName(name.s, name.e));
         }
 
-        // Field path: root must be a message-typed parameter.
-        let (idx, ty) = self
-            .lookup_param(segs[0])
-            .ok_or(CelcErr::UnknownParam(segs[0].s, segs[0].e))?;
-        let mut current = ty?;
+        // Field path: root must be a message-typed parameter — or, with an
+        // implicit receiver, a field of parameter 0.
+        let Some((idx, ty)) = self.lookup_param(segs[0]) else {
+            if let Some(found) = self.receiver_path(segs)? {
+                return Ok(found);
+            }
+            return Err(CelcErr::UnknownParam(segs[0].s, segs[0].e));
+        };
+        self.emit_path(idx, ty?, segs[0].s, segs[0].e, &segs[1..])
+    }
+
+    /// Resolve `segs` as a path under the implicit receiver. `None` when there
+    /// is no receiver or its message has no field named `segs[0]`, so the
+    /// caller falls through to its own resolution and error.
+    fn receiver_path(&mut self, segs: &[Seg]) -> Result<Option<(CTy, bool)>, CelcErr> {
+        if !self.receiver {
+            return Ok(None);
+        }
+        let Some(rty) = self.param_type_at(0) else {
+            return Ok(None);
+        };
+        let CTy::Msg(in_params, ms, me) = rty else {
+            return Ok(None);
+        };
+        let mname_buf = if in_params { self.params } else { self.schema };
+        let Some(body) = find_message(self.schema, &mname_buf[ms as usize..me as usize]) else {
+            return Ok(None);
+        };
+        match find_field(self.schema, body, self.seg_bytes(segs[0])) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            Err(at) => return Err(CelcErr::BadSchema(at)),
+        }
+        // The receiver has no source span; errors inside the path render from
+        // the first field, which is what the author wrote.
+        self.emit_path(0, rty, segs[0].s, segs[0].s, segs).map(Some)
+    }
+
+    /// The declared type of the parameter at `index`, or `None` past the end.
+    fn param_type_at(&self, index: u8) -> Option<CTy> {
+        let mut pos = 0usize;
+        let mut idx = 0u8;
+        loop {
+            skip_ws_at(self.params, &mut pos);
+            scan_ident(self.params, &mut pos)?;
+            skip_ws_at(self.params, &mut pos);
+            if self.params.get(pos) != Some(&b':') {
+                return None;
+            }
+            pos += 1;
+            skip_ws_at(self.params, &mut pos);
+            let ts = pos;
+            let te = scan_dotted(self.params, &mut pos)?;
+            if idx == index {
+                return Some(self.resolve_type_name(true, ts as u16, te as u16));
+            }
+            skip_ws_at(self.params, &mut pos);
+            if self.params.get(pos) != Some(&b',') {
+                return None;
+            }
+            pos += 1;
+            idx = idx.checked_add(1)?;
+        }
+    }
+
+    /// Walk `tail` field-by-field from parameter `idx` of type `root` and emit
+    /// one `PATH`. `path_s..path_e` is the source span of the path so far.
+    fn emit_path(
+        &mut self,
+        idx: u8,
+        root: CTy,
+        path_s: u16,
+        mut path_e: u16,
+        tail: &[Seg],
+    ) -> Result<(CTy, bool), CelcErr> {
+        if tail.len() > CELC_MAX_SEGS {
+            return Err(CelcErr::Capacity);
+        }
+        let mut current = root;
         let mut numbers = [0u32; CELC_MAX_SEGS];
-        // `path_e` tracks the end of the path SO FAR (host `at` rendering).
-        let mut path_e = segs[0].e;
-        for (i, seg) in segs[1..nsegs].iter().enumerate() {
+        for (i, seg) in tail.iter().enumerate() {
             let CTy::Msg(in_params, ms, me) = current else {
                 return Err(CelcErr::NotAMessage {
-                    path_s: segs[0].s,
+                    path_s,
                     path_e,
                     scalar: cty_scalar_code(&current),
                 });
@@ -679,10 +784,15 @@ impl Celc<'_> {
             current = fty;
             path_e = seg.e;
         }
+        if tail.is_empty() {
+            self.put1(ir::LOADPARAM)?;
+            self.put1(idx)?;
+            return Ok((current, false));
+        }
         self.put1(ir::PATH)?;
         self.put1(idx)?;
-        self.put1((nsegs - 1) as u8)?;
-        for n in &numbers[..nsegs - 1] {
+        self.put1(tail.len() as u8)?;
+        for n in &numbers[..tail.len()] {
             self.put(&n.to_le_bytes())?;
         }
         Ok((current, false))
