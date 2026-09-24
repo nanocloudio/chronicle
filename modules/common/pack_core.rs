@@ -93,8 +93,10 @@ fn count_u8(n: usize) -> Result<u8, PackError> {
 
 /// `[max_cost:u32 LE][code_len:u16 LE][code]`.
 ///
-/// The cost is NARROWED to u32 here, exactly as the host does — the containers
-/// carry a 32-bit budget and the compiler's `u64` never approaches it.
+/// The cost is NARROWED to u32 here, as at every wire site. The containers carry
+/// a 32-bit budget, and `lower_core` proves at compile time that a program
+/// capped at `u16::MAX` bytes cannot cost more than that — the same cap
+/// `ProgramTooLong` enforces two lines below.
 fn pk_prog(out: &mut [u8], p: usize, prog: &Prog) -> Result<usize, PackError> {
     if prog.code.len() > u16::MAX as usize {
         return Err(PackError::ProgramTooLong);

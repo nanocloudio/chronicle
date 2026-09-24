@@ -57,7 +57,29 @@ pub enum LowerError {
     BadTag(u8),
     /// The output buffer was too small for the lowered bytecode.
     Overflow,
+    /// A lowered program is longer than the two-byte length prefix can carry.
+    ///
+    /// Refused rather than wrapped, because the prefix is what `read_prog`
+    /// frames the NEXT program with: a wrapped length would not fault, it would
+    /// hand the reader a short program and then decode the tail of this one as
+    /// the header of the next. Reachable only through an output buffer of
+    /// 64 KiB or more, which callers do supply (`chronicle_cli` lowers into a
+    /// `UPROC_BUF`-sized buffer) — so this is the caller's bound checked here,
+    /// where the narrowing happens, instead of trusted from another file.
+    ProgramTooLong,
 }
+
+/// The static cost is carried on the wire as a `u32`, and it is narrowed from the
+/// `u64` this function returns without a check. That is sound, and this is why:
+/// every emitted op adds one unit and consumes at least one output byte, and a
+/// `CALL` adds its arity on top of that — `builtin_arity` answers argument
+/// counts, at most three today and never more than a `u8` could hold. A
+/// program's code is capped at `u16::MAX` bytes by the same prefix that carries
+/// its length, so the cost is bounded by `u16::MAX * (1 + arity)`. The assertion
+/// pins that bound against `u32::MAX` with arity taken at its widest, so the
+/// narrowing at every wire site is a checked fact rather than a comment.
+const MAX_CALL_ARITY_BOUND: u64 = u8::MAX as u64;
+const _: () = assert!((u16::MAX as u64) * (1 + MAX_CALL_ARITY_BOUND) <= u32::MAX as u64);
 
 /// Lower a flat, post-order checked-IR stream into VM bytecode in `out`. Returns
 /// `(bytecode_len, opcode_count)` — the opcode count is the static WORK bound the
@@ -278,6 +300,9 @@ pub fn lower_stages_kinded(
             let dst = out.get_mut(wp + 7..).ok_or(LowerError::Overflow)?;
             lower_flat(flat, dst)?
         };
+        if clen > u16::MAX as usize {
+            return Err(LowerError::ProgramTooLong);
+        }
         out[wp] = route;
         out[wp + 1..wp + 5].copy_from_slice(&(cost as u32).to_le_bytes());
         out[wp + 5..wp + 7].copy_from_slice(&(clen as u16).to_le_bytes());
@@ -308,6 +333,9 @@ fn lower_one_prog(
         let dst = out.get_mut(wp + 6..).ok_or(LowerError::Overflow)?;
         lower_flat(flat, dst)?
     };
+    if clen > u16::MAX as usize {
+        return Err(LowerError::ProgramTooLong);
+    }
     out[wp..wp + 4].copy_from_slice(&(cost as u32).to_le_bytes());
     out[wp + 4..wp + 6].copy_from_slice(&(clen as u16).to_le_bytes());
     Ok((flat_start + ilen, wp + 6 + clen))

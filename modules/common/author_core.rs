@@ -78,7 +78,12 @@ pub fn celc_err_name(e: CelcErr) -> &'static [u8] {
 }
 
 pub fn put_prog(cont: &mut [u8], w: &mut usize, code: &[u8], cost: u64) -> bool {
-    if *w + 6 + code.len() > cont.len() {
+    // The length prefix is two bytes and `read_prog` frames the next program
+    // off it, so a longer program is refused here — the same refusal
+    // `pk_prog` makes — rather than wrapped into a length that silently
+    // mis-frames everything after it. The cost narrowing beside it needs no
+    // check: `lower_core` proves the bound at compile time.
+    if code.len() > u16::MAX as usize || *w + 6 + code.len() > cont.len() {
         return false;
     }
     cont[*w..*w + 4].copy_from_slice(&(cost as u32).to_le_bytes());

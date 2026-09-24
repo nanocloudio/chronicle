@@ -105,6 +105,7 @@ COLL_CAP >= 1 | modules/common/agg_core.rs
 |---|---|---|---|---|---|---|---|---|---|
 | `MAX_STAGES` | 8 | st | per record | capacity | `stage_count > MAX_STAGES` → `inputs_failed`, never truncated (consumed) | 8 × `Stage` descriptor on the step | a bounded pipeline depth; a longer chain is a graph of nodes | larger variant | `pipeline::…over_cap_stage…` |
 | `DECISION_STAGE_COST` | 100_000 | vmi | per decision stage | policy default | n/a — recorded, not consulted | none | the `max_cost` field the stage format requires; a decision stage's real bounds are the per-program costs inside its own container, enforced by `run_decision` | tracks the format | `tools/e2e/inline-decision.sh` |
+| `MAX_CALL_ARITY_BOUND` | `u8::MAX as u64` (255) | op | per `CALL` | proof bound | n/a — not a refusal point; it sizes a compile-time assertion | none | the widest argument count a `CALL` could add to a program's static cost. With code capped at `u16::MAX` bytes by its length prefix and every op adding one unit plus this at most, the cost cannot exceed `u32::MAX`, which is what lets every wire site narrow the `u64` cost to the container's `u32` field unchecked. Held at a `u8`'s width rather than the table's actual maximum (three) so a builtin gaining arguments cannot outgrow the proof without the assertion saying so | tracks the `[cost:u32]` wire field; widening the field retires it | `lower_core` const assert — a violation fails the build |
 | `INGRESS_BUF` | `PAYLOAD_MAX` (8192) | B | per module (pipeline) | capacity | publish payload > ceiling → OVERSIZE refusal, frame consumed (consumed: yes, counted) | one intake buffer | a sink for any producer of the exchange surface takes the contract's whole payload; the decoded record is still one `REC_BUF` frame | tracks the contract | `tools/e2e/pipeline-chain.sh`, `examples/reverser/reverser_pi5.yaml` (build fact check) |
 | `MAX_INFLIGHT` | 8 | rec | per module | capacity | window full → no record admitted until the destination answers (backpressure, consumed: no) | one counter; the frames live downstream | publishes unacknowledged at once on the exchange surface | larger variant | `tools/e2e/pipeline-chain.sh` (more records than the window, all delivered) |
 | `PUB_FRAME_MAX` | `3 + PUBLISH_OVERHEAD + REC_BUF` — 4112 / 4112 / 528 | B | per publish frame | capacity | a record that would frame larger is refused before the send; the window is never advanced on a frame that did not go | one publish buffer | one framed publish at this module's record ceiling — what `publish_out` declares as `max_record`, so the exchange peer sizes for exactly this | tracks `REC_BUF` and the contract overhead | `tools/e2e/pipeline-egress.sh` |
@@ -243,6 +244,7 @@ MAX_PLAN_STAGES | modules/common/author_core.rs | 16
 MAX_BINDINGS | modules/common/author_core.rs | 8
 MAX_BINDING_PARAMS | modules/common/author_core.rs | 12
 DECISION_STAGE_COST | modules/common/lower_core.rs | 100_000
+MAX_CALL_ARITY_BOUND | modules/common/lower_core.rs | u8::MAX as u64
 MAX_INFLIGHT | modules/app/pipeline/mod.rs | 8
 INGRESS_BUF | modules/app/pipeline/mod.rs | PAYLOAD_MAX
 MAX_BUILD_FIELDS | modules/common/vm_core.rs | 32
