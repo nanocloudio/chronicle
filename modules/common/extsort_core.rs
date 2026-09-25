@@ -20,9 +20,13 @@
 // by the store's write chunk.
 //
 // Runs. A run is a sequence of BLOCKS: `[payload_len: u32 LE][crc32c: u32 LE]
-// [payload]`, where the payload is whole records. A block's CRC is checked when
-// it is loaded, before any of its records is handed out, so a torn or altered
-// spill ends the sort with `ExtErr::Corrupt` instead of emitting a wrong answer.
+// [payload]`, where the payload is whole records. When a block is loaded, before
+// any of its records is compared or handed out, its length is bounded by what
+// was read, its CRC is checked, and every record in it is checked to frame
+// within it. A torn or corrupted spill therefore ends the sort with
+// `ExtErr::Corrupt` instead of emitting a wrong answer — or indexing past a
+// block, which on a device with no unwinder is a hang. The CRC detects accidental
+// damage; it is not a defence against a store that forges its contents.
 //
 // Record layout (buffer and runs):
 //   [rec_len: u32 LE][seq: u64 LE][gkey_len: u16 LE][key_len: u16 LE][key][frame]
@@ -99,6 +103,12 @@ const TAG_BYTES: u8 = 0x04;
 /// comparison of encodings orders the values (null < bool < numbers < bytes;
 /// numbers by value across signed/unsigned; bytes lexicographically). `desc`
 /// inverts the component. Returns the new end, or `None` if `out` is full.
+///
+/// `Double`, `Msg` and an unresolved `Scratch` have no encoding here and are
+/// written as NULL, so they sort with nulls and compare equal to one another.
+/// A caller keys on them only after resolving a scratch value to its bytes and
+/// deciding what the others mean — as a grouping key, silently merging them
+/// with nulls would be a wrong answer.
 pub fn encode_key_part(v: Value<'_>, desc: bool, out: &mut [u8], at: usize) -> Option<usize> {
     let start = at;
     let mut p = at;
@@ -231,9 +241,43 @@ fn rd_u32(b: &[u8], at: usize) -> usize {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
 }
 fn rd_u64(b: &[u8], at: usize) -> u64 {
-    let mut x = [0u8; 8];
-    x.copy_from_slice(&b[at..at + 8]);
-    u64::from_le_bytes(x)
+    u64::from_le_bytes([
+        b[at],
+        b[at + 1],
+        b[at + 2],
+        b[at + 3],
+        b[at + 4],
+        b[at + 5],
+        b[at + 6],
+        b[at + 7],
+    ])
+}
+
+/// Every record in a block payload frames within it: its length covers its
+/// header and fits in what is left, its key fits after the header, and its group
+/// key within its key. Checked once when a block loads, so everything that later
+/// reads a record by its own lengths — comparison, emission, hand-out — reads
+/// inside the block. No addition here can overflow: each bound is compared
+/// against what remains, not summed.
+fn block_frames(p: &[u8]) -> bool {
+    let mut at = 0usize;
+    while at < p.len() {
+        let rest = p.len() - at;
+        if rest < EXT_REC_HDR {
+            return false;
+        }
+        let len = rd_u32(p, at);
+        if len < EXT_REC_HDR || len > rest {
+            return false;
+        }
+        let gk = rd_u16(p, at + 12);
+        let k = rd_u16(p, at + 14);
+        if gk > k || k > len - EXT_REC_HDR {
+            return false;
+        }
+        at += len;
+    }
+    true
 }
 
 /// A record's parts: (sequence, group key, full key, frame).
@@ -348,6 +392,8 @@ pub struct Sorter {
     final_runs: [u32; EXT_MAX_FANIN],
     nfinal: usize,
     reduce_out: u32,
+    /// Records the reduce pass in progress has written to `reduce_out`.
+    reduce_emitted: u64,
     /// A reduce pass runs while input is still arriving; resume filling after.
     reduce_then_fill: bool,
     /// Only the first `limit` records of the result are wanted (0 = all).
@@ -468,6 +514,7 @@ impl Sorter {
             final_runs: [0; EXT_MAX_FANIN],
             nfinal: 0,
             reduce_out: 0,
+            reduce_emitted: 0,
             reduce_then_fill: false,
             limit: 0,
             served: 0,
@@ -482,9 +529,11 @@ impl Sorter {
     }
 
     /// Want only the first `n` records of the result (top-k). A full buffer
-    /// then keeps its first `n` records and goes on filling, and a spilled
-    /// run holds at most `n`: memory and spill are bounded by `n`, not by the
-    /// input. Set before the first `push`.
+    /// then keeps its first `n` records and goes on filling, and every run —
+    /// spilled from the buffer or produced by a merge — holds at most `n`, since
+    /// only the first `n` of a sorted run can reach the result. Live spill is
+    /// therefore bounded by `n` and the run table, not by the input. Set before
+    /// the first `push`.
     pub fn set_limit(&mut self, n: u64) -> Result<(), ExtErr> {
         if self.phase != Phase::Filling || self.stats.records != 0 {
             return Err(ExtErr::Phase);
@@ -837,6 +886,7 @@ impl Sorter {
         self.stats.merge_passes += 1;
         self.open_readers(&live[..f]);
         self.reduce_out = self.new_run(store)?;
+        self.reduce_emitted = 0;
         self.wlen = 0;
         self.phase = Phase::Reducing;
         Ok(())
@@ -889,15 +939,21 @@ impl Sorter {
                 Ok(true)
             }
             Read::Done(n) => {
+                // `plen` comes off the medium, so it is compared against the
+                // room left rather than added to the header size: on a 32-bit
+                // core `EXT_BLOCK_HDR + plen` wraps for a torn length near
+                // `u32::MAX` and would pass the very check meant to refuse it.
+                let n = n.min(block);
                 if n < EXT_BLOCK_HDR {
                     return Err(ExtErr::Corrupt);
                 }
                 let plen = rd_u32(buf, 0);
                 let crc = rd_u32(buf, 4) as u32;
-                if EXT_BLOCK_HDR + plen > n || EXT_BLOCK_HDR + plen > block {
+                if plen > n - EXT_BLOCK_HDR {
                     return Err(ExtErr::Corrupt);
                 }
-                if crc32c(&buf[EXT_BLOCK_HDR..EXT_BLOCK_HDR + plen]) != crc {
+                let payload = &buf[EXT_BLOCK_HDR..EXT_BLOCK_HDR + plen];
+                if crc32c(payload) != crc || !block_frames(payload) {
                     return Err(ExtErr::Corrupt);
                 }
                 let rd = &mut self.readers[r];
@@ -946,7 +1002,7 @@ impl Sorter {
     fn advance(&mut self, m: &[u8], r: usize) -> Result<(), ExtErr> {
         let rd = self.readers[r];
         let len = rd_u32(m, rd.buf_at + rd.pos);
-        if len < EXT_REC_HDR || rd.pos + len > rd.blen {
+        if len < EXT_REC_HDR || len > rd.blen - rd.pos {
             return Err(ExtErr::Corrupt);
         }
         self.readers[r].pos += len;
@@ -961,7 +1017,17 @@ impl Sorter {
     ) -> Result<(), ExtErr> {
         while *budget > 0 {
             *budget -= 1;
-            match self.pick_min(m, store)? {
+            // Under a limit, the merged run ends at the `limit`-th record: its
+            // input is sorted, so nothing after that can reach the result. No
+            // reader has a read outstanding here — the record just written was
+            // picked with every reader filled — so the inputs can be deleted as
+            // on a full merge.
+            let next = if self.limit != 0 && self.reduce_emitted >= self.limit {
+                None
+            } else {
+                self.pick_min(m, store)?
+            };
+            match next {
                 Some(usize::MAX) => return Ok(()), // pending read
                 Some(r) => {
                     let rd = self.readers[r];
@@ -970,6 +1036,7 @@ impl Sorter {
                     let out = self.reduce_out;
                     self.emit(m, store, out, at, len)?;
                     self.advance(m, r)?;
+                    self.reduce_emitted += 1;
                 }
                 None => {
                     let out = self.reduce_out;

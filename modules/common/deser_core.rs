@@ -71,7 +71,8 @@ pub mod rd {
     /// concatenation, first-pushed first. Built in the caller's SCRATCH (see
     /// [`eval_decode_scratch`]); `ScratchOverflow` when it does not fit.
     pub const CAT: u8 = 0x82;
-    /// Pop a value, push it as lowercase hex (in scratch).
+    /// Pop a value, push its bytes as lowercase hex (in scratch). An integer
+    /// is hexed as its decimal text, the text `CAT` gives it.
     pub const HEX: u8 = 0x83;
     /// `n:u16 LE` — pop a value, push it without its first n bytes; EMPTY when
     /// shorter.
@@ -340,15 +341,19 @@ pub fn eval_decode_scratch<'a>(
                     return Err(EvalError::StackUnderflow);
                 }
                 // Measure, then build into the front of what scratch is left.
+                // Every operand is first its text — an integer's decimal
+                // digits, anything else its bytes — and `HEX` then doubles it.
+                let per = if opcode == rd::HEX { 2 } else { 1 };
                 let mut need = 0usize;
                 for &v in &stack[sp - n..sp] {
-                    need += match v {
-                        Value::Int(v) => {
-                            let mut d = [0u8; 20];
-                            rd_dec_digits(v, &mut d)
-                        }
-                        other => rd_bytes(other)?.len() * if opcode == rd::HEX { 2 } else { 1 },
-                    };
+                    need += per
+                        * match v {
+                            Value::Int(v) => {
+                                let mut d = [0u8; 20];
+                                rd_dec_digits(v, &mut d)
+                            }
+                            other => rd_bytes(other)?.len(),
+                        };
                 }
                 if need > free.len() {
                     return Err(EvalError::ScratchOverflow);
@@ -357,27 +362,24 @@ pub fn eval_decode_scratch<'a>(
                 free = tail;
                 let mut w = 0usize;
                 for &v in &stack[sp - n..sp] {
-                    match v {
+                    let mut d = [0u8; 20];
+                    let text: &[u8] = match v {
                         Value::Int(v) => {
-                            let mut d = [0u8; 20];
                             let dl = rd_dec_digits(v, &mut d);
-                            head[w..w + dl].copy_from_slice(&d[..dl]);
-                            w += dl;
+                            &d[..dl]
                         }
-                        other => {
-                            let b = rd_bytes(other)?;
-                            if opcode == rd::HEX {
-                                const HX: &[u8; 16] = b"0123456789abcdef";
-                                for &c in b {
-                                    head[w] = HX[(c >> 4) as usize];
-                                    head[w + 1] = HX[(c & 0x0f) as usize];
-                                    w += 2;
-                                }
-                            } else {
-                                head[w..w + b.len()].copy_from_slice(b);
-                                w += b.len();
-                            }
+                        other => rd_bytes(other)?,
+                    };
+                    if opcode == rd::HEX {
+                        const HX: &[u8; 16] = b"0123456789abcdef";
+                        for &c in text {
+                            head[w] = HX[(c >> 4) as usize];
+                            head[w + 1] = HX[(c & 0x0f) as usize];
+                            w += 2;
                         }
+                    } else {
+                        head[w..w + text.len()].copy_from_slice(text);
+                        w += text.len();
                     }
                 }
                 sp -= n;

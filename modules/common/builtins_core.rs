@@ -171,6 +171,18 @@ impl<'a> Source<'a> {
             Source::Arena { len, .. } => *len,
         }
     }
+    /// The source's bytes, borrowed from wherever they live. For an arena value
+    /// the borrow is of `s`, so it has to end before `s` is written — callers
+    /// take positions from it first and write afterwards.
+    fn bytes<'b>(&'b self, s: &'b Scratch<'_>) -> &'b [u8]
+    where
+        'a: 'b,
+    {
+        match self {
+            Source::Ext(x) => x,
+            Source::Arena { off, len } => &s.buf[*off..*off + *len],
+        }
+    }
     #[inline]
     fn at(&self, i: usize, s: &Scratch<'_>) -> u8 {
         match self {
@@ -258,11 +270,15 @@ fn is_ascii_ws(b: u8) -> bool {
 
 /// A non-negative index within `0..=len`, else TypeError (CEL errors on
 /// out-of-range rather than clamping).
+///
+/// Range-checked as an `i64` before it becomes a `usize`. Converting first would
+/// truncate on a 32-bit core, so an index of 2^32 would read as 0 on an RP part
+/// and be out of range on a Pi 5 — one program, two answers.
 fn checked_index(i: i64, len: usize) -> Result<usize, EvalError> {
-    if i < 0 || i as usize > len {
-        return Err(EvalError::TypeError);
+    match usize::try_from(i) {
+        Ok(u) if u <= len => Ok(u),
+        _ => Err(EvalError::TypeError),
     }
-    Ok(i as usize)
 }
 
 /// UTF-8 sequence length claimed by a lead byte (1 for ASCII and invalid).
@@ -291,9 +307,16 @@ fn b64_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Dispatch one builtin call. `args` are in declaration order (receiver
-/// first). Scratch-producing functions append into `s`. Ids absent from this
-/// build (feature off) or unknown fail closed with `BadBuiltin`.
+// ---- JSON: a bounded path reader over a document's bytes -------------------
+//
+// Shared by the `json.*` builtins and the decoder's `rd::JSON`. It reads where
+// the document lives and allocates nothing. Every step moves forward through the
+// bytes — a member or element that is not followed by `,` or its closer ends the
+// read as absent — so the work is bounded by the document's length, whatever
+// index or path a caller names. Keys are compared as written: a key the document
+// spells with an escape is matched only by a path spelling it the same way.
+
+/// Skip JSON whitespace from `i`.
 fn json_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
         i += 1;
@@ -353,16 +376,20 @@ fn json_skip(b: &[u8], i: usize) -> usize {
 }
 
 /// The value at one step (`key` of an object, or index of an array) from the
-/// value starting at `i`: its start.
+/// value starting at `i`: its start. `None` when the step is absent or the
+/// container is malformed on the way to it.
 fn json_step(b: &[u8], i: usize, seg: &[u8]) -> Option<usize> {
     let i = json_ws(b, i);
     match *b.get(i)? {
         b'{' => {
             let mut j = json_ws(b, i + 1);
-            while j < b.len() && b[j] != b'}' {
-                let ks = j;
-                let ke = json_skip(b, ks);
-                let key = b.get(ks + 1..ke.checked_sub(1)?)?;
+            loop {
+                // `"key": value`, then `,` or the end of the object.
+                if b.get(j) != Some(&b'"') {
+                    return None;
+                }
+                let ke = json_skip(b, j);
+                let key = b.get(j + 1..ke.checked_sub(1)?)?;
                 j = json_ws(b, ke);
                 if b.get(j) != Some(&b':') {
                     return None;
@@ -372,11 +399,11 @@ fn json_step(b: &[u8], i: usize, seg: &[u8]) -> Option<usize> {
                     return Some(vs);
                 }
                 j = json_ws(b, json_skip(b, vs));
-                if b.get(j) == Some(&b',') {
-                    j = json_ws(b, j + 1);
+                match b.get(j) {
+                    Some(b',') => j = json_ws(b, j + 1),
+                    _ => return None,
                 }
             }
-            None
         }
         b'[' => {
             let mut want = 0usize;
@@ -388,25 +415,33 @@ fn json_step(b: &[u8], i: usize, seg: &[u8]) -> Option<usize> {
             }
             let mut j = json_ws(b, i + 1);
             let mut k = 0usize;
-            while j < b.len() && b[j] != b']' {
+            loop {
+                // An element must be there and must move the cursor; then `,`
+                // or the end of the array. An index past the last element is
+                // therefore reached only by walking the array, never by counting
+                // in place.
+                let e = json_skip(b, j);
+                if j >= b.len() || e == j {
+                    return None;
+                }
                 if k == want {
                     return Some(j);
                 }
-                j = json_ws(b, json_skip(b, j));
-                if b.get(j) == Some(&b',') {
-                    j = json_ws(b, j + 1);
+                j = json_ws(b, e);
+                match b.get(j) {
+                    Some(b',') => j = json_ws(b, j + 1),
+                    _ => return None,
                 }
                 k += 1;
             }
-            None
         }
         _ => None,
     }
 }
 
 /// The raw span `[start, end)` of the value at a dotted path (object keys;
-/// decimal array indices), or None when absent. Shared by the decoder's
-/// `rd::JSON` and the `json.*` builtins.
+/// decimal array indices), or `None` when absent. Empty segments are skipped, so
+/// an empty path names the document itself.
 fn json_locate(doc: &[u8], path: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0usize;
     for seg in path.split(|&c| c == b'.') {
@@ -443,22 +478,33 @@ fn json_value<'a>(doc: &'a [u8], path: &[u8]) -> &'a [u8] {
     }
 }
 
-/// The largest document the `json.*` builtins read (bytes).
-const JSON_DOC_MAX: usize = 4096;
-
-/// A string-ish argument's bytes, copied out (the arena cannot be borrowed
-/// while it may be written).
-fn src_copy(src: &Source<'_>, s: &Scratch<'_>, out: &mut [u8]) -> Result<usize, EvalError> {
-    let n = src.len();
-    if n > out.len() {
-        return Err(EvalError::ScratchOverflow);
+/// Append `src[lo..hi]` into the scratch at `*w` (a reserved range).
+fn put_src(src: &Source<'_>, lo: usize, hi: usize, s: &mut Scratch<'_>, w: &mut usize) {
+    let mut i = lo;
+    while i < hi {
+        let b = src.at(i, s);
+        s.buf[*w] = b;
+        *w += 1;
+        i += 1;
     }
-    for (i, b) in out.iter_mut().enumerate().take(n) {
-        *b = src.at(i, s);
-    }
-    Ok(n)
 }
 
+/// Append literal bytes into the scratch at `*w` (a reserved range).
+fn put_lit(bytes: &[u8], s: &mut Scratch<'_>, w: &mut usize) {
+    for &b in bytes {
+        s.buf[*w] = b;
+        *w += 1;
+    }
+}
+
+/// Dispatch one builtin call. `args` are in declaration order (receiver
+/// first). Scratch-producing functions append into `s`. Ids absent from this
+/// build (feature off) or unknown fail closed with `BadBuiltin`.
+///
+/// No builtin holds a buffer of its own on the stack. This body is inlined into
+/// the evaluator loop, so a local array here is paid by every evaluation — not
+/// only by the call that uses it — and on an RP part running under MPU isolation
+/// the whole of that loop runs on a 2 KiB process stack.
 pub fn call_builtin<'a>(
     id: u16,
     args: &[Value<'a>],
@@ -470,17 +516,17 @@ pub fn call_builtin<'a>(
         SIZE => Ok(Value::Int(Source::of(&args[0])?.len() as i64)),
         #[cfg(feature = "strings")]
         JSON_GET | JSON_HAS | JSON_SET_DEFAULT => {
+            // Read in place: an external document is a borrowed slice and a
+            // scratch one is read where it sits. Every position is taken from
+            // those borrows before anything is written.
             let docs = Source::of(&args[0])?;
-            let mut doc = [0u8; JSON_DOC_MAX];
-            let dl = src_copy(&docs, s, &mut doc)?;
-            let mut path = [0u8; 256];
-            let pl = src_copy(&Source::of(&args[1])?, s, &mut path)?;
-            let found = json_locate(&doc[..dl], &path[..pl]);
+            let paths = Source::of(&args[1])?;
+            let found = json_locate(docs.bytes(s), paths.bytes(s));
             match id {
                 JSON_HAS => Ok(Value::Bool(found.is_some())),
                 JSON_GET => Ok(match found {
                     Some(span) => {
-                        let (i, e) = json_unquote(&doc[..dl], span);
+                        let (i, e) = json_unquote(docs.bytes(s), span);
                         docs.window_value(i, e)
                     }
                     None => docs.window_value(0, 0),
@@ -491,47 +537,54 @@ pub fn call_builtin<'a>(
                     if found.is_some() {
                         return Ok(args[0]);
                     }
-                    let mut raw = [0u8; 512];
-                    let rl = src_copy(&Source::of(&args[2])?, s, &mut raw)?;
-                    let p = &path[..pl];
-                    // `k` (top level) or `parent.k` (one level down, the
-                    // parent an object that exists); anything else unchanged.
+                    let raws = Source::of(&args[2])?;
+                    let p = paths.bytes(s);
+                    // `k` (top level) or `parent.k` (one level down, the parent
+                    // an object that exists); any other path leaves the document
+                    // as it is.
                     let (parent, key) = match p.iter().position(|&c| c == b'.') {
-                        None => (None, p),
+                        None => (None, 0..p.len()),
                         Some(d) if p.iter().rposition(|&c| c == b'.') == Some(d) => {
-                            (Some(&p[..d]), &p[d + 1..])
+                            (Some(0..d), d + 1..p.len())
                         }
                         Some(_) => return Ok(args[0]),
                     };
+                    // The key is written verbatim, so one that JSON would need
+                    // escaped is not written at all: the document comes back
+                    // unchanged, not malformed or carrying members the path
+                    // smuggled in.
+                    if p[key.clone()]
+                        .iter()
+                        .any(|&c| c == b'"' || c == b'\\' || c < 0x20)
+                    {
+                        return Ok(args[0]);
+                    }
+                    let d = docs.bytes(s);
                     let obj_at = match parent {
-                        None => json_ws(&doc[..dl], 0),
-                        Some(pp) => match json_locate(&doc[..dl], pp) {
+                        None => json_ws(d, 0),
+                        Some(pp) => match json_locate(d, &p[pp]) {
                             Some((i, _)) => i,
                             None => return Ok(args[0]),
                         },
                     };
-                    if doc.get(obj_at) != Some(&b'{') {
+                    if d.get(obj_at) != Some(&b'{') {
                         return Ok(args[0]);
                     }
-                    let after = json_ws(&doc[..dl], obj_at + 1);
-                    let empty = doc.get(after) == Some(&b'}');
+                    let empty = d.get(json_ws(d, obj_at + 1)) == Some(&b'}');
+                    let (dl, rl) = (d.len(), raws.len());
                     // doc[..=obj_at] "key":raw [,] doc[obj_at+1..]
                     let total = dl + 1 + key.len() + 2 + rl + usize::from(!empty);
                     let off = s.reserve(total)?;
                     let mut w = off;
-                    let mut put = |bytes: &[u8], s: &mut Scratch<'_>| {
-                        s.buf[w..w + bytes.len()].copy_from_slice(bytes);
-                        w += bytes.len();
-                    };
-                    put(&doc[..=obj_at], s);
-                    put(b"\"", s);
-                    put(key, s);
-                    put(b"\":", s);
-                    put(&raw[..rl], s);
+                    put_src(&docs, 0, obj_at + 1, s, &mut w);
+                    put_lit(b"\"", s, &mut w);
+                    put_src(&paths, key.start, key.end, s, &mut w);
+                    put_lit(b"\":", s, &mut w);
+                    put_src(&raws, 0, rl, s, &mut w);
                     if !empty {
-                        put(b",", s);
+                        put_lit(b",", s, &mut w);
                     }
-                    put(&doc[obj_at + 1..dl], s);
+                    put_src(&docs, obj_at + 1, dl, s, &mut w);
                     Ok(Value::Scratch {
                         off: off as u32,
                         len: total as u32,
@@ -560,10 +613,14 @@ pub fn call_builtin<'a>(
         PART => {
             let src = Source::of(&args[0])?;
             let delim = Source::of(&args[1])?;
-            let want = match args[2] {
-                Value::Int(v) if v >= 0 => v as usize,
-                _ => return Err(EvalError::TypeError),
-            };
+            // A negative index is a type error; one past the address space is
+            // past the last part, on every target. `try_from` rather than `as`,
+            // which would truncate on a 32-bit core.
+            let want = arg_int(&args[2])?;
+            if want < 0 {
+                return Err(EvalError::TypeError);
+            }
+            let want = usize::try_from(want).unwrap_or(usize::MAX);
             let (n, dn) = (src.len(), delim.len());
             if dn == 0 {
                 return Err(EvalError::TypeError);
