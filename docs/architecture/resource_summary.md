@@ -61,7 +61,7 @@ does not declare that target.
 | chronicle_cli | 394176 | n/a | n/a |
 | decision | 57536 | 57536 | 19648 |
 | expression | 10432 | 10432 | 3264 |
-| pipeline | 78144 | 78144 | 53568 |
+| pipeline | 79168 | 79168 | 54592 |
 | sensor_intake | 320 | 256 | 256 |
 
 State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB.

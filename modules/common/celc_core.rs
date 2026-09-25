@@ -421,6 +421,15 @@ impl Celc<'_> {
             };
             self.pos += 1;
             let (rt, _) = self.mul_level()?;
+            // CEL's string `+`: concatenation, as a builtin into scratch (the
+            // VM's ADD is integer arithmetic).
+            if tag == ir::ADD && cty_stringish(&lt) && cty_stringish(&rt) {
+                self.put1(ir::CALL)?;
+                self.put(&builtin::CONCAT.to_le_bytes())?;
+                lt = CTy::Str;
+                root = false;
+                continue;
+            }
             if !cty_is_int(&lt) || !cty_is_int(&rt) {
                 return Err(CelcErr::NotInteger);
             }
@@ -601,6 +610,10 @@ impl Celc<'_> {
                         }
                         b"base64" => {
                             let rty = self.call_and_emit(NS_B64, seg, None)?;
+                            return Ok((rty, false));
+                        }
+                        b"json" => {
+                            let rty = self.call_and_emit(NS_JSON, seg, None)?;
                             return Ok((rty, false));
                         }
                         b"cel" => return self.cel_macro(seg),
@@ -805,7 +818,9 @@ impl Celc<'_> {
     /// Argument expressions are emitted in order — post-order stack layout,
     /// receiver (if any) already emitted deepest.
     fn call_and_emit(&mut self, ns: u8, name: Seg, recv: Option<CTy>) -> Result<CTy, CelcErr> {
-        let mut args = [CTy::Int; 2];
+        // Three for a global/namespaced call (`json.setDefault(doc, path,
+        // raw)`); a method's receiver is not among them.
+        let mut args = [CTy::Int; 3];
         let mut nargs = 0usize;
         self.skip_ws();
         if self.src.get(self.pos) == Some(&b')') {
@@ -816,7 +831,7 @@ impl Celc<'_> {
                 if aroot {
                     return Err(CelcErr::NestedConstruction);
                 }
-                if nargs >= 2 {
+                if nargs >= args.len() {
                     return Err(CelcErr::BadCallArgs(name.s, name.e));
                 }
                 args[nargs] = aty;
@@ -1078,6 +1093,7 @@ const NS_METHOD: u8 = 0; // recv.name(args)
 const NS_GLOBAL: u8 = 1; // name(args)         — `size`
 const NS_MATH: u8 = 2; // math.name(args)
 const NS_B64: u8 = 3; // base64.name(args)
+const NS_JSON: u8 = 4; // json.name(args)
 
 fn cty_stringish(t: &CTy) -> bool {
     matches!(t, CTy::Str | CTy::Bytes)
@@ -1127,7 +1143,7 @@ fn resolve_builtin(
                 return match name {
                     b"size" | b"contains" | b"startsWith" | b"endsWith" | b"indexOf"
                     | b"lastIndexOf" | b"charAt" | b"substring" | b"trim" | b"reverse"
-                    | b"lowerAscii" | b"upperAscii" | b"replace" => Err(true),
+                    | b"lowerAscii" | b"upperAscii" | b"replace" | b"part" => Err(true),
                     _ => Err(false),
                 };
             }
@@ -1196,6 +1212,14 @@ fn resolve_builtin(
                     all_str(2)?;
                     Ok((b::REPLACE, *r))
                 }
+                // `list.part(",", i)`: the i-th delimited part — a policy's
+                // list walked at fixed positions, since a program has no loop.
+                b"part" => {
+                    if args.len() != 2 || !cty_stringish(&args[0]) || !cty_is_int(&args[1]) {
+                        return Err(true);
+                    }
+                    Ok((b::PART, *r))
+                }
                 _ => Err(false),
             }
         }
@@ -1242,6 +1266,21 @@ fn resolve_builtin(
             b"bitShiftRight" => {
                 all_int(2)?;
                 Ok((b::BIT_SHR, CTy::Int))
+            }
+            _ => Err(false),
+        },
+        NS_JSON => match name {
+            b"get" => {
+                all_str(2)?;
+                Ok((b::JSON_GET, CTy::Str))
+            }
+            b"has" => {
+                all_str(2)?;
+                Ok((b::JSON_HAS, CTy::Bool))
+            }
+            b"setDefault" => {
+                all_str(3)?;
+                Ok((b::JSON_SET_DEFAULT, CTy::Str))
             }
             _ => Err(false),
         },

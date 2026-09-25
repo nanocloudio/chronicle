@@ -19,7 +19,7 @@
 //
 // GOVERNANCE: the table is append-only. An id, once published, keeps its
 // meaning forever — ids are wire contract exactly like content-type bytes.
-// Each entry is gated by its extension's cfg feature (RFC module_variants);
+// Each entry is gated by its extension's cfg feature, one per variant;
 // a `CALL` naming an id that is absent from this build fails closed with
 // `EvalError::BadBuiltin` — never a silent identity, never a guess.
 //
@@ -69,6 +69,12 @@ pub mod builtin {
                                  // ── encoders (feature "encoders") ───────────────────────────────────
     pub const B64_ENCODE: u16 = 25; //  (str|bytes) -> str   [std alphabet, pad]
     pub const B64_DECODE: u16 = 26; //  (str) -> bytes       [strict]
+                                    // ── documents (feature "strings") ───────────────────────────────────
+    pub const JSON_GET: u16 = 27; //  json.get(doc, path) -> str   [EMPTY when absent]
+    pub const JSON_HAS: u16 = 28; //  json.has(doc, path) -> bool
+    pub const JSON_SET_DEFAULT: u16 = 29; //  json.setDefault(doc, path, raw) -> str
+    pub const PART: u16 = 30; //  (s, delim, i) -> str      [the i-th part; EMPTY past the end]
+    pub const CONCAT: u16 = 31; //  a + b (strings) -> str      [scratch]
 }
 
 /// Bounded output arena for scratch-producing builtins. The caller owns the
@@ -110,7 +116,7 @@ pub fn builtin_available(id: u16) -> bool {
         #[cfg(feature = "strings")]
         SIZE | CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF | CHAR_AT
         | SUBSTRING | SUBSTRING_RANGE | TRIM | REVERSE_STR | REVERSE_BYTES | LOWER_ASCII
-        | UPPER_ASCII | REPLACE => true,
+        | UPPER_ASCII | REPLACE | JSON_GET | JSON_HAS | JSON_SET_DEFAULT | PART | CONCAT => true,
         #[cfg(feature = "math")]
         MATH_GREATEST | MATH_LEAST | MATH_ABS | MATH_SIGN | BIT_AND | BIT_OR | BIT_XOR
         | BIT_SHL | BIT_SHR => true,
@@ -131,8 +137,9 @@ pub fn builtin_arity(id: u16) -> Option<usize> {
         SIZE | TRIM | REVERSE_STR | REVERSE_BYTES | LOWER_ASCII | UPPER_ASCII | MATH_ABS
         | MATH_SIGN | B64_ENCODE | B64_DECODE => 1,
         CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF | CHAR_AT | SUBSTRING
-        | MATH_GREATEST | MATH_LEAST | BIT_AND | BIT_OR | BIT_XOR | BIT_SHL | BIT_SHR => 2,
-        SUBSTRING_RANGE | REPLACE => 3,
+        | MATH_GREATEST | MATH_LEAST | BIT_AND | BIT_OR | BIT_XOR | BIT_SHL | BIT_SHR
+        | JSON_GET | JSON_HAS | CONCAT => 2,
+        SUBSTRING_RANGE | REPLACE | JSON_SET_DEFAULT | PART => 3,
         _ => return None,
     })
 }
@@ -287,6 +294,171 @@ fn b64_val(c: u8) -> Option<u8> {
 /// Dispatch one builtin call. `args` are in declaration order (receiver
 /// first). Scratch-producing functions append into `s`. Ids absent from this
 /// build (feature off) or unknown fail closed with `BadBuiltin`.
+fn json_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
+}
+
+/// The end of the JSON value starting at `i` (bounded by the bytes: a
+/// malformed document ends early rather than overruns).
+fn json_skip(b: &[u8], i: usize) -> usize {
+    let i = json_ws(b, i);
+    if i >= b.len() {
+        return i;
+    }
+    match b[i] {
+        b'"' => {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                if b[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            (j + 1).min(b.len())
+        }
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < b.len() {
+                match b[j] {
+                    b'"' => {
+                        j = json_skip(b, j);
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return j + 1;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            j
+        }
+        _ => {
+            let mut j = i;
+            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                j += 1;
+            }
+            j
+        }
+    }
+}
+
+/// The value at one step (`key` of an object, or index of an array) from the
+/// value starting at `i`: its start.
+fn json_step(b: &[u8], i: usize, seg: &[u8]) -> Option<usize> {
+    let i = json_ws(b, i);
+    match *b.get(i)? {
+        b'{' => {
+            let mut j = json_ws(b, i + 1);
+            while j < b.len() && b[j] != b'}' {
+                let ks = j;
+                let ke = json_skip(b, ks);
+                let key = b.get(ks + 1..ke.checked_sub(1)?)?;
+                j = json_ws(b, ke);
+                if b.get(j) != Some(&b':') {
+                    return None;
+                }
+                let vs = json_ws(b, j + 1);
+                if key == seg {
+                    return Some(vs);
+                }
+                j = json_ws(b, json_skip(b, vs));
+                if b.get(j) == Some(&b',') {
+                    j = json_ws(b, j + 1);
+                }
+            }
+            None
+        }
+        b'[' => {
+            let mut want = 0usize;
+            for &c in seg {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                want = want.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+            }
+            let mut j = json_ws(b, i + 1);
+            let mut k = 0usize;
+            while j < b.len() && b[j] != b']' {
+                if k == want {
+                    return Some(j);
+                }
+                j = json_ws(b, json_skip(b, j));
+                if b.get(j) == Some(&b',') {
+                    j = json_ws(b, j + 1);
+                }
+                k += 1;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The raw span `[start, end)` of the value at a dotted path (object keys;
+/// decimal array indices), or None when absent. Shared by the decoder's
+/// `rd::JSON` and the `json.*` builtins.
+fn json_locate(doc: &[u8], path: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    for seg in path.split(|&c| c == b'.') {
+        if seg.is_empty() {
+            continue;
+        }
+        i = json_step(doc, i, seg)?;
+    }
+    let i = json_ws(doc, i);
+    if i >= doc.len() {
+        return None;
+    }
+    Some((i, json_skip(doc, i)))
+}
+
+/// A span as a value reads: a string's content without its quotes, anything
+/// else as written.
+fn json_unquote(doc: &[u8], (i, e): (usize, usize)) -> (usize, usize) {
+    if e >= i + 2 && doc[i] == b'"' {
+        (i + 1, e - 1)
+    } else {
+        (i, e)
+    }
+}
+
+/// The value at a dotted path as [`json_unquote`] reads it; EMPTY when absent.
+fn json_value<'a>(doc: &'a [u8], path: &[u8]) -> &'a [u8] {
+    match json_locate(doc, path) {
+        Some(span) => {
+            let (i, e) = json_unquote(doc, span);
+            &doc[i..e]
+        }
+        None => &[],
+    }
+}
+
+/// The largest document the `json.*` builtins read (bytes).
+const JSON_DOC_MAX: usize = 4096;
+
+/// A string-ish argument's bytes, copied out (the arena cannot be borrowed
+/// while it may be written).
+fn src_copy(src: &Source<'_>, s: &Scratch<'_>, out: &mut [u8]) -> Result<usize, EvalError> {
+    let n = src.len();
+    if n > out.len() {
+        return Err(EvalError::ScratchOverflow);
+    }
+    for (i, b) in out.iter_mut().enumerate().take(n) {
+        *b = src.at(i, s);
+    }
+    Ok(n)
+}
+
 pub fn call_builtin<'a>(
     id: u16,
     args: &[Value<'a>],
@@ -296,6 +468,127 @@ pub fn call_builtin<'a>(
     match id {
         #[cfg(feature = "strings")]
         SIZE => Ok(Value::Int(Source::of(&args[0])?.len() as i64)),
+        #[cfg(feature = "strings")]
+        JSON_GET | JSON_HAS | JSON_SET_DEFAULT => {
+            let docs = Source::of(&args[0])?;
+            let mut doc = [0u8; JSON_DOC_MAX];
+            let dl = src_copy(&docs, s, &mut doc)?;
+            let mut path = [0u8; 256];
+            let pl = src_copy(&Source::of(&args[1])?, s, &mut path)?;
+            let found = json_locate(&doc[..dl], &path[..pl]);
+            match id {
+                JSON_HAS => Ok(Value::Bool(found.is_some())),
+                JSON_GET => Ok(match found {
+                    Some(span) => {
+                        let (i, e) = json_unquote(&doc[..dl], span);
+                        docs.window_value(i, e)
+                    }
+                    None => docs.window_value(0, 0),
+                }),
+                _ => {
+                    // The default goes in only where there is nothing: a
+                    // present field — whatever its value — is the caller's.
+                    if found.is_some() {
+                        return Ok(args[0]);
+                    }
+                    let mut raw = [0u8; 512];
+                    let rl = src_copy(&Source::of(&args[2])?, s, &mut raw)?;
+                    let p = &path[..pl];
+                    // `k` (top level) or `parent.k` (one level down, the
+                    // parent an object that exists); anything else unchanged.
+                    let (parent, key) = match p.iter().position(|&c| c == b'.') {
+                        None => (None, p),
+                        Some(d) if p.iter().rposition(|&c| c == b'.') == Some(d) => {
+                            (Some(&p[..d]), &p[d + 1..])
+                        }
+                        Some(_) => return Ok(args[0]),
+                    };
+                    let obj_at = match parent {
+                        None => json_ws(&doc[..dl], 0),
+                        Some(pp) => match json_locate(&doc[..dl], pp) {
+                            Some((i, _)) => i,
+                            None => return Ok(args[0]),
+                        },
+                    };
+                    if doc.get(obj_at) != Some(&b'{') {
+                        return Ok(args[0]);
+                    }
+                    let after = json_ws(&doc[..dl], obj_at + 1);
+                    let empty = doc.get(after) == Some(&b'}');
+                    // doc[..=obj_at] "key":raw [,] doc[obj_at+1..]
+                    let total = dl + 1 + key.len() + 2 + rl + usize::from(!empty);
+                    let off = s.reserve(total)?;
+                    let mut w = off;
+                    let mut put = |bytes: &[u8], s: &mut Scratch<'_>| {
+                        s.buf[w..w + bytes.len()].copy_from_slice(bytes);
+                        w += bytes.len();
+                    };
+                    put(&doc[..=obj_at], s);
+                    put(b"\"", s);
+                    put(key, s);
+                    put(b"\":", s);
+                    put(&raw[..rl], s);
+                    if !empty {
+                        put(b",", s);
+                    }
+                    put(&doc[obj_at + 1..dl], s);
+                    Ok(Value::Scratch {
+                        off: off as u32,
+                        len: total as u32,
+                    })
+                }
+            }
+        }
+        #[cfg(feature = "strings")]
+        CONCAT => {
+            let a = Source::of(&args[0])?;
+            let b = Source::of(&args[1])?;
+            let (al, bl) = (a.len(), b.len());
+            let off = s.reserve(al + bl)?;
+            for i in 0..al {
+                s.buf[off + i] = a.at(i, s);
+            }
+            for i in 0..bl {
+                s.buf[off + al + i] = b.at(i, s);
+            }
+            Ok(Value::Scratch {
+                off: off as u32,
+                len: (al + bl) as u32,
+            })
+        }
+        #[cfg(feature = "strings")]
+        PART => {
+            let src = Source::of(&args[0])?;
+            let delim = Source::of(&args[1])?;
+            let want = match args[2] {
+                Value::Int(v) if v >= 0 => v as usize,
+                _ => return Err(EvalError::TypeError),
+            };
+            let (n, dn) = (src.len(), delim.len());
+            if dn == 0 {
+                return Err(EvalError::TypeError);
+            }
+            let mut start = 0usize;
+            let mut k = 0usize;
+            let mut i = 0usize;
+            while i + dn <= n {
+                if src.window_eq(i, &delim, s) {
+                    if k == want {
+                        return Ok(src.window_value(start, i));
+                    }
+                    k += 1;
+                    i += dn;
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(if k == want {
+                src.window_value(start, n)
+            } else {
+                src.window_value(0, 0)
+            })
+        }
         #[cfg(feature = "strings")]
         CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF => {
             let h = Source::of(&args[0])?;

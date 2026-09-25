@@ -47,6 +47,8 @@ use exchange::{
 /// Publishes that may be unacknowledged at once. The window is what applies
 /// BACKPRESSURE: at the limit the pipeline stops admitting records rather than
 /// running ahead of a destination that has not confirmed anything.
+/// A decode program's scratch arena (values it builds rather than borrows).
+const DEC_SCRATCH: usize = 1024;
 const MAX_INFLIGHT: u32 = 8;
 
 /// One framed publish at this module's ceiling: the 3-byte envelope, the
@@ -265,9 +267,9 @@ impl StageEval for KindedEval {
 }
 use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
-    eval_decode, frame_len, hex_decode, lower_stages_kinded, parse_version_table, pipeline_reload,
-    run_decision_scratch_metered, run_stage_metered, run_stages_metered, run_stages_with,
-    scan_code, scan_decision_container, scan_version_table, stage_at, stage_count,
+    eval_decode_scratch, frame_len, hex_decode, lower_stages_kinded, parse_version_table,
+    pipeline_reload, run_decision_scratch_metered, run_stage_metered, run_stages_metered,
+    run_stages_with, scan_code, scan_decision_container, scan_version_table, stage_at, stage_count,
     version_selector_from_frame, Accounting, Admit, Builder, Field, Message, Mode, Pending,
     PipeError, Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
     MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_SCRATCH_CAP,
@@ -438,6 +440,9 @@ struct ModuleState {
     dec: [u8; PROG_BUF],
     dec_len: u16,
     dec_out: [u8; ENC_BUF],
+    /// Where a decode program builds values (`CAT`, `HEX` — a key assembled
+    /// from parts, an identity as hex); reused per record.
+    dec_scratch: [u8; DEC_SCRATCH],
 
     /// The common accounting taxonomy: a delivered output (a transformed record OR the fail-closed
     /// VERSION_UNAVAILABLE marker) resolves its input as `inputs_succeeded`; a
@@ -468,7 +473,9 @@ define_params! {
         if i < len { s.param_overflow = true; }
     };
 
-    3, decode, str, 0 => |s, d, len| {
+    // `str_chunked` like `encode`: a decode program that reads a whole request
+    // (a target, a header, a JSON body, a key) is past one 255-byte entry.
+    3, decode, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.dec_hex_len as usize) < HEX_BUF {
             s.dec_hex[s.dec_hex_len as usize] = *d.add(i);
@@ -1000,7 +1007,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut b = Builder::new();
             let dec = core::slice::from_raw_parts(s.dec.as_ptr(), s.dec_len as usize);
             let inp = core::slice::from_raw_parts(s.in_buf.as_ptr(), raw_len);
-            match eval_decode(dec, inp, &mut b, 100_000) {
+            let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
+            match eval_decode_scratch(dec, inp, scr, &mut b, 100_000) {
                 Ok(()) => match encode_frame(&b.message(), &mut s.dec_out) {
                     Ok(rl) => {
                         frame_ptr = s.dec_out.as_ptr();

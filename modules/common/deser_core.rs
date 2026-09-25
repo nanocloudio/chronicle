@@ -38,6 +38,85 @@ pub mod rd {
     /// stable and a consumer distinguishes "absent" by emptiness rather than by
     /// the program having failed.
     pub const UNTIL_OPT: u8 = 0x7B;
+
+    // ── value readers: pop a Bytes value, push a part of it ─────────────────
+    //
+    // The cursor ops above read the INPUT; these read a value already pushed —
+    // a request target, a header block, a JSON body — so a program can take a
+    // section of the input whole (`TAKEN`) and then look inside it without the
+    // reader running past its end. None fails on absence: an absent part is
+    // EMPTY, which is what a flat record's consumer reads as "not there".
+    /// `len:u16 LE, bytes` — the part BEFORE the first occurrence of the
+    /// sequence; the whole value when it does not occur (`/path?q` → `/path`).
+    pub const BEFORE: u8 = 0x7C;
+    /// `len:u16 LE, bytes` — the part AFTER the first occurrence; EMPTY when it
+    /// does not occur (`/path?q` → `q`; `Bearer t` after `Bearer ` → `t`).
+    pub const AFTER: u8 = 0x7D;
+    /// `delim:u8, index:u8` — the index-th `delim`-separated part (0-based,
+    /// empty parts counted); EMPTY past the last.
+    pub const PART: u8 = 0x7E;
+    /// `len:u16 LE, name` — an HTTP header block's value for `name` (field
+    /// names compared ASCII-case-insensitively, the value trimmed); EMPTY when
+    /// absent.
+    pub const HDR: u8 = 0x7F;
+    /// `len:u16 LE, path` — a JSON document's value at a dotted path (object
+    /// keys; decimal array indices): a string's content without its quotes, a
+    /// number/bool/null as written, an object or array as its bytes; EMPTY
+    /// when absent or not JSON.
+    pub const JSON: u8 = 0x80;
+    /// Pop b, pop a — push a when it is non-empty, else b (a path's name, else
+    /// the body's).
+    pub const COALESCE: u8 = 0x81;
+    /// `n:u8` — pop n values (bytes, text or an integer as decimal), push their
+    /// concatenation, first-pushed first. Built in the caller's SCRATCH (see
+    /// [`eval_decode_scratch`]); `ScratchOverflow` when it does not fit.
+    pub const CAT: u8 = 0x82;
+    /// Pop a value, push it as lowercase hex (in scratch).
+    pub const HEX: u8 = 0x83;
+    /// `n:u16 LE` — pop a value, push it without its first n bytes; EMPTY when
+    /// shorter.
+    pub const DROP: u8 = 0x84;
+    /// Pop cond, pop value — push value when cond is non-empty, else EMPTY (a
+    /// derived value that must vanish with the thing it was derived from).
+    pub const GATE: u8 = 0x85;
+}
+
+/// Bytes of a value a reader can look inside.
+fn rd_bytes<'a>(v: Value<'a>) -> Result<&'a [u8], EvalError> {
+    match v {
+        Value::Bytes(b) => Ok(b),
+        Value::Str(s) => Ok(s.as_bytes()),
+        Value::Null => Ok(&[]),
+        _ => Err(EvalError::TypeError),
+    }
+}
+
+fn rd_find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+/// An HTTP header block's value for `name`, as [`rd::HDR`] reads it.
+fn rd_header<'a>(block: &'a [u8], name: &[u8]) -> &'a [u8] {
+    for line in block.split(|&c| c == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&c| c == b':') else {
+            continue;
+        };
+        if line[..colon].eq_ignore_ascii_case(name) {
+            let mut v = &line[colon + 1..];
+            while let [b' ' | b'\t', rest @ ..] = v {
+                v = rest;
+            }
+            while let [rest @ .., b' ' | b'\t'] = v {
+                v = rest;
+            }
+            return v;
+        }
+    }
+    &[]
 }
 
 /// Read one protobuf base-128 varint at `pos` in `buf`; returns `(value, next)`.
@@ -73,6 +152,28 @@ fn pb_fixed(buf: &[u8], pos: usize, width: usize) -> Option<(i64, usize)> {
 
 const DEC_STACK: usize = 32;
 
+/// Decimal digits of `v` into `out`; the length.
+fn rd_dec_digits(v: i64, out: &mut [u8; 20]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    let mut u = v.unsigned_abs();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 || i == 1 {
+            break;
+        }
+    }
+    if v < 0 {
+        i -= 1;
+        tmp[i] = b'-';
+    }
+    let n = tmp.len() - i;
+    out[..n].copy_from_slice(&tmp[i..]);
+    n
+}
+
 /// Execute a deserialization program over `input`, constructing a record into
 /// `builder`. Values pushed by read opcodes borrow `input` (`'a`), so the
 /// constructed message does too — no allocation.
@@ -82,6 +183,22 @@ pub fn eval_decode<'a>(
     builder: &mut Builder<'a>,
     max_cost: u64,
 ) -> Result<(), EvalError> {
+    eval_decode_scratch(code, input, &mut [], builder, max_cost)
+}
+
+/// [`eval_decode`] with a SCRATCH arena for the ops that build a value rather
+/// than borrow one (`CAT`, `HEX`). Each built value takes the front of what is
+/// left, so it lives as long as the input the others borrow — the record is
+/// built without an allocation either way. A program using neither needs none.
+pub fn eval_decode_scratch<'a>(
+    code: &'a [u8],
+    input: &'a [u8],
+    scratch: &'a mut [u8],
+    builder: &mut Builder<'a>,
+    max_cost: u64,
+) -> Result<(), EvalError> {
+    let mut free: &'a mut [u8] = scratch;
+    let mut locals: [Value<'a>; MAX_LOCALS] = [Value::Null; MAX_LOCALS];
     let mut stack: [Value<'a>; DEC_STACK] = [Value::Null; DEC_STACK];
     let mut sp: usize = 0;
     let mut pos: usize = 0; // cursor into `input`
@@ -135,6 +252,138 @@ pub fn eval_decode<'a>(
 
         match opcode {
             op::FINISH_MSG => return Ok(()),
+            // A literal — a key separator, a scheme prefix — to build with.
+            op::PUSH_STR => {
+                let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
+                let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+                pc += 2;
+                let bytes = code.get(pc..pc + len).ok_or(EvalError::Truncated)?;
+                pc += len;
+                push!(Value::Bytes(bytes));
+            }
+            op::STORE_LOCAL => {
+                let idx = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
+                pc += 1;
+                if idx >= MAX_LOCALS {
+                    return Err(EvalError::TypeError);
+                }
+                locals[idx] = pop!();
+            }
+            op::LOAD_LOCAL => {
+                let idx = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
+                pc += 1;
+                if idx >= MAX_LOCALS {
+                    return Err(EvalError::TypeError);
+                }
+                push!(locals[idx]);
+            }
+            rd::BEFORE | rd::AFTER | rd::HDR | rd::JSON => {
+                let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
+                let len = u16::from_le_bytes([b[0], b[1]]) as usize;
+                pc += 2;
+                let arg = code.get(pc..pc + len).ok_or(EvalError::Truncated)?;
+                pc += len;
+                let v = rd_bytes(pop!())?;
+                let out: &'a [u8] = match opcode {
+                    rd::BEFORE => match rd_find(v, arg) {
+                        Some(i) => &v[..i],
+                        None => v,
+                    },
+                    rd::AFTER => match rd_find(v, arg) {
+                        Some(i) => &v[i + arg.len()..],
+                        None => &[],
+                    },
+                    rd::HDR => rd_header(v, arg),
+                    _ => json_value(v, arg),
+                };
+                push!(Value::Bytes(out));
+            }
+            rd::PART => {
+                let delim = *code.get(pc).ok_or(EvalError::Truncated)?;
+                let idx = *code.get(pc + 1).ok_or(EvalError::Truncated)? as usize;
+                pc += 2;
+                let v = rd_bytes(pop!())?;
+                let part = v.split(|&c| c == delim).nth(idx).unwrap_or(&[]);
+                push!(Value::Bytes(part));
+            }
+            rd::COALESCE => {
+                let b = pop!();
+                let a = pop!();
+                let pick = if rd_bytes(a)?.is_empty() { b } else { a };
+                push!(pick);
+            }
+            rd::GATE => {
+                let cond = rd_bytes(pop!())?;
+                let v = pop!();
+                push!(if cond.is_empty() {
+                    Value::Bytes(&[])
+                } else {
+                    v
+                });
+            }
+            rd::DROP => {
+                let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
+                let n = u16::from_le_bytes([b[0], b[1]]) as usize;
+                pc += 2;
+                let v = rd_bytes(pop!())?;
+                push!(Value::Bytes(v.get(n..).unwrap_or(&[])));
+            }
+            rd::CAT | rd::HEX => {
+                let n = if opcode == rd::CAT {
+                    let n = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
+                    pc += 1;
+                    n
+                } else {
+                    1
+                };
+                if n == 0 || n > sp {
+                    return Err(EvalError::StackUnderflow);
+                }
+                // Measure, then build into the front of what scratch is left.
+                let mut need = 0usize;
+                for &v in &stack[sp - n..sp] {
+                    need += match v {
+                        Value::Int(v) => {
+                            let mut d = [0u8; 20];
+                            rd_dec_digits(v, &mut d)
+                        }
+                        other => rd_bytes(other)?.len() * if opcode == rd::HEX { 2 } else { 1 },
+                    };
+                }
+                if need > free.len() {
+                    return Err(EvalError::ScratchOverflow);
+                }
+                let (head, tail) = core::mem::take(&mut free).split_at_mut(need);
+                free = tail;
+                let mut w = 0usize;
+                for &v in &stack[sp - n..sp] {
+                    match v {
+                        Value::Int(v) => {
+                            let mut d = [0u8; 20];
+                            let dl = rd_dec_digits(v, &mut d);
+                            head[w..w + dl].copy_from_slice(&d[..dl]);
+                            w += dl;
+                        }
+                        other => {
+                            let b = rd_bytes(other)?;
+                            if opcode == rd::HEX {
+                                const HX: &[u8; 16] = b"0123456789abcdef";
+                                for &c in b {
+                                    head[w] = HX[(c >> 4) as usize];
+                                    head[w + 1] = HX[(c & 0x0f) as usize];
+                                    w += 2;
+                                }
+                            } else {
+                                head[w..w + b.len()].copy_from_slice(b);
+                                w += b.len();
+                            }
+                        }
+                    }
+                }
+                sp -= n;
+                let built: &'a [u8] = head;
+                push!(Value::Bytes(built));
+            }
             op::SET_FIELD => {
                 let number = read_u32(code, pc)?;
                 pc += 4;

@@ -87,6 +87,8 @@ MAX_FRAME <= REC_BUF | modules/app/sensor_intake/mod.rs
 MAX_WIN_PER_EVENT <= MAX_PANES | modules/common/agg_core.rs
 MAX_LANES >= 1 && MAX_PANES >= 1 && MAX_OPS >= 1 | modules/common/agg_core.rs
 COLL_CAP >= 1 | modules/common/agg_core.rs
+EXT_MAX_FANIN >= 2 && EXT_MAX_FANIN <= EXT_MAX_RUNS | modules/common/extsort_core.rs
+EXT_KEY_MAX <= u16::MAX as usize | modules/common/extsort_core.rs
 ```
 
 ## Record / buffer capacities
@@ -146,6 +148,21 @@ COLL_CAP >= 1 | modules/common/agg_core.rs
 | `SNAPSHOT_GLOBAL_BYTES` | `1 + 8 + 6 * 4 + 1 + 8` (42, every tier) | B | per checkpoint | derived | n/a | none | the snapshot's fixed header: version, max event time, six counters, lane count, processing clock | tracks the `agg_core::snapshot` layout | `aggregation` checkpoint suites |
 | `SNAPSHOT_LANE_BYTES` | `1 + 2 + KEY_CAP + 8 + 1` (60, every tier) | B | per lane | derived | n/a | none | one lane's header: key discriminant, key length, key, finalized high-water, pane count | tracks the `agg_core::snapshot` layout | `aggregation` checkpoint suites |
 | `SNAPSHOT_PANE_BYTES` | `1 + 8 + 16 * MAX_OPS + 4 + 1 + 8 * COLL_CAP` — 270 full and small, 110 tiny | B | per pane | derived | n/a | none | one pane: finalized flag, window start, every accumulator pair, emit counter, and the length-prefixed collection cell | tracks the `agg_core::snapshot` layout | `aggregation` checkpoint suites |
+
+## External sort and grouping
+
+`extsort_core` sorts any number of records in a caller-given work buffer, spilling
+sorted runs to a run store; `monoid_core` folds grouped records exactly. Their
+memory is the consumer's budget, not a constant; these are the ceilings inside it.
+
+| Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
+|---|---|---|---|---|---|---|---|---|---|
+| `EXT_MAX_FANIN` | 16 | run | per merge | capacity | more runs than fit → an extra merge pass, never a refusal | one read block per input run, and one `Reader` per fan-in slot in the sort's state | the reader table a sort holds — a pending block request and a cursor per input run of the merge in progress — so a merge's state is bounded whatever the input. A policy ceiling: the work buffer usually affords fewer (`cap / block − 1`, at least 2), and a merge that cannot take every run at once takes another pass | larger reader table | `extsort::a_small_buffer_spills_and_merges_in_several_passes` |
+| `EXT_MAX_RUNS` | 64 | run | per sort | capacity | runs near the ceiling are folded into one while input is still arriving — input length is unbounded | one `RunInfo` per run | the tracking table; folding keeps it bounded for any input | larger table | `extsort::a_small_buffer_spills_and_merges_in_several_passes` |
+| `EXT_KEY_MAX` | 1024 | B | per record | capacity | longer normalised key → `ExtErr::TooLarge` at push (consumed: no, the operator reports it) | on the record, in the buffer and runs | keys compare in full, so a key is held whole; the `u16` key-length field bounds it | fix-forward record format | `extsort::oversized_records_and_tiny_budgets_are_refused` |
+| `EXT_REC_HDR` | 16 | B | per record | v1 format | n/a | per record | `[len u32][seq u64][gkey_len u16][key_len u16]` | fix-forward format change | `extsort` reference suites |
+| `EXT_BLOCK_HDR` | 8 | B | per block | v1 format | a block failing its CRC or framing → `ExtErr::Corrupt` before any of its records is emitted | per block | `[payload_len u32][crc32c u32]` | fix-forward format change | `extsort::a_corrupted_block_fails_before_any_of_its_records_is_emitted` |
+| `MONOID_VALUE_CAP` | 64 | B | per accumulator | capacity | a longer bytes value held by min/max/distinct/quantile is compared in full but reported absent, never as a different string | one cell per aggregate | bounded per-group state | larger cell | `extsort::min_max_order_bytes_after_ints_and_keep_long_values_honest` |
 
 ## CLI / authoring
 
@@ -258,6 +275,12 @@ STAGE_SCRATCH_CAP | modules/common/pipeline_core.rs | 512
 MAX_RULE | modules/common/author_core.rs | 32
 RULE_CODE | modules/common/author_core.rs | 512
 BIN_BUF | modules/common/author_core.rs | 16384
+EXT_REC_HDR | modules/common/extsort_core.rs | 16
+EXT_BLOCK_HDR | modules/common/extsort_core.rs | 8
+EXT_MAX_FANIN | modules/common/extsort_core.rs | 16
+EXT_MAX_RUNS | modules/common/extsort_core.rs | 64
+EXT_KEY_MAX | modules/common/extsort_core.rs | 1024
+MONOID_VALUE_CAP | modules/common/monoid_core.rs | 64
 MAX_CONTAINER_BIN | modules/common/pipeline_core.rs | 6144
 MAX_CONTAINER_BIN_FULL | modules/common/pipeline_core.rs | 16384
 EMIT_FRAME_MAX | modules/app/aggregation/mod.rs | if SMALL { 128 } else { 512 }

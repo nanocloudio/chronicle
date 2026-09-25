@@ -175,6 +175,7 @@ ids outside the pinned table entirely.
 | feature | upstream | adopted | result discipline |
 | --- | --- | --- | --- |
 | `strings` | CEL stdlib + `ext.strings` v3 | `size`, `contains`, `startsWith`, `endsWith`, `indexOf`, `lastIndexOf`, `charAt`, `substring`(1 and 2-arg), `trim`, `reverse`, `lowerAscii`, `upperAscii`, `replace`(3-arg) | predicates/indexes → scalars; `substring`/`trim`/`charAt` → zero-copy subslices; `reverse`/case/`replace` → scratch arena |
+| `strings` (documents) | nanocloud's admission, no upstream | `json.get(doc, path)` (a string's content, a scalar as written, a container as its bytes; EMPTY when absent), `json.has(doc, path)`, `json.setDefault(doc, path, raw)` (inserts only where absent, top level or one object down), `s.part(delim, i)` (the i-th part; EMPTY past the end), and CEL's string `a + b` (concatenation; integer `+` is unchanged); dotted paths with decimal array indices, documents up to 4 KiB | `get`/`part` → zero-copy; `setDefault`, `+` → scratch arena |
 | `math` | `ext.math`, integer subset | `greatest`/`least` (2-arg pin), `abs`, `sign`, `bitAnd`, `bitOr`, `bitXor`, `bitShiftLeft`, `bitShiftRight` | scalars |
 | `encoders` | `ext.encoders` | `base64.encode`, `base64.decode` (strict: canonical padding or error) | scratch arena |
 | `bindings` | `ext.bindings` | `cel.bind(x, init, result)` | compiler + 2 slot opcodes, no runtime table entry |
