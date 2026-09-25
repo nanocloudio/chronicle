@@ -1,0 +1,41 @@
+// A label selector's requirements against a pod's labels, as ONE map stage:
+// the requirements are a repeated field of the record, each a nested message
+// its producer has paired with the pod's value for its key, and the stage
+// counts which requirements hold.
+module t.selector {
+  message t.Req {
+    key: string = 1;
+    op: string = 2;
+    values: string = 3;     // comma-joined — a label value holds no comma
+    lv: string = 4;         // the pod's value for `key`; absent when it has none
+  }
+  message t.Pair {
+    reqs: t.Req = 60;       // repeated
+    yes: int = 70;
+    no: int = 71;
+    unknown: int = 72;
+  }
+  // The requirements that did not hold (false or unknown): 0 = selected.
+  message t.Verdict {
+    misses: int = 1;
+  }
+
+  map holds(r: t.Pair) -> t.Pair {
+    over r.reqs as e: t.Req max 16;
+    count r.yes, r.no, r.unknown;
+    when (e.op == "In" && has(e.lv) && ("," + e.values + ",").contains("," + e.lv + ","))
+      || (e.op == "NotIn" && (!has(e.lv) || !("," + e.values + ",").contains("," + e.lv + ",")))
+      || (e.op == "Exists" && has(e.lv))
+      || (e.op == "DoesNotExist" && !has(e.lv));
+  }
+  transformation verdict(r: t.Pair) -> t.Verdict {
+    t.Verdict { misses: r.no + r.unknown }
+  }
+  pipeline select(r: t.Pair) -> t.Verdict {
+    call m = holds(r);
+    call v = verdict(m);
+    return v;
+  }
+  entry select = select;
+  provenance revision "example" toolchain "chronicle-authoring";
+}

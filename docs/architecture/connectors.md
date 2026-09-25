@@ -10,7 +10,7 @@ store and wired into the emitted graph.
 | Protocol family | Owner | Modules |
 |---|---|---|
 | Redis, Postgres, MySQL, MongoDB, Cassandra | **lattice** | `redis_client`, `pg_client`, `mysql_client`, `mongo_client`, `cassandra_client` |
-| MQTT, Kafka, AMQP, NATS | **quantum** | `mqtt_client`, `kafka_client`, `amqp_client`, `nats_client` |
+| MQTT, Kafka, AMQP, NATS | **quantum** | `mqtt_client`, `mqtt_sink`, `kafka_client`, `kafka_sink`, `amqp_client`, `amqp_sink`, `nats_client` |
 | HTTP, WebSocket, RTP, SIP, SMTP, S3 | **wave** | `http`, `ws_stream`, `smtp`, `s3`, … |
 
 Each provider is proven **standalone in its owning repo** against a real backend
@@ -52,23 +52,24 @@ the deployment answers separately, one binding per resource, and
 ```
 
 ```
-orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,endpoint=7f000001;user=app
-feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,broker_ip=#167772161;topic=orders
+orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;cid_len=#4
+feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,authority=10.0.0.1:9092;topic=orders
 ```
 
 Every field is the provider's: the module name, the version tag it publishes
 under, the port pair, and the param names. Chronicle transports them and
 checks the shape. `r`/`n` says whether the provider answers with data a next
 stage can read; a value led by `#` is numeric and is emitted unquoted, because
-a provider's `u32` decoder rejects `"167772161"`. Bindings are joined by `|`,
+a provider's `u32` decoder rejects `"4"`. Bindings are joined by `|`,
 so `|`, `,`, `;` and `=` cannot appear inside a value.
 
 The planner ([`plan_core.rs`](../../modules/common/plan_core.rs)) turns each
 binding into a `Connector` — the graph node's `type:`, its store pin
 `<silicon>/<provider>:<version>`, its port pair and its params. Each binding
 carries its own version tag because siblings release independently.
-`plan_provider_pins` resolves the pins against the fluxor OCI store, the driver
-composes `fluxor slot-image` to emit the OTA bundle, and
+`plan_provider_pins` computes the pins, the driver records them in `fluxor.lock`
+and composes `fluxor slot-image`, which resolves them from the OCI store and
+emits the OTA bundle, and
 [`graph_core.rs`](../../modules/common/graph_core.rs) renders the wired graph.
 
 Two refusals are deliberate. An unbound resource is a deployment error and is
@@ -98,11 +99,11 @@ A consumer that only publishes requires the parent, `stream.ordered_ack`, and
 accepts either.
 
 ```text
-publish_in (input):  [corr:u64][flags:u8][msg_key_len:u16][msg_key…]
-                     [payload_len:u16][payload…]
+publish_in (input):  [corr:u64][flags:u8][msg_key_len:u16][payload_len:u16]
+                     [msg_key…][payload…]
 ack_out    (output): [corr:u64][status:u8]
-reply_out  (output): [corr:u64][status:u8][msg_key_len:u16][msg_key…]
-                     [payload_len:u16][payload…]      — exchange only
+reply_out  (output): [corr:u64][status:u8][msg_key_len:u16][payload_len:u16]
+                     [msg_key…][payload…]              — exchange only
 ```
 
 Each frame travels behind a 3-byte envelope, `[tag:u8][len:u16 LE]`
@@ -132,7 +133,7 @@ itself to:
 |---|---|
 | `PAYLOAD_MAX` | 8192 |
 | `KEY_MAX` | 512 |
-| `PUBLISH_FRAME_MAX` | 8717 — `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX`, what a `publish_in` port takes as one record |
+| `PUBLISH_FRAME_MAX` | 8717 — `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX`, one whole publish frame; a full-tier `publish_in` port's `max_record` adds the 3-byte envelope (8720) |
 
 A provider whose backend cannot accept the full ceiling declares the smaller
 number as its `max_payload` capability fact, and the build checks it against
@@ -147,7 +148,11 @@ Fluxor's `docs/architecture/limit_register.md`.
 As a **producer**, it publishes when a graph wires `publish_out` to a
 provider's `publish_in` and `ack_out` back to `ack_in`; wiring neither leaves
 results on `result_out`. Each result frame is wrapped in a `Publish` with a
-fresh correlation id and no key; at most `MAX_INFLIGHT` publishes are
+fresh correlation id; its `msg_key` is the record's **carry** (field 254,
+[the frame](dataplane.md#the-typed-record-frame)), or empty when it carries
+none — a carry past `KEY_BUF` (`KEY_MAX`, 64 B on rp2040) is refused
+(`carry_refused`), never truncated.
+At most `MAX_INFLIGHT` publishes are
 unacknowledged at once, and a full window is backpressure — nothing is admitted
 until the destination answers. Typed refusals are counted. The pipeline is an
 at-most-once producer: it keeps no replay log, so publishes outstanding at a
@@ -161,6 +166,16 @@ payload cannot be processed. The intake takes any contract payload
 (`PAYLOAD_MAX`); the decoded record is one typed frame. LINK_UP is announced once the module is ready to take
 records. That is what lets an application pipeline be the destination of a
 CDC feed directly, acknowledging what it actually consumed.
+
+Against a **replying** provider, wire its `reply_out` to `reply_in`. The
+reply IS the ack: it frees the window slot, and becomes a record on
+`result_out` — the payload through `reply_decode` (without one, the payload
+must itself be one record frame), the echoed key restored as the carry (254),
+the exchange status at 253. The request's context crossed the destination in
+the key, so the node holds nothing between asking and answering: request →
+effect → decoded reply is one node, which is the Pipeline artefact's effect
+step made concrete. `examples/exchange_carry/` and
+`tools/e2e/exchange-carry.sh` prove it live, with an oversized carry refused.
 
 `examples/pipeline_egress/`, `examples/http_exchange/` and
 `examples/pipeline_chain/` are the graphs; `tools/e2e/pipeline-egress.sh`,
@@ -176,7 +191,7 @@ sinks (`mongo_client`) use these names:
 |---|---|---|
 | `net_in` / `net_out` | both | transport, to the platform's network provider |
 | `request_in` → `reply_out` | in/out | request/reply protocols |
-| `publish_in` | in | payload sink (fire-and-forget) |
+| `publish_in` | in | payload sink; on the ordered-ack surface each publish is answered on `ack_out`/`reply_out`, on a status-reporting sink on `status_out` |
 | `message_out` | out | a subscribed stream |
 | `status_out` | out | lifecycle/result, human-readable (`TextPlain`) |
 

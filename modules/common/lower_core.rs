@@ -3,7 +3,7 @@
 // `include!`d verbatim by both this crate and the on-device modules — one source
 // of truth, host and device.
 //
-// The checked IR (see the CEL compiler (celc_core)) is the type-free, fully
+// The checked IR (emitted by the CEL compiler, `celc_core`) is the type-free, fully
 // name-resolved form of an expression: all schema access already happened, so
 // turning it into bytecode needs no type environment. This file is the piece
 // that does that turning, and it is designed to run *at load on the target*: a
@@ -13,7 +13,7 @@
 //
 // Wire form: a POST-ORDER token stream (children before parent), so lowering is a
 // single forward pass — each token's operands were already emitted by the tokens
-// before it, exactly as the tree-walking `lower_ir` would have. No recursion, no
+// before it. No recursion, no
 // stack, no allocation; every read and write is bounds-checked, so a malformed
 // stream returns `LowerError`, never panics.
 
@@ -45,6 +45,9 @@ pub mod ir {
     pub const STORE_LOCAL: u8 = 0x16; // idx:u8
     pub const LOAD_LOCAL: u8 = 0x17; // idx:u8
     pub const DIV: u8 = 0x18;
+    pub const HAS: u8 = 0x19; // CEL `has(<path>)` — the operand is already on the stack
+    pub const PACK: u8 = 0x1A; // n:u8, n × number:u8 — a nested message's frame
+    pub const REM: u8 = 0x1B; // integer `%`
 }
 
 /// Deterministic lowering failures. Never panics on malformed input.
@@ -67,13 +70,18 @@ pub enum LowerError {
     /// `UPROC_BUF`-sized buffer) — so this is the caller's bound checked here,
     /// where the narrowing happens, instead of trusted from another file.
     ProgramTooLong,
+    /// Bytes follow the last stage the container declares. The format has no
+    /// trailer, so a count that disagrees with the body is refused rather
+    /// than run as fewer stages than were written.
+    TrailingBytes,
 }
 
 /// The static cost is carried on the wire as a `u32`, and it is narrowed from the
 /// `u64` this function returns without a check. That is sound, and this is why:
-/// every emitted op adds one unit and consumes at least one output byte, and a
+/// every emitted op adds one unit and consumes at least one output byte, a
 /// `CALL` adds its arity on top of that — `builtin_arity` answers argument
-/// counts, at most three today and never more than a `u8` could hold. A
+/// counts, at most three and never more than a `u8` could hold — and a
+/// `FRAME_PACK` adds its `n`, never more than the `n + 2` bytes it occupies. A
 /// program's code is capped at `u16::MAX` bytes by the same prefix that carries
 /// its length, so the cost is bounded by `u16::MAX * (1 + arity)`. The assertion
 /// pins that bound against `u32::MAX` with arity taken at its widest, so the
@@ -98,8 +106,7 @@ const _: () = assert!((u16::MAX as u64) * (1 + MAX_CALL_ARITY_BOUND) <= u32::MAX
 /// naive window walk costing the PRODUCT of its two operands. Anything wanting a
 /// duration must measure it on the target.
 ///
-/// Pure, allocation-free, and panic-free: this is the exact bytecode the host
-/// `lower_ir` produces, which the differential fuzzer proves.
+/// Pure, allocation-free, and panic-free.
 pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerError> {
     let mut pc: usize = 0;
     let mut end: usize = 0;
@@ -172,6 +179,14 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
                 }
             }
             ir::NOT => emit!(op::NOT),
+            ir::HAS => emit!(op::IS_SET),
+            ir::PACK => {
+                let n = rd_u8!();
+                let nums = rd_bytes!(n as usize);
+                emit!(op::FRAME_PACK, &[n], nums);
+                // The VM charges 1 + n, one per value packed; cover it.
+                ops += n as u64;
+            }
             ir::CMP_EQ => emit!(op::CMP_EQ),
             ir::CMP_NE => emit!(op::CMP_NE),
             ir::CMP_LT => emit!(op::CMP_LT),
@@ -184,6 +199,7 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
             ir::SUB => emit!(op::SUB),
             ir::MUL => emit!(op::MUL),
             ir::DIV => emit!(op::DIV),
+            ir::REM => emit!(op::REM),
             ir::SETFIELD => {
                 let nb = rd_bytes!(4);
                 emit!(op::SET_FIELD, nb);
@@ -227,6 +243,11 @@ pub fn lower_flat(flat: &[u8], out: &mut [u8]) -> Result<(usize, u64), LowerErro
 /// and this value is recorded rather than consulted.
 pub const DECISION_STAGE_COST: u64 = 100_000;
 
+/// The recorded cost of a MAP stage. Like a decision, the container carries
+/// its predicate's own bound; the driver meters every element against it, and
+/// the element count is bounded by the container's declared maximum.
+pub const MAP_STAGE_COST: u64 = 100_000;
+
 /// Transcode an IR-stages container into the bytecode-stages container that
 /// `stage_at`/`run_stages` consume, lowering each stage at load.
 ///
@@ -247,9 +268,9 @@ pub fn lower_stages(ir_container: &[u8], out: &mut [u8]) -> Result<usize, LowerE
 /// [`lower_stages`] where a stage's KIND decides whether its body is lowered.
 ///
 /// A compute stage's body is flat IR and is transcoded to bytecode. A DECISION
-/// stage's body is already a decision container — a different program format
-/// the expression lowerer would mangle — so it is copied through verbatim and
-/// the stage's declared cost is preserved.
+/// or MAP stage's body is already a container — a different program format the
+/// expression lowerer would mangle — so it is copied through verbatim and the
+/// stage records `DECISION_STAGE_COST` or `MAP_STAGE_COST`.
 ///
 /// `kinds` is parallel to the container and may be shorter or empty; an
 /// unnamed stage is compute, so a container alone lowers exactly as
@@ -283,19 +304,28 @@ pub fn lower_stages_kinded(
         if wp + 7 > out.len() {
             return Err(LowerError::Overflow);
         }
-        let is_decision = kinds
+        let is_container = kinds
             .get(ip_stage)
-            .is_some_and(|k| *k == STAGE_KIND_DECISION);
-        let (clen, cost) = if is_decision {
-            // Verbatim: the body is a decision container, not flat IR, so
-            // there is nothing for the expression lowerer to transcode. Its
-            // arms carry their own cost bounds (see `DECISION_STAGE_COST`).
+            .is_some_and(|k| *k == STAGE_KIND_DECISION || *k == STAGE_KIND_MAP);
+        let is_map = kinds.get(ip_stage).is_some_and(|k| *k == STAGE_KIND_MAP);
+        let (clen, cost) = if is_container {
+            // Verbatim: the body is a decision or map container, not flat IR,
+            // so there is nothing for the expression lowerer to transcode. Its
+            // programs carry their own cost bounds (see `DECISION_STAGE_COST`,
+            // `MAP_STAGE_COST`).
             let dst = out.get_mut(wp + 7..).ok_or(LowerError::Overflow)?;
             if flat.len() > dst.len() {
                 return Err(LowerError::Overflow);
             }
             dst[..flat.len()].copy_from_slice(flat);
-            (flat.len(), DECISION_STAGE_COST)
+            (
+                flat.len(),
+                if is_map {
+                    MAP_STAGE_COST
+                } else {
+                    DECISION_STAGE_COST
+                },
+            )
         } else {
             let dst = out.get_mut(wp + 7..).ok_or(LowerError::Overflow)?;
             lower_flat(flat, dst)?
@@ -307,6 +337,9 @@ pub fn lower_stages_kinded(
         out[wp + 1..wp + 5].copy_from_slice(&(cost as u32).to_le_bytes());
         out[wp + 5..wp + 7].copy_from_slice(&(clen as u16).to_le_bytes());
         wp += 7 + clen;
+    }
+    if ip != ir_container.len() {
+        return Err(LowerError::TrailingBytes);
     }
     Ok(wp)
 }
@@ -341,13 +374,25 @@ fn lower_one_prog(
     Ok((flat_start + ilen, wp + 6 + clen))
 }
 
+/// Bytes of parameter that follow an operator's kind byte in an aggregation
+/// `def` container: a `u16` LE for the two parameterised kinds, 6 (TopK, its
+/// `k`) and 7 (Quantile, its permille), and none for the rest. Both container
+/// forms share this layout.
+pub const fn def_op_param_len(kind: u8) -> usize {
+    match kind {
+        6 | 7 => 2,
+        _ => 0,
+    }
+}
+
 /// Transcode an aggregation IR-`def` container into the bytecode `def` container
 /// `build_spec` consumes. The 36-byte header (window_size, lateness, max_lanes,
 /// window_step, correction_horizon) is copied verbatim; each embedded program —
 /// key, time, emit, and every op selector — is `[ir_len:u16][flat_ir]` in the IR
 /// form and is lowered to `[cost:u32][len:u16][code]`. The `nops` byte and each
-/// op `kind` byte pass through. Fail-closed: any program that won't lower fails
-/// the whole transcode (a load-time analogue of a runtime BadOpcode).
+/// op's kind byte and parameter ([`def_op_param_len`]) pass through. Fail-closed:
+/// any program that won't lower fails the whole transcode (a load-time analogue
+/// of a runtime BadOpcode).
 pub fn lower_def(ir_def: &[u8], out: &mut [u8]) -> Result<usize, LowerError> {
     const HDR: usize = 36;
     let hdr = ir_def.get(..HDR).ok_or(LowerError::Truncated)?;
@@ -363,7 +408,7 @@ pub fn lower_def(ir_def: &[u8], out: &mut [u8]) -> Result<usize, LowerError> {
         ip = nip;
         wp = nwp;
     }
-    // Operator count, then per op: kind byte + selector program.
+    // Operator count, then per op: kind byte, its parameter, selector program.
     let nops = *ir_def.get(ip).ok_or(LowerError::Truncated)? as usize;
     ip += 1;
     if wp >= out.len() {
@@ -373,12 +418,13 @@ pub fn lower_def(ir_def: &[u8], out: &mut [u8]) -> Result<usize, LowerError> {
     wp += 1;
     for _ in 0..nops {
         let kind = *ir_def.get(ip).ok_or(LowerError::Truncated)?;
-        ip += 1;
-        if wp >= out.len() {
-            return Err(LowerError::Overflow);
-        }
-        out[wp] = kind;
-        wp += 1;
+        let n = 1 + def_op_param_len(kind);
+        let head = ir_def.get(ip..ip + n).ok_or(LowerError::Truncated)?;
+        ip += n;
+        out.get_mut(wp..wp + n)
+            .ok_or(LowerError::Overflow)?
+            .copy_from_slice(head);
+        wp += n;
         let (nip, nwp) = lower_one_prog(ir_def, ip, out, wp)?;
         ip = nip;
         wp = nwp;

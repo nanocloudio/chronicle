@@ -16,27 +16,28 @@ buffer behind it are one number on every target rather than two that can disagre
 
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
-| aggregation | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | barrier_in | input | 64 | 256 | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | checkpoint_out | output | 40960 (rp2040 4096) | 40960 (rp2040 4096) | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | proposal_out | output | 512 | 512 | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | assigned_in | input | 64 | 256 | 25 |
-| aggregation | bcm2712,rp2350,rp2040 | leader_in | input | 64 | 256 | 25 |
+| aggregation | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | barrier_in | input | 64 | 256 | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | checkpoint_out | output | 40960 (rp2040 4096) | 40960 (rp2040 4096) | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | proposal_out | output | 512 | 512 | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | assigned_in | input | 64 | 256 | 26 |
+| aggregation | bcm2712,rp2350,rp2040 | leader_in | input | 64 | 256 | 26 |
 | chronicle_cli | bcm2712 | args | input |  | 131328 |  |
 | chronicle_cli | bcm2712 | stdout | output |  | 40960 |  |
 | chronicle_cli | bcm2712 | exit | output |  | 16 |  |
-| decision | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 21 |
-| decision | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 21 |
+| decision | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 22 |
+| decision | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 22 |
 | expression | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
 | expression | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
-| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | publish_out | output | 4112 (rp2040 528) | 16448 (rp2040 2112) | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | ack_in | input | 12 | 512 | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | publish_in | input | 8720 | 34880 | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | ack_out | output | 12 | 512 | 26 |
-| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 26 |
+| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | publish_out | output | 4624 (rp2040 592) | 18496 (rp2040 2368) | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | ack_in | input | 12 | 512 | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | publish_in | input | 8720 (rp2040 1040) | 34880 (rp2040 4160) | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | ack_out | output | 12 | 512 | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | reply_in | input | 8720 (rp2040 592) | 17440 (rp2040 1184) | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 30 |
 | sensor_intake | bcm2712,rp2350,rp2040 | sample | input | 24 | 240 |  |
 | sensor_intake | bcm2712,rp2350,rp2040 | record_out | output | 96 | 960 |  |
 
@@ -57,11 +58,11 @@ does not declare that target.
 
 | Module | bcm2712 | rp2350 | rp2040 |
 |---|---:|---:|---:|
-| aggregation | 312512 | 202816 | 23744 |
-| chronicle_cli | 394176 | n/a | n/a |
+| aggregation | 312576 | 202816 | 23744 |
+| chronicle_cli | 397888 | n/a | n/a |
 | decision | 57536 | 57536 | 19648 |
 | expression | 10432 | 10432 | 3264 |
-| pipeline | 79168 | 79168 | 54592 |
+| pipeline | 102272 | 102272 | 40512 |
 | sensor_intake | 320 | 256 | 256 |
 
 State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB.

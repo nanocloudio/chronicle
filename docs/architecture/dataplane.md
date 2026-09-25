@@ -2,7 +2,8 @@
 
 ## Overview
 
-Chronicle runs on Fluxor as four generic, param-driven `.fmod` modules. None bakes
+Chronicle runs on Fluxor as four generic, param-driven engine `.fmod` modules, plus
+the `sensor_intake` adapter and the CLI applet. No engine bakes
 any specific logic: each is one binary that executes *whatever* bytecode arrives in
 its config params. A graph wires them together with typed channels; the compiler
 emits the params.
@@ -10,9 +11,10 @@ emits the params.
 | Module | Role | Param(s) |
 |--------|------|----------|
 | `app/expression` | one checked-CEL Expression | `program`, `max_cost` |
-| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode` |
+| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `reply_decode` |
 | `app/aggregation` | event-time stateful engine | `ir_def` |
 | `app/decision` | first-hit rule container | `decision` |
+| `app/sensor_intake` | `SensorSample` → typed record frame | — |
 | `app/chronicle_cli` | the toolchain CLI applet (`fluxor exec chronicle`) | — |
 
 Protocol I/O is **not** here: connectors are provider `.fmod`s owned by the
@@ -34,11 +36,31 @@ the on-device serialization of a message:
 [count:u8]  then count ×  [number:u8][type:u8][len:u16 LE][payload]
 ```
 
-`type` is `0` (byte string) or `1` (`i64`, 8 bytes LE). The field number is a `u8`,
-so field numbers are `1..=255`; the encoder rejects a wider number rather than
-truncate it, and field `255` is reserved as the [version selector](versioning.md).
-`encode_frame` / `decode_frame` in `pipeline_core.rs` are the single codec for this
-format.
+`type` is `0` (byte string), `1` (`i64`, 8 bytes LE) or `3` (a nested message,
+whose payload is its own frame); `2` is unassigned and refused. The field number is a `u8`, so field
+numbers are `1..=255`; the encoder rejects a wider number rather than truncate it.
+
+The engines reserve `240..=255`. Three of those numbers have fixed meanings;
+`240..=252` are held unassigned:
+
+| Number | Type | Meaning |
+|---|---|---|
+| `255` | string or bytes | the [version selector](versioning.md) |
+| `254` | message | the **carry** (`CARRY_FIELD`): the record's carried context, a nested message every connector returns unchanged, so a request built before an effect and the reply handled after it share no state but the record. On the [exchange surface](connectors.md#the-exchange-surface) it travels as the `msg_key` |
+| `253` | int | the **exchange status** (`EXCHANGE_STATUS_FIELD`) on a record made from a provider's reply: `0` answered, `1..=15` the contract's refusals. A payload's own field 253 is replaced by it |
+
+A field with one of these numbers has its reserved meaning whatever the schema
+calls it, so the schema compiler accepts a reserved number only as its fixed type
+and refuses `240..=252` outright (`ReservedField`). Data fields are numbered
+below 240.
+
+A frame never carries an absent field: `encode_frame` leaves it out. A **nested
+message** crosses a frame as its own frame, typed `3`: a construction that is
+another construction's field value packs into one (`FRAME_PACK`), a path through
+a message-typed field reads it (`GET_FIELD`), and passing it on keeps its type. A
+byte-string field is never read as a message, and a map stage's elements are
+messages. A connector that returns the carry returns its type byte with it. `encode_frame` / `decode_frame` in `pipeline_core.rs`
+are the single codec for this format.
 
 ## The pipeline module
 
@@ -48,14 +70,14 @@ format.
 input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶ output
 ```
 
-- **decode** (optional `decode` param): a [byte-deserialization](connectors.md)
+- **decode** (optional `decode` param): a [byte-deserialization](../guides/wire-codec.md)
   program that parses a raw protocol reply into a record frame before the stages.
 - **version select**: the record's `X-Module-Version` selector (field 255) resolves
   to one of the loaded [versions](versioning.md); unknown ⇒ fail closed.
 - **stages**: an ordered chain of stage programs (see [stage kinds](#stage-kinds)).
   Each stage's constructed message is *serialized* as the next stage's input
   (serialize-at-the-boundary), so stages compose with no shared mutable state.
-- **encode** (optional `encode` param): a [byte-serialization](connectors.md)
+- **encode** (optional `encode` param): a [byte-serialization](../guides/wire-codec.md)
   program that renders the final record as wire bytes (e.g. a Redis `SET`).
 
 The stage table is a param container — `[nstages:u8]{[cost:u32][len:u16][code]}` —
@@ -73,6 +95,7 @@ names a different executor for a stage:
 |---|---|---|
 | `00` compute | Transformation bytecode | the expression evaluator |
 | `01` decision | a [Decision](model.md) container | the first-hit policy driver |
+| `02` map | a map container (`MAP_HEADER` + a predicate) | the bounded map driver |
 
 A Decision is one input, one output and the same decode/evaluate/encode step a
 compute stage is; only the program format differs. Running it as a stage makes
@@ -90,6 +113,19 @@ unchecked.
 A decision stage's body is copied through the lowering verbatim rather than
 transcoded, and its arms carry their own cost bounds; see `DECISION_STAGE_COST`
 in the [limit register](limit_register.md).
+
+A **map** stage applies one predicate to every element of a repeated field —
+a field number the frame carries more than once, each occurrence a nested
+message's frame — at most the declared `max` of them (more refuses the stage,
+`TooMany`). Whatever an element is judged against travels in the element — a
+producer pairs before the stage. The predicate reads `(element, record)` and
+answers true, false or unknown; the driver
+counts the three into declared int fields, so "every element holds" is
+`false == 0 && unknown == 0` in whatever follows. Authored as a `.uproc`
+`map` (see `examples/map_stage/selector.uproc`), sealed as an Expression plus
+the calling Stage's `MapSpec`, and lowered into the surrounding compute run's
+node — a map does not branch, so it is a stage, not a node. Its body is copied
+verbatim like a decision's; see `MAP_STAGE_COST`.
 
 The pipeline also speaks the ordered-ack exchange surface in both directions:
 wire `publish_out`/`ack_in` and results leave as correlated publishes to any
@@ -117,10 +153,14 @@ its output is accepted downstream (see
 
 `Distinct`/`TopK`/`Quantile` are on device too, alongside the fixed-size monoids.
 They fold a bounded sorted cell drawn from a fixed pool indexed by a derived
-`(lane, pane)` slot, so they cost no state at all in a Sum-only deployment. TopK
-stays exact past the cell ceiling — it evicts the smallest, which it would have
-discarded anyway — while Distinct and Quantile saturate and COUNT the loss via
-`coll_overflows()` rather than passing a lower bound off as exact.
+`(lane, pane)` slot, so they cost no state at all in a Sum-only deployment.
+TopK's `k` and Quantile's permille travel in the container with the operator.
+TopK stays exact past the cell ceiling — it evicts the smallest, which it would
+have discarded anyway — while a Distinct or Quantile cell that saturates has no
+exact answer: its value is emitted absent and the loss counted in
+`coll_overflows()`, never a lower bound passed off as exact. A Count, Sum or Avg
+that overflows i64 is emitted absent the same way, counted in
+`arith_overflows()`.
 
 They are also NOT retractable: a late correction within the horizon folds the
 monoids but freezes a collection cell, and the refusal is counted in
@@ -165,5 +205,6 @@ VM with random bytecode and inputs.
 ## Related Documentation
 
 - [model.md](model.md) — the artefact model and the shared cores
-- [connectors.md](connectors.md) — encode/decode byte VMs and the transport
+- [../guides/wire-codec.md](../guides/wire-codec.md) — the encode/decode byte VMs
+- [connectors.md](connectors.md) — the provider modules and the exchange surface
 - [versioning.md](versioning.md) — multi-version pipelines and hot reload

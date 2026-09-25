@@ -5,7 +5,7 @@
 // on a `resource`, and a connector binding names an endpoint and credentials
 // that live nowhere in the document. This one is deliberately bindings-free, so
 // `chronicle graph` can take it all the way from source to bootable YAML with
-// nothing supplied from outside — which is what `graph-e2e.sh` proves.
+// nothing supplied from outside — which is what `tools/e2e/graph.sh` proves.
 //
 // Two consecutive `call` stages, so the compute-run collapse is observable: the
 // graph must contain ONE pipeline node, not two.

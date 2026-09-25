@@ -25,17 +25,26 @@ pub enum Value<'a> {
     Bool(bool),
     Int(i64),
     Uint(u64),
-    Double(f64),
     Str(&'a str),
     Bytes(&'a [u8]),
     /// A (borrowed) protobuf message, addressed by field number.
     Msg(&'a Message<'a>),
+    /// A nested message held as its own record frame — frame type 3. A path
+    /// selects into it; a frame writes it back as type 3, so it stays a
+    /// message across every stage and connector that passes it on.
+    Frame(&'a [u8]),
     /// Bytes produced by a builtin into the caller's scratch arena
     /// (`builtins_core::Scratch`), addressed by offset — an index, not a
     /// borrow, because a borrow would freeze the arena against the next
     /// builtin's append. Resolve with [`resolve_scratch`] (or the arena's
     /// `slice`) once evaluation is done and the arena is immutable.
     Scratch {
+        off: u32,
+        len: u32,
+    },
+    /// A nested message `FRAME_PACK` built in the scratch arena: a
+    /// [`Value::Frame`] addressed as [`Value::Scratch`] is.
+    ScratchFrame {
         off: u32,
         len: u32,
     },
@@ -48,6 +57,7 @@ pub enum Value<'a> {
 pub fn resolve_scratch<'a>(v: Value<'a>, scratch: &'a Scratch<'_>) -> Value<'a> {
     match v {
         Value::Scratch { off, len } => Value::Bytes(scratch.slice(off, len)),
+        Value::ScratchFrame { off, len } => Value::Frame(scratch.slice(off, len)),
         other => other,
     }
 }
@@ -79,8 +89,20 @@ impl<'a> Message<'a> {
     }
 }
 
-/// Maximum fields a single constructed message may carry.
-pub const MAX_BUILD_FIELDS: usize = 32;
+/// Maximum fields a single decoded or constructed message may carry.
+///
+/// A field table lives on the evaluating step's stack, so the bound is a stack
+/// cost and is tiered on pointer width: 128 fields (4 KiB a table) on a 64-bit
+/// core, where a module's stack is at least 64 KiB; 32 (768 bytes) on a 32-bit
+/// core, where an isolated module's stack is 2 KiB. The frame's one-byte field
+/// count holds either. A record with more fields than the table holds is
+/// refused, never truncated.
+pub const MAX_BUILD_FIELDS: usize = if cfg!(target_pointer_width = "64") {
+    128
+} else {
+    32
+};
+const _: () = assert!(MAX_BUILD_FIELDS <= u8::MAX as usize);
 
 /// Fixed-capacity accumulator for a constructed message. Its fields borrow from
 /// the input (`'a`), so construction allocates nothing. The caller owns the
@@ -136,18 +158,25 @@ pub mod op {
                                     // len:u16 LE, bytes[len] — push a string literal (as borrowed UTF-8 bytes,
                                     // pointing into the code; `Value::Bytes` avoids linking `from_utf8` on device).
     pub const PUSH_STR: u8 = 0x12;
-    // Comparison: pop b, a; push Bool(a OP b).
+    // Comparison: pop b, a; push Bool(a OP b), or Null when either is absent.
     pub const CMP_EQ: u8 = 0x20;
     pub const CMP_NE: u8 = 0x21;
     pub const CMP_LT: u8 = 0x22;
     pub const CMP_LE: u8 = 0x23;
     pub const CMP_GT: u8 = 0x24;
     pub const CMP_GE: u8 = 0x25;
-    // Logical: AND/OR pop b, a; NOT pops a. Operate on Bool.
+    // Logical: AND/OR pop b, a; NOT pops a. Operate on Bool or Null (unknown),
+    // three-valued as CEL's `&&`/`||`/`!` are over errors.
     pub const AND: u8 = 0x30;
     pub const OR: u8 = 0x31;
     pub const NOT: u8 = 0x32;
-    // Integer arithmetic: pop b, a; push Int(a OP b) (wrapping).
+    pub const IS_SET: u8 = 0x33; // pop v, push Bool(v is present) — CEL `has()`
+    /// n:u8, then n field numbers (u8) — pop n values, push the record FRAME
+    /// they make (a nested message, as it crosses a frame boundary). Written
+    /// into the scratch arena; absent values are left out, as in any frame.
+    pub const FRAME_PACK: u8 = 0x42;
+    // Integer arithmetic: pop b, a; push Int(a OP b). A result outside i64 is
+    // `Overflow`, never wrapped (CEL's int64 overflow error).
     pub const ADD: u8 = 0x50;
     pub const SUB: u8 = 0x51;
     pub const MUL: u8 = 0x52;
@@ -155,6 +184,9 @@ pub mod op {
     /// `DivByZero` eval error — the decision fails closed, as every other
     /// fault does; a policy that divides by a field must guard it.
     pub const DIV: u8 = 0x56;
+    /// Integer remainder, sign of the dividend (CEL's `%`). A zero divisor is a
+    /// `DivByZero` eval error, as for `DIV`.
+    pub const REM: u8 = 0x57;
     // Message construction.
     pub const SET_FIELD: u8 = 0x40; // number:u32 — pop value into builder
     pub const FINISH_MSG: u8 = 0x41; // result is the built message
@@ -188,8 +220,11 @@ pub enum EvalError {
     /// A `CALL` named a builtin this build does not carry (unknown id, or its
     /// extension feature is compiled out).
     BadBuiltin(u16),
-    /// `DIV` with a zero divisor.
+    /// `DIV` or `REM` with a zero integer divisor.
     DivByZero,
+    /// Integer arithmetic whose result lies outside i64 — refused, never
+    /// wrapped into a plausible wrong number.
+    Overflow,
     /// A scratch-producing builtin overflowed the caller's arena (or the
     /// caller provided none — `eval_full` without an arena).
     ScratchOverflow,
@@ -234,8 +269,7 @@ pub fn eval_scratch_metered<'a>(
     max_cost: u64,
     spent: &mut u64,
 ) -> Result<Value<'a>, EvalError> {
-    let mut builder = Builder::new();
-    match eval_full_scratch_metered(code, params, &mut builder, scratch, max_cost, spent)? {
+    match eval_in(code, params, None, scratch, max_cost, spent)? {
         EvalResult::Scalar(v) => Ok(v),
         EvalResult::Constructed => Err(EvalError::BadResultArity),
     }
@@ -244,8 +278,9 @@ pub fn eval_scratch_metered<'a>(
 /// Execute `code` against `params`, spending at most `max_cost` steps. A
 /// constructed message (via `SET_FIELD`/`FINISH_MSG`) is written into `builder`.
 ///
-/// No scratch arena: every builtin that needs to WRITE (reverse, case
-/// mapping, replace, base64) fails closed with `ScratchOverflow`. Subslice
+/// No scratch arena: every op that needs to WRITE (reverse, case mapping,
+/// replace, base64, string `+`, nested message construction) fails closed
+/// with `ScratchOverflow`. Subslice
 /// and scalar builtins still work. Callers that enable the writing builtins
 /// use [`eval_full_scratch`] and resolve `Value::Scratch` results against
 /// the arena when serializing.
@@ -281,6 +316,20 @@ pub fn eval_full_scratch_metered<'a>(
     code: &'a [u8],
     params: &'a [Message<'a>],
     builder: &mut Builder<'a>,
+    scratch: &mut Scratch<'_>,
+    max_cost: u64,
+    spent: &mut u64,
+) -> Result<EvalResult<'a>, EvalError> {
+    eval_in(code, params, Some(builder), scratch, max_cost, spent)
+}
+
+/// The evaluator. A scalar evaluation passes no builder, so it carries no
+/// field table on its stack; a program that constructs is then refused at its
+/// first `SET_FIELD` (`BadResultArity`), as it would be at `FINISH_MSG`.
+fn eval_in<'a>(
+    code: &'a [u8],
+    params: &'a [Message<'a>],
+    mut builder: Option<&mut Builder<'a>>,
     scratch: &mut Scratch<'_>,
     max_cost: u64,
     spent: &mut u64,
@@ -348,6 +397,15 @@ pub fn eval_full_scratch_metered<'a>(
             op::CMP_EQ | op::CMP_NE | op::CMP_LT | op::CMP_LE | op::CMP_GT | op::CMP_GE => {
                 let b = pop!();
                 let a = pop!();
+                // A comparison with an ABSENT operand is UNKNOWN, not false and
+                // not an error yet: `&&`/`||` may still absorb it (CEL's
+                // commutative error semantics), and a predicate left unknown
+                // fails its decision closed. A present value of the wrong type
+                // stays a TypeError.
+                if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                    push!(Value::Null);
+                    continue;
+                }
                 let ord = compare(a, b, scratch).ok_or(EvalError::TypeError)?;
                 let r = match opcode {
                     op::CMP_EQ => ord == Ordering::Equal,
@@ -360,18 +418,50 @@ pub fn eval_full_scratch_metered<'a>(
                 push!(Value::Bool(r));
             }
             op::AND | op::OR => {
-                let b = as_bool(pop!())?;
-                let a = as_bool(pop!())?;
-                push!(Value::Bool(if opcode == op::AND { a && b } else { a || b }));
+                // Three-valued, as CEL specifies `&&`/`||` over errors: a
+                // decisive operand wins whatever the other is (`false && ?` is
+                // false, `true || ?` is true, in either order); otherwise an
+                // unknown operand leaves the result unknown.
+                let b = as_tri(pop!())?;
+                let a = as_tri(pop!())?;
+                let r = if opcode == op::AND {
+                    match (a, b) {
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), Some(true)) => Some(true),
+                        _ => None,
+                    }
+                } else {
+                    match (a, b) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                };
+                push!(match r {
+                    Some(v) => Value::Bool(v),
+                    None => Value::Null,
+                });
             }
             op::NOT => {
-                let a = as_bool(pop!())?;
-                push!(Value::Bool(!a));
+                let a = as_tri(pop!())?;
+                push!(match a {
+                    Some(v) => Value::Bool(!v),
+                    None => Value::Null,
+                });
+            }
+            op::IS_SET => {
+                // `has(x)`: presence, never an error — the one way a predicate
+                // asks about absence instead of being undone by it.
+                let a = pop!();
+                push!(Value::Bool(!matches!(a, Value::Null)));
             }
             op::SET_FIELD => {
                 let number = read_u32(code, pc)?;
                 pc += 4;
                 let value = pop!();
+                let Some(builder) = builder.as_deref_mut() else {
+                    return Err(EvalError::BadResultArity);
+                };
                 if builder.len >= MAX_BUILD_FIELDS {
                     return Err(EvalError::BuildOverflow);
                 }
@@ -394,11 +484,33 @@ pub fn eval_full_scratch_metered<'a>(
                 sp -= arity;
                 let mut args: [Value<'a>; 3] = [Value::Null; 3];
                 let mut i = 0;
+                let mut absent = false;
                 while i < arity {
                     args[i] = stack[sp + i];
+                    absent |= matches!(args[i], Value::Null);
                     i += 1;
                 }
-                push!(call_builtin(id, &args[..arity], scratch)?);
+                // Absence propagates through a builtin as through an operator:
+                // `contains(absent)` is UNKNOWN, which `has(x) && …` absorbs.
+                if absent {
+                    push!(Value::Null);
+                } else {
+                    push!(call_builtin(id, &args[..arity], scratch)?);
+                }
+            }
+            op::FRAME_PACK => {
+                let n = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
+                let nums = code.get(pc + 1..pc + 1 + n).ok_or(EvalError::Truncated)?;
+                pc += 1 + n;
+                // Charged like a call: one unit per value it consumes.
+                *spent += n as u64;
+                if sp < n {
+                    return Err(EvalError::StackUnderflow);
+                }
+                sp -= n;
+                let vals = stack.get(sp..sp + n).ok_or(EvalError::StackUnderflow)?;
+                let v = frame_pack(nums, vals, scratch)?;
+                push!(v);
             }
             #[cfg(feature = "bindings")]
             op::STORE_LOCAL => {
@@ -434,8 +546,8 @@ enum Ordering {
 }
 
 fn compare(a: Value<'_>, b: Value<'_>, scratch: &Scratch<'_>) -> Option<Ordering> {
-    // Integer comparison across Int/Uint via i128 widening. Double is not
-    // ordered here (no floating-point path in the checked runtime).
+    // Integer comparison across Int/Uint via i128 widening (CEL's
+    // heterogeneous numeric order).
     if let (Some(x), Some(y)) = (as_i128(a), as_i128(b)) {
         return Some(ord_i128(x, y));
     }
@@ -445,8 +557,10 @@ fn compare(a: Value<'_>, b: Value<'_>, scratch: &Scratch<'_>) -> Option<Ordering
     fn as_b<'v>(v: Value<'v>, scratch: &'v Scratch<'_>) -> Option<&'v [u8]> {
         match v {
             Value::Str(x) => Some(x.as_bytes()),
-            Value::Bytes(x) => Some(x),
-            Value::Scratch { off, len } => Some(scratch.slice(off, len)),
+            Value::Bytes(x) | Value::Frame(x) => Some(x),
+            Value::Scratch { off, len } | Value::ScratchFrame { off, len } => {
+                Some(scratch.slice(off, len))
+            }
             _ => None,
         }
     }
@@ -503,7 +617,7 @@ fn as_i128(v: Value<'_>) -> Option<i128> {
 // stack exactly as a VM's own arm would, so which VM honours an op is invisible to
 // a program.
 
-/// PUSH_I64, ADD, SUB, MUL — honoured by all three VMs.
+/// PUSH_I64, ADD, SUB, MUL, DIV, REM — honoured by all three VMs.
 #[inline]
 fn arith_op<'a>(
     opcode: u8,
@@ -539,25 +653,41 @@ fn arith_op<'a>(
             *pc += 8;
             push!(Value::Int(v));
         }
-        op::ADD | op::SUB | op::MUL | op::DIV => {
-            let b = match as_int(pop!()) {
+        op::ADD | op::SUB | op::MUL | op::DIV | op::REM => {
+            let bv = pop!();
+            let av = pop!();
+            // Absence propagates: arithmetic on an absent operand is UNKNOWN,
+            // left for `&&`/`||`/`has()` to resolve or a decision to refuse.
+            if matches!(av, Value::Null) || matches!(bv, Value::Null) {
+                push!(Value::Null);
+                return Some(Ok(()));
+            }
+            let b = match as_arith_int(bv) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            let a = match as_int(pop!()) {
+            let a = match as_arith_int(av) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            if opcode == op::DIV && b == 0 {
+            if (opcode == op::DIV || opcode == op::REM) && b == 0 {
                 return Some(Err(EvalError::DivByZero));
             }
+            // Checked, so no panic path is linked: a zero divisor is refused
+            // above, and `MIN / -1` is the one quotient past i64::MAX. `REM`
+            // cannot leave i64 (`MIN % -1` is 0).
             let r = match opcode {
-                op::ADD => a.wrapping_add(b),
-                op::SUB => a.wrapping_sub(b),
-                op::DIV => a.wrapping_div(b),
-                _ => a.wrapping_mul(b), // MUL
+                op::ADD => a.checked_add(b),
+                op::SUB => a.checked_sub(b),
+                op::DIV => a.checked_div(b),
+                op::REM if b == -1 => Some(0),
+                op::REM => a.checked_rem(b),
+                _ => a.checked_mul(b), // MUL
             };
-            push!(Value::Int(r));
+            match r {
+                Some(r) => push!(Value::Int(r)),
+                None => return Some(Err(EvalError::Overflow)),
+            }
         }
         _ => return None,
     }
@@ -614,6 +744,17 @@ fn load_op<'a>(
             *pc += 4;
             match pop!() {
                 Value::Msg(m) => push!(m.get(number)),
+                // A nested message crosses a frame boundary as its own FRAME,
+                // typed as one (3), so selecting into one reads the frame. A
+                // byte string is not a message, whatever its bytes look like.
+                Value::Frame(f) => match frame_get(f, number) {
+                    Ok(v) => push!(v),
+                    Err(e) => return Some(Err(e)),
+                },
+                // A member of an ABSENT nested message is absent too — the
+                // path propagates absence as every operator does, so
+                // `r.ctx.x` on a record with no `ctx` is unknown, not an error.
+                Value::Null => push!(Value::Null),
                 _ => return Some(Err(EvalError::NotAMessage)),
             }
         }
@@ -662,11 +803,14 @@ pub fn scan_code(code: &[u8]) -> Result<(), EvalError> {
             | op::AND
             | op::OR
             | op::NOT
+            | op::IS_SET
             | op::ADD
             | op::SUB
             | op::MUL
-            | op::DIV => 0,
+            | op::DIV
+            | op::REM => 0,
             op::LOAD_PARAM | op::PUSH_BOOL => 1,
+            op::FRAME_PACK => 1 + *code.get(pc).ok_or(EvalError::Truncated)? as usize,
             op::GET_FIELD | op::SET_FIELD => 4,
             op::PUSH_I64 => 8,
             op::PUSH_STR => {
@@ -701,17 +845,154 @@ pub fn scan_code(code: &[u8]) -> Result<(), EvalError> {
     Ok(())
 }
 
-fn as_int(v: Value<'_>) -> Result<i64, EvalError> {
+/// An integer operand as an `i64` VALUE: a `Uint` above `i64::MAX` has none,
+/// so it is `Overflow` rather than a wrapped negative number.
+fn as_arith_int(v: Value<'_>) -> Result<i64, EvalError> {
     match v {
         Value::Int(i) => Ok(i),
-        Value::Uint(u) => Ok(u as i64),
+        Value::Uint(u) => i64::try_from(u).map_err(|_| EvalError::Overflow),
         _ => Err(EvalError::TypeError),
     }
 }
 
-fn as_bool(v: Value<'_>) -> Result<bool, EvalError> {
+/// Field `number` of a record frame (`[count][number][type][len u16][payload]…`),
+/// typed as `decode_frame` types it; absent is `Null`, and an empty frame is a
+/// message with no fields. A frame that does not frame is `NotAMessage` — the
+/// value selected into was not a nested message after all.
+fn frame_get(f: &[u8], number: u32) -> Result<Value<'_>, EvalError> {
+    if f.is_empty() {
+        return Ok(Value::Null);
+    }
+    let count = *f.first().ok_or(EvalError::NotAMessage)? as usize;
+    let mut p = 1usize;
+    let mut i = 0usize;
+    while i < count {
+        let h = f.get(p..p + 4).ok_or(EvalError::NotAMessage)?;
+        let (num, ty) = (h.first().copied(), h.get(1).copied());
+        let len = match (h.get(2), h.get(3)) {
+            (Some(&a), Some(&b)) => u16::from_le_bytes([a, b]) as usize,
+            _ => return Err(EvalError::NotAMessage),
+        };
+        let body = f.get(p + 4..p + 4 + len).ok_or(EvalError::NotAMessage)?;
+        if num.map(u32::from) == Some(number) {
+            return match ty {
+                Some(1) => match <[u8; 8]>::try_from(body) {
+                    Ok(b) => Ok(Value::Int(i64::from_le_bytes(b))),
+                    Err(_) => Err(EvalError::NotAMessage),
+                },
+                Some(0) => Ok(Value::Bytes(body)),
+                Some(3) => Ok(Value::Frame(body)),
+                _ => Err(EvalError::NotAMessage),
+            };
+        }
+        p += 4 + len;
+        i += 1;
+    }
+    if p != f.len() {
+        return Err(EvalError::NotAMessage);
+    }
+    Ok(Value::Null)
+}
+
+/// Copy `src` into `buf` at `at` — bounds-checked, no panic path (a PIC
+/// module links none).
+fn frame_put(buf: &mut [u8], at: usize, src: &[u8]) -> Result<(), EvalError> {
+    let dst = buf
+        .get_mut(at..at + src.len())
+        .ok_or(EvalError::ScratchOverflow)?;
+    for (d, s) in dst.iter_mut().zip(src.iter()) {
+        *d = *s;
+    }
+    Ok(())
+}
+
+/// Encode `vals` under `nums` as a record frame in the scratch arena — the
+/// wire form a nested message takes, returned as a [`Value::ScratchFrame`].
+/// Absent values are left out; a nested message packs as type 3; a value with
+/// no frame representation (a decoded message) is a `TypeError`, and a `Uint`
+/// above `i64::MAX` (the frame's integer is an i64) is `Overflow`.
+fn frame_pack<'a>(
+    nums: &[u8],
+    vals: &[Value<'a>],
+    scratch: &mut Scratch<'_>,
+) -> Result<Value<'a>, EvalError> {
+    // Size first, so the frame is reserved once and written in place.
+    let mut size = 1usize;
+    let mut count = 0usize;
+    for v in vals {
+        size += 4 + match *v {
+            Value::Null => continue,
+            Value::Int(_) | Value::Uint(_) | Value::Bool(_) => 8,
+            Value::Bytes(b) | Value::Frame(b) => b.len(),
+            Value::Str(s) => s.len(),
+            Value::Scratch { len, .. } | Value::ScratchFrame { len, .. } => len as usize,
+            _ => return Err(EvalError::TypeError),
+        };
+        count += 1;
+    }
+    if count > u8::MAX as usize {
+        return Err(EvalError::BuildOverflow);
+    }
+    let off = scratch.reserve(size)?;
+    frame_put(scratch.buf, off, &[count as u8])?;
+    let mut w = off + 1;
+    for (k, v) in vals.iter().enumerate() {
+        let num = *nums.get(k).ok_or(EvalError::Truncated)?;
+        let (ty, len) = match *v {
+            Value::Null => continue,
+            Value::Int(_) | Value::Uint(_) | Value::Bool(_) => (1u8, 8usize),
+            Value::Bytes(b) => (0, b.len()),
+            Value::Frame(b) => (3, b.len()),
+            Value::Str(s) => (0, s.len()),
+            Value::Scratch { len, .. } => (0, len as usize),
+            Value::ScratchFrame { len, .. } => (3, len as usize),
+            _ => return Err(EvalError::TypeError),
+        };
+        if len > u16::MAX as usize {
+            return Err(EvalError::BuildOverflow);
+        }
+        let l = (len as u16).to_le_bytes();
+        frame_put(scratch.buf, w, &[num, ty, l[0], l[1]])?;
+        w += 4;
+        match *v {
+            Value::Int(i) => frame_put(scratch.buf, w, &i.to_le_bytes())?,
+            Value::Uint(u) => {
+                let i = i64::try_from(u).map_err(|_| EvalError::Overflow)?;
+                frame_put(scratch.buf, w, &i.to_le_bytes())?
+            }
+            Value::Bool(b) => frame_put(scratch.buf, w, &(b as i64).to_le_bytes())?,
+            Value::Bytes(b) | Value::Frame(b) => frame_put(scratch.buf, w, b)?,
+            Value::Str(s) => frame_put(scratch.buf, w, s.as_bytes())?,
+            // An earlier builtin's result lives in this arena, below `off`:
+            // copied byte by byte, since source and destination share it.
+            Value::Scratch { off: so, .. } | Value::ScratchFrame { off: so, .. } => {
+                for i in 0..len {
+                    let b = *scratch
+                        .buf
+                        .get(so as usize + i)
+                        .ok_or(EvalError::ScratchOverflow)?;
+                    *scratch
+                        .buf
+                        .get_mut(w + i)
+                        .ok_or(EvalError::ScratchOverflow)? = b;
+                }
+            }
+            _ => {}
+        }
+        w += len;
+    }
+    Ok(Value::ScratchFrame {
+        off: off as u32,
+        len: size as u32,
+    })
+}
+
+/// A logic operand: `Some(bool)`, or `None` for UNKNOWN (an absent value, or a
+/// comparison that involved one). Anything else is a TypeError.
+fn as_tri(v: Value<'_>) -> Result<Option<bool>, EvalError> {
     match v {
-        Value::Bool(b) => Ok(b),
+        Value::Bool(b) => Ok(Some(b)),
+        Value::Null => Ok(None),
         _ => Err(EvalError::TypeError),
     }
 }

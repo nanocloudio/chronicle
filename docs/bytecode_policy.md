@@ -35,9 +35,9 @@ builtin is a bounded scan over bounded values, which is enough for termination
 and not enough to predict a duration.
 
 Any microsecond figure for a step is therefore a **measured property of one
-target**, not an enforced one. `fluxor.toml` builds a single target
-(`bcm2712`, Pi 5), so a timing claim here is a claim about that board and
-nothing else. Treat a tick budget as something to measure per target, and the
+target**, not an enforced one. `fluxor.toml` builds three targets (`bcm2712`,
+`rp2350`, `rp2040`) whose cores differ by orders of magnitude, so a timing claim
+is a claim about the board it was measured on and nothing else. Treat a tick budget as something to measure per target, and the
 opcode count as the thing the runtime actually guarantees.
 
 In scope:
@@ -97,7 +97,7 @@ What it does not keep is the reason the VM exists:
   before reopening this.
 - **The edit loop.** A logic change is a param write. On wasm it is a build —
   not the full build/sign/flash cycle, since an authoring module could in
-  principle host the codegen, but a toolchain where there is now a table write.
+  principle host the codegen, but a toolchain where the VM needs only a table write.
 
 **The summary:** AOT to wasm is a real option, and footprint is not what answers
 it. What keeps the VM is per-record version selection inside one module instance,
@@ -131,16 +131,72 @@ verifier is where this class of system goes wrong.
 If you find yourself needing a branch or a loop, the answer is never a new
 opcode. It is a new artefact kind.
 
+## Absence
+
+An absent field reads as `Null` (`GET_FIELD` of a number the record does not
+carry), and absence is never a value:
+
+- A **comparison** with an absent operand is UNKNOWN (`Null`), not `false` and
+  not yet an error. A present operand of the wrong type is still `TypeError`.
+- **Operators and builtins propagate it**: arithmetic, string `+` and any
+  builtin with an absent operand answer UNKNOWN, as a CEL error propagates —
+  so `has(l.value) && l.value.contains(v)` is `false` for an absent value,
+  never a type error.
+- **`&&` / `||` / `!`** are three-valued, as CEL specifies them over error
+  operands: a decisive side wins in either order (`false && ?` is `false`,
+  `true || ?` is `true`); otherwise the result stays unknown.
+- **`has(<param>.<field>…)`** (`IS_SET`, 0x33) asks about presence and is
+  never unknown — the one way a predicate reasons about absence instead of
+  being undone by it. Its argument must be a field selection.
+- A decision's **`when` left unknown** fails the whole decision
+  (`DecisionError::Absent`): no rule and no default fires, since the rule
+  that could not be evaluated may have been a refusal. The decision module
+  counts it as `errors_absent`, a split of `inputs_failed`.
+- A **frame never carries a `Null`**: a stage that sets a field from an
+  absent value leaves the field out, so the next stage sees it absent too.
+
+This is not the "conditional for the null case" the fence forbids: nothing
+branches, every operator stays a total function of its operands. It is why a
+wire code of 0 can mean success (errno, kagi's `verify_err`) safely — a record
+that never carried the code cannot satisfy `status == 0`.
+
+So an unknown does not fail the stage that computes it: a stage that sets a
+field from an absent comparison emits the field absent, and whatever reads that
+field fails closed in turn. A `TypeError` is kept for what is genuinely wrong —
+a present operand of the wrong type.
+
+## Nested messages
+
+A message-typed field crosses a frame as its own frame, under frame type 3, so
+the frame itself says which fields are messages and a reader needs no schema to
+walk the nesting. In the VM that field is a `Frame` value, and it is written back
+as type 3 wherever it is passed on. Two operations make it transparent to an
+author:
+
+- `GET_FIELD` on a message reads its frame (absent → `Null`; a frame that does
+  not frame → `NotAMessage`), so `r.ctx.cid` reads through a carried context. A
+  byte string is not a message, whatever its bytes look like: selecting into one
+  is `NotAMessage`.
+- `FRAME_PACK n, nums…` (0x42, IR `PACK` 0x1A) pops `n` values and pushes the
+  message they make, into the scratch arena — what a construction compiles to
+  when it is another construction's field value (`Out{ ctx: Ctx{ cid: … } }`).
+  Charged `1 + n`, like a call.
+
+Both are pure and total and neither branches. This is what the reserved carry
+field (254) is built from: context rides in one field, and copying it is
+`ctx: r.ctx`.
+
 ## How capability is added instead: constrained artefact kinds
 
-When a computation does not fit the VM, model it as a **new artefact kind** whose
-shape is itself constrained and whose execution is a native engine. This is the
-established pattern, used twice already:
+When a computation does not fit the VM, give it a construct whose shape is
+itself constrained and whose execution is a native engine — a new artefact kind,
+or a stage kind inside the Pipeline when it neither branches nor holds state:
 
 | Need | Why the VM can't | The artefact kind |
 | --- | --- | --- |
 | Branch on rules | no conditional jump | **Decision** — first-hit `[when, outcome]` container, `run_decision` |
 | Windowed accumulation over time | unbounded, stateful | **Aggregation** — monoid spec + pane engine |
+| A predicate over every element of a list | no loop | **Map stage** — a Pipeline `Stage` with a `MapSpec` (declared max, counted verdicts) calling an Expression; `run_map_stage` |
 
 A new artefact kind must:
 
@@ -154,11 +210,26 @@ A new artefact kind must:
    separate node precisely because it branches; do not smuggle control flow into
    the pipeline node to avoid a channel hop.
 
-So a hypothetical "for each line item, compute a fee" is not a loop opcode. It is
-a bounded map-over-repeated-field artefact: a declared max element count, a
-per-element pure expression the VM already runs, and a native driver that applies
-it. The per-element logic stays inside the fence; the iteration is declarative
-and bounded outside it.
+The map stage answers a quantified question about a list — does every element
+hold, does any, how many do not — and nothing else: it applies one predicate to
+each element and writes three counts (true, false, unknown) into the record.
+There is no per-element output, so it does not transform a list, and a
+per-element computation whose results are combined ("for each line item, compute
+a fee, and total them") is not a map stage. That is a fold: it belongs at the
+codec edge, which already walks the document, or in aggregation once the items
+travel as records.
+
+The per-element logic stays inside the fence; the iteration is declarative and
+bounded outside it. Its declared maximum is the bound in force: more elements
+refuse the stage (`TooMany`), which a failure route can answer, and a container
+whose maximum and three counts cannot fit the target's field table
+(`MAX_PIPE_FIELDS`) is refused at load. Elements and the record's other fields
+share that table, so a record wider than it is refused before the stage runs.
+Both refusals are counted as `over_bound`. What an element is judged against
+travels in the element: a producer that pairs (a selector term with the label
+it names) pairs before the stage, which stays a pure quantifier.
+It lives inside the Pipeline artefact (`Stage.map`) rather than as a new kind
+because it neither branches nor holds state.
 
 ## The pinned CEL extension surface
 
@@ -175,10 +246,24 @@ ids outside the pinned table entirely.
 | feature | upstream | adopted | result discipline |
 | --- | --- | --- | --- |
 | `strings` | CEL stdlib + `ext.strings` v3 | `size`, `contains`, `startsWith`, `endsWith`, `indexOf`, `lastIndexOf`, `charAt`, `substring`(1 and 2-arg), `trim`, `reverse`, `lowerAscii`, `upperAscii`, `replace`(3-arg) | predicates/indexes → scalars; `substring`/`trim`/`charAt` → zero-copy subslices; `reverse`/case/`replace` → scratch arena |
-| `strings` (documents) | nanocloud's admission, no upstream | `json.get(doc, path)` (a string's content, a scalar as written, a container as its bytes; EMPTY when absent), `json.has(doc, path)`, `json.setDefault(doc, path, raw)` (inserts only where absent, at the top level or one object down; a key that JSON would need escaped leaves the document unchanged), `s.part(delim, i)` (the i-th part; EMPTY past the end), and CEL's string `a + b` (concatenation — `+` on integers is arithmetic); dotted paths with decimal array indices, keys compared as written. A document is read where it lives, so it has no size ceiling of its own, and a container that is not well-formed on the way to the path reads as absent | `get`/`part` → zero-copy; `setDefault`, `+` → scratch arena |
 | `math` | `ext.math`, integer subset | `greatest`/`least` (2-arg pin), `abs`, `sign`, `bitAnd`, `bitOr`, `bitXor`, `bitShiftLeft`, `bitShiftRight` | scalars |
 | `encoders` | `ext.encoders` | `base64.encode`, `base64.decode` (strict: canonical padding or error) | scratch arena |
+| every build | CEL stdlib conversion | `int(x)` (int, uint, or a decimal string) | scalars |
 | `bindings` | `ext.bindings` | `cel.bind(x, init, result)` | compiler + 2 slot opcodes, no runtime table entry |
+
+**Numbers.** Every number is an integer. `int` arithmetic divides toward zero
+(`/`) and takes the dividend's sign (`%`, opcode `REM`); a zero divisor is
+`DivByZero`, and a result outside i64 (`+ - * /`) is `Overflow`, as CEL
+specifies — never a wrapped number. A fractional value is a scaled integer whose scale
+the schema's author fixes — thousandths, cents, milliseconds — so it evaluates
+to the same bits on every target, the MCUs included, which a PIC module's lack
+of a soft-float runtime would otherwise forbid. A fractional literal (`1.5`) is
+a parse error.
+
+**Unassigned codes.** Opcode `0x13`, decoder ops `0x80` and `0x8A`, IR tag `0x1C`,
+builtins `27`–`30` and `33`, and frame type `2` are reserved and never
+assigned: a program or frame that names one is refused at load (`BadOpcode`,
+`BadBuiltin`, `BadFrame`) rather than read as something else.
 
 **Deviations from upstream, pinned:** indices and `size` are BYTE offsets,
 not code points — identical to CEL for ASCII, documented beyond it; `trim`
@@ -193,14 +278,16 @@ types in the VM; `matches`, `ext.regex` — no unbounded matching engine in a
 work-bounded PIC (pattern extraction is a compiled-module capability, per
 the crypto precedent); `format`, `quote` — printf machinery, weak
 power-to-weight; `ext.protos` — the codec layer (`pb_core`, `PBFIELD`)
-already owns that problem at the right layer.
+already owns that problem at the right layer; `ext.json`-style document
+access — documents are read by the decoder (`JSONAT`, `JSONDEF`), which keeps
+absence distinct from an empty value.
 
 **Scratch arena:** writing builtins append into a bounded caller-owned arena
 (`STAGE_SCRATCH_CAP` per stage/record) and return offset-addressed values,
 resolved at serialization. Overflow fails the evaluation closed
-(`ScratchOverflow`). The aggregation engine currently passes no arena — its
-programs may use every non-writing builtin; a writing builtin there fails
-closed rather than differently.
+(`ScratchOverflow`). The aggregation engine passes no arena — its programs may
+use every non-writing builtin; a writing builtin there fails closed with
+`ScratchOverflow`.
 
 **Governance:** builtin ids are wire contract — append-only, never reorder,
 never reuse, exactly like the content-type table. New entries follow "Adding

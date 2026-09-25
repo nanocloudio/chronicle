@@ -74,11 +74,11 @@ esac
 # `resource` is a declaration rather than an endpoint literal. Every field here
 # is the PROVIDER's — module name, port names, param names — so binding a
 # different destination is this string changing, not chronicle changing.
-BIND='orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,endpoint=7f000001;user=app;database=orders'
+BIND='orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;database=orders'
 out=$(cli graph "$eff" process bcm2712 "$BIND" 2>/dev/null)
 case "$out" in
   *"type: pg_client"*)
-    if printf '%s' "$out" | grep -q 'endpoint: "7f000001"' &&
+    if printf '%s' "$out" | grep -q 'authority: "127.0.0.1:5432"' &&
        printf '%s' "$out" | grep -q 'to: pg.request_in'; then
       ok "a bound resource lowers to its provider, ports and params"
     else

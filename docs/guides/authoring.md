@@ -16,11 +16,13 @@ corpus (`module_identity_matches_the_prost_corpus`).
 ## Example
 
 See [`examples/authoring/process_order.uproc`](../../examples/authoring/process_order.uproc)
-— `commerce.process_order`, authored end to end.
+— `commerce.process_order`, authored end to end. Abridged here: the full file also
+declares `commerce.Money`, `commerce.NormalizedOrder` and `commerce.Route`.
 
 ```
 module commerce.process_order {
   message commerce.Order { id: string = 1; total: commerce.Money = 3; }
+  enum AUTOMATIC = 0;
   enum MANUAL_REVIEW = 1;
 
   expression is_large(order: commerce.Order) -> bool {
@@ -52,7 +54,8 @@ module commerce.process_order {
 ```
 document      := 'module' QNAME '{' decl* '}'
 decl          := message | enumconst | expression | transformation
-               | decision | resource | pipeline | entry | provenance
+               | decision | aggregation | map | resource | pipeline | entry
+               | provenance
 message       := 'message' QNAME '{' field* '}'
 field         := IDENT ':' type '=' INT ';'
 enumconst     := 'enum' IDENT '=' INT ';'
@@ -66,8 +69,19 @@ stage         := 'call' IDENT '=' QNAME '(' [IDENT (',' IDENT)*] ')' ';'
                | 'effect' IDENT '=' '@' IDENT ['.' IDENT] '(' IDENT ')' ';'
                | 'commit' 'after' IDENT ';' | 'return' IDENT ';'
 entry         := 'entry' IDENT '=' IDENT ';'
+aggregation   := 'aggregation' IDENT '(' IDENT ':' type ')' '->' type '{' aclause* '}'
+aclause       := 'key' EXPR ';' | 'event_time' EXPR ';'
+               | 'window' ('tumbling' INT | 'sliding' INT INT) ';'
+               | 'lateness' INT ';' | 'guard' INT ';' | 'lanes' INT ';'
+               | 'operator' IDENT '=' opkind ';' | 'emit' EXPR ';'
+opkind        := 'count' | ('sum'|'avg'|'min'|'max'|'distinct') '(' EXPR ')'
+               | ('topk'|'quantile') '(' INT ',' EXPR ')'
+map           := 'map' IDENT '(' IDENT ':' type ')' '->' type '{' mclause* '}'
+mclause       := 'over' IDENT '.' IDENT 'as' IDENT ':' type 'max' INT ';'
+               | 'count' IDENT '.' IDENT ',' IDENT '.' IDENT ',' IDENT '.' IDENT ';'
+               | 'when' EXPR ';'
 provenance    := 'provenance' 'revision' STRING 'toolchain' STRING ';'
-type          := 'int'|'uint'|'double'|'bool'|'string'|'bytes' | QNAME
+type          := 'int'|'uint'|'bool'|'string'|'bytes' | QNAME
 EXPR          := <the CEL subset of celc_core, captured verbatim>
 ```
 
@@ -98,7 +112,9 @@ aggregation customer_totals(order: commerce.Order) -> commerce.CustomerTotal {
   window tumbling 100;          // or: window sliding <size> <step>;
   lateness 2000;                // watermark lateness allowance (ms)
   guard 200;                    // watermark guard floor (ms)
-  lanes 64;                     // bounded cardinality (0 = unbounded)
+  lanes 16;                     // lane ceiling, capped at the engine's MAX_LANES
+                                // (16; 4 on rp2040); a key past it is counted
+                                // in lane_overflows
   operator order_count = count;
   operator gross_total = sum(order.total.units);
   // operator p90 = quantile(900, order.total.units);   // topk(k, …) likewise
@@ -113,14 +129,16 @@ The `emit` construction is checked over a synthesized **emit context** `ctx`:
 `ctx.key` (the partition key), `ctx.state.<operator>` (each operator's output, in
 declaration order), and `ctx.window.start` / `ctx.window.end`. Operator kinds:
 `count` (no selector), `sum`/`avg`/`min`/`max`/`distinct` `(<selector>)`, and
-`topk`/`quantile` `(<n>, <selector>)`.
+`topk`/`quantile` `(<n>, <selector>)`: `topk`'s `n` is the number of largest
+values summed, 1..=65535; `quantile`'s is a permille, 0..=1000. An aggregation
+takes at most one of `distinct`, `topk` and `quantile`: each window pane holds
+a single collection cell.
 
 ## Connector wire edges — NOT a DSL block
 
 A dataplane's wire edges — the request built from a record, the reply parsed back
-into one — are [wire-codec templates](wire-codec.md) compiled to `ser` / `rd`
-bytecode and supplied as a generic `pipeline` module's `encode` / `decode`
-params.
+into one — are [`ser` / `rd` byte programs](wire-codec.md) supplied as a generic
+`pipeline` module's `encode` / `decode` params.
 
 There is no `connector { … }` block in the DSL — writing one is a parse error.
 Wire edges are pipeline params rather than sealed canonical artefacts, which is
@@ -142,7 +160,7 @@ graph — which is the point of the DSL existing at all:
 | --- | --- |
 | `chronicle parse <uproc_hex>` | parse a document and summarise its declarations |
 | `chronicle author <uproc_hex>` | compile and SEAL every artefact, printing `<name> <digest>` |
-| `chronicle graph <uproc_hex> <pipeline> [target]` | lower a pipeline to bootable graph YAML |
+| `chronicle graph <uproc_hex> <pipeline> [target] [bindings]` | lower a pipeline to bootable graph YAML, binding each effect's resource from `[bindings]` (see [connectors.md](../architecture/connectors.md)) |
 | `chronicle compile-source <schema> <param> <type> <source>` | type-check source handed over at runtime → `ir` hex |
 | `chronicle compile-stages <schema> <param> <type> <src>…` | the same, as a chain → `ir_stages` hex |
 | `chronicle release <default_tag> <tag>:<prog_hex>…` | build the multi-version `versions` param |
@@ -155,8 +173,8 @@ un-embeddable. Pass `linux` for the host profile.
 
 Two things it deliberately refuses rather than guesses. An `effect` stage names a
 resource whose endpoint and credentials appear nowhere in the document, so
-`graph` reports it instead of inventing a binding that would produce a graph
-pointing at nothing. And `compile-stages` rejects a stage that does not construct
+without a binding for it `graph` reports it instead of inventing one that would
+produce a graph pointing at nothing. And `compile-stages` rejects a stage that does not construct
 a message: the executor hands one stage's output frame to the next, so a scalar
 has nothing to pass on — it would pack into a well-formed container and fail
 inside the VM at runtime.
@@ -174,7 +192,8 @@ Driven end to end by [`tools/e2e/graph.sh`](../../tools/e2e/graph.sh),
 ## Scope
 
 The DSL covers the artefact kinds with a builder — Expression, Transformation,
-Decision, Aggregation, Pipeline — plus the Module wrapper. Schema artefacts
+Decision, Aggregation, Pipeline (including its map stages) — plus the Module
+wrapper. Schema artefacts
 (descriptor closures) are supplied out-of-band, referenced by the message closure
 declared inline. Connector wire edges are pipeline PARAMS, not a DSL block (see
 above).
@@ -183,4 +202,4 @@ above).
 
 - [../architecture/model.md](../architecture/model.md) — the artefact model and identity
 - [../architecture/dataplane.md](../architecture/dataplane.md) — how authored artefacts run on device
-- [wire-codec.md](wire-codec.md) — the connector encoder/decoder templates
+- [wire-codec.md](wire-codec.md) — the `ser`/`rd` byte-codec programs

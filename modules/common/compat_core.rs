@@ -1,13 +1,15 @@
-// Semantic + structural diffing, on device — deciding whether a new version of
-// a module or a schema can replace the old one.
+// Semantic + structural diffing — deciding whether a new version of a module or
+// a schema can replace the old one. A no_std, no-alloc core like activation's,
+// so it can run wherever activation does; no module mounts it, and the
+// chronicle_cli harness covers it.
 //
-// This is what a node consults before it swaps something out. Activation asks
+// This is the question to settle before swapping something out. Activation asks
 // "can I run this?"; compatibility asks "can I run this INSTEAD, without
 // breaking whoever depends on the thing it replaces?". A node that cannot answer
 // that has to treat every update as either safe (and sometimes break callers) or
 // unsafe (and never update).
 //
-// Two verdicts, both mirroring the host exactly:
+// Two verdicts:
 //
 //   MODULE   — IDENTICAL when the recomputed digests match. BREAKING when an
 //              entry point disappears (callers lose a surface) or the new
@@ -18,9 +20,10 @@
 //              message vanishes, or a field is removed, renumbered, or changes
 //              type or label. Otherwise COMPATIBLE: fields may be ADDED.
 //
-// The schema digest is the subtle part. The host hashes a SORTED copy — files by
-// name, messages within a file by name — so two descriptor sets that differ only
-// in ordering are Identical to it. Comparing raw bytes here would call those
+// The schema digest is the subtle part. It is the `descriptor_digest` a sealed
+// Schema carries (`artefact_core`), taken over a SORTED copy — files by name,
+// messages within a file by name — so two descriptor sets that differ only in
+// ordering are Identical. Comparing raw bytes here would call those
 // Compatible instead, a quiet disagreement on exactly the case the sorting
 // exists to handle. So `schema_descriptor_digest` rebuilds the sorted encoding
 // before hashing, permuting whole encoded regions rather than re-encoding their
@@ -275,7 +278,7 @@ fn write_sorted_file(w: &mut Pb, file: &[u8]) -> Result<(), CompatError> {
     Ok(())
 }
 
-/// The host's `descriptor_digest`: sha256 over the descriptor set with files
+/// A Schema's `descriptor_digest`: sha256 over the descriptor set with files
 /// sorted by name and each file's messages sorted by name.
 pub fn schema_descriptor_digest(fds: &[u8], scratch: &mut [u8]) -> Result<[u8; 32], CompatError> {
     let mut raws = [(&[] as &[u8], &[] as &[u8]); MAX_FILES];

@@ -21,6 +21,7 @@ the saving — stages serialize between themselves inside a node too.
 | `examples/arena_budget/tight.yaml` | 2 | 3 | 0 |
 | `examples/composed/linux.yaml` | 2 | 3 | 1 |
 | `examples/decision/linux.yaml` | 1 | 2 | 0 |
+| `examples/exchange_carry/linux.yaml` | 2 | 6 | 0 |
 | `examples/expression/id.yaml` | 1 | 2 | 0 |
 | `examples/expression/ir.yaml` | 1 | 2 | 0 |
 | `examples/expression/linux.yaml` | 1 | 2 | 0 |

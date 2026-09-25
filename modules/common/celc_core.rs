@@ -1,35 +1,37 @@
 // No-alloc CEL front end: parse + type-check + checked-IR emission in ONE pass.
 //
-// This is THE compiler — the only implementation. The host crate
-// (the CEL compiler (`celc_core`)) is a thin std wrapper that `include!`s this same
-// source: its `TypeEnv` builder renders to the textual environment below and
-// its string errors are sliced from the spans this core reports. The core
-// exploits the fact that the flat checked-IR encoding (`lower_core.rs` `ir`) is
-// a POST-ORDER token stream — operands precede operators — so a recursive
-// descent over the source can emit IR bytes directly as it reduces, carry each
-// subexpression's type in its return value, and never allocate. The
-// differential test (`tests/harness/tests/pipeline.rs (builtins suite)`)
-// proves the wrapper's rendered environment is faithful to the hand-written
-// text form the device receives.
+// This is the CEL compiler, the only implementation: the device CLI, the
+// authoring and registry cores and the host test harness all `include!` this
+// source. It exploits the fact that the flat checked-IR encoding
+// (`lower_core.rs` `ir`) is a POST-ORDER token stream — operands precede
+// operators — so a recursive descent over the source can emit IR bytes
+// directly as it reduces, carry each subexpression's type in its return value,
+// and never allocate. Errors are codes plus spans; a renderer slices names
+// from the input buffers.
 //
 // Grammar and semantics:
 //   expr := or ; or := and ('||' and)* ; and := cmp ('&&' cmp)*
 //   cmp := add (CMPOP add)? ; add := mul (('+'|'-') mul)*
-//   mul := unary ('*' unary)* ; unary := '!' unary | '-' INT | primary
-//   primary := INT | STR | 'true' | 'false' | '(' expr ')'
+//   mul := unary (('*'|'/'|'%') unary)* ; unary := '!' unary | '-' INT | primary
+//   primary := (INT | STR | 'true' | 'false' | '(' expr ')'
+//            | IDENT '(' args ')'                  — `size`, `int`, `has`
 //            | DOTTED ('{' name ':' expr, … '}')?
-// Comparisons are untyped (any operands), arithmetic requires int/uint,
-// logical ops and `!` require bool, field values are NOT type-checked against
-// their declaration, and a construct may not appear as a field value.
+//            | DOTTED '(' args ')') ('.' IDENT '(' args ')')*
+// Comparisons accept any operand types except a message construction,
+// arithmetic requires int/uint except `+` on two strings (concatenation),
+// logical ops and `!` require bool, and field values are NOT type-checked
+// against their declaration. A construct used as a field value is packed as a
+// nested message frame; a construct anywhere else but the root is refused.
 //
 // Deliberate bounds (all fail closed): identifiers are ASCII-only, expression
 // nesting depth is capped (`CELC_MAX_DEPTH` — a PIC stack cannot recurse
-// unboundedly), and on inputs with several independent errors the streaming
+// unboundedly), source, schema and params are each at most `u16::MAX` bytes
+// (spans are u16; longer input is `Capacity`), and on inputs with several independent errors the streaming
 // pass surfaces a value's inner error before the enclosing field-name check.
 //
 // The schema/param environment arrives as TEXT (no builder API on device):
 //   schema : defs separated by ';'. A message def is `Name{f:ty@N,…}` where
-//            ty ∈ int|uint|double|bool|str|bytes or a (dotted) message name;
+//            ty ∈ int|uint|bool|str|bytes or a (dotted) message name;
 //            an enum def is `NAME=INT`. Message names may be dotted.
 //   params : `name:Type,…` in declaration order (order IS the runtime index).
 // Lookups scan the text on demand — no tables, no interning, no allocation.
@@ -45,8 +47,8 @@ pub const BUF_SCHEMA: u8 = 1;
 pub const BUF_PARAMS: u8 = 2;
 
 /// Structured, deterministic compile errors. Codes plus SPANS, never strings —
-/// a std wrapper (the host crate) renders names by slicing the referenced
-/// buffer; the device CLI renders the code alone. `Parse`/`BadSchema` carry the
+/// a renderer slices names from the referenced buffer; the device CLI renders
+/// the code alone. `Parse`/`BadSchema` carry the
 /// byte offset that stopped the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CelcErr {
@@ -94,6 +96,26 @@ pub enum CelcErr {
     BadCallArgs(u16, u16),
     /// `cel.bind` nesting exceeded the VM's local-slot file (`MAX_LOCALS`).
     LocalDepth,
+    /// A field numbered in the engine's reserved block (`240..=255`) other
+    /// than as that number's fixed type: schema offset of the number.
+    ReservedField(u16),
+}
+
+/// The first of the field numbers the engines reserve. `253` (the exchange
+/// status) is an `int`, `254` (the carry) a message and `255` (the version
+/// selector) a string or bytes; `240..=252` are held for meanings to come.
+/// A schema may declare a reserved number only as its fixed type — anything
+/// else would be read, overwritten or acted on by an engine under a name that
+/// says otherwise.
+pub const RESERVED_FIELD_MIN: u32 = 240;
+
+fn reserved_use_ok(number: u32, ty: CTy) -> bool {
+    match number {
+        253 => ty == CTy::Int,
+        254 => matches!(ty, CTy::Msg(..)),
+        255 => matches!(ty, CTy::Str | CTy::Bytes),
+        n => !(RESERVED_FIELD_MIN..=255).contains(&n),
+    }
 }
 
 /// A subexpression's type. Message identity is a span into the schema (canonical
@@ -103,7 +125,6 @@ pub enum CelcErr {
 pub enum CTy {
     Int,
     Uint,
-    Double,
     Bool,
     Str,
     Bytes,
@@ -115,22 +136,30 @@ fn cty_is_int(t: &CTy) -> bool {
     matches!(t, CTy::Int | CTy::Uint)
 }
 
+/// The result type of arithmetic on `a` and `b`: integers only.
+fn arith_ty(a: &CTy, b: &CTy) -> Result<CTy, CelcErr> {
+    if cty_is_int(a) && cty_is_int(b) {
+        Ok(CTy::Int)
+    } else {
+        Err(CelcErr::NotInteger)
+    }
+}
+
 /// Discriminant for a scalar `CTy` (carried in `NotAMessage` for rendering).
 pub fn cty_scalar_code(t: &CTy) -> u8 {
     match t {
         CTy::Int => 0,
         CTy::Uint => 1,
-        CTy::Double => 2,
-        CTy::Bool => 3,
-        CTy::Str => 4,
-        CTy::Bytes => 5,
-        CTy::Msg(..) => 6,
+        CTy::Bool => 2,
+        CTy::Str => 3,
+        CTy::Bytes => 4,
+        CTy::Msg(..) => 5,
     }
 }
 
 /// Compile `src` against the textual environment into flat checked IR written to
 /// `out`. Returns `(len, result_type)`. NO `RET` terminator is appended — see
-/// [`celc_compile_auto`] for the host-`compile` convention.
+/// [`celc_compile_auto`] for the scalar-terminator convention.
 pub fn celc_compile_ty(
     schema: &[u8],
     params: &[u8],
@@ -164,6 +193,11 @@ fn celc_compile_scoped(
     out: &mut [u8],
     receiver: bool,
 ) -> Result<(usize, CTy), CelcErr> {
+    // Every span is a u16; a longer buffer would wrap one and slice backwards.
+    let max = u16::MAX as usize;
+    if src.len() > max || schema.len() > max || params.len() > max {
+        return Err(CelcErr::Capacity);
+    }
     let mut p = Celc {
         schema,
         params,
@@ -174,6 +208,7 @@ fn celc_compile_scoped(
         depth: 0,
         locals: [None; CELC_MAX_LOCALS],
         nlocals: 0,
+        in_field: 0,
         receiver,
     };
     p.skip_ws();
@@ -199,8 +234,8 @@ pub fn celc_compile(
     Ok((n, matches!(ty, CTy::Msg(..))))
 }
 
-/// [`celc_compile`] plus the host `compile`/`encode_ir` scalar convention: a
-/// non-message result gets the `ir::RET` terminator appended.
+/// [`celc_compile`] plus the scalar-terminator convention: a non-message
+/// result gets the `ir::RET` terminator appended.
 pub fn celc_compile_auto(
     schema: &[u8],
     params: &[u8],
@@ -250,6 +285,9 @@ struct Celc<'a> {
     nlocals: usize,
     /// Parameter 0 is the implicit receiver ([`celc_compile_implicit`]).
     receiver: bool,
+    /// Non-zero while compiling a construction's FIELD VALUE: a construction
+    /// met there is a nested message, packed into its frame, not built.
+    in_field: usize,
 }
 
 impl Celc<'_> {
@@ -312,8 +350,25 @@ impl Celc<'_> {
         })
     }
 
-    /// Parse an unsigned decimal literal into i64 (host `str::parse` semantics:
-    /// overflow is `BadInteger`). `neg` folds the unary-minus literal case.
+    /// An integer literal (overflow is `BadInteger`). `neg` folds the unary-minus literal case. A fractional
+    /// literal (`1.5`) is a parse error: there are no non-integer numbers.
+    fn num_lit(&mut self, neg: bool) -> Result<(CTy, bool), CelcErr> {
+        self.skip_ws();
+        let start = self.pos;
+        let mut end = start;
+        while self.src.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if self.src.get(end) == Some(&b'.') && self.src.get(end + 1).is_some_and(u8::is_ascii_digit)
+        {
+            return Err(CelcErr::Parse(start as u16));
+        }
+        let v = self.int_lit(neg)?;
+        self.put1(ir::INT)?;
+        self.put(&v.to_le_bytes())?;
+        Ok((CTy::Int, false))
+    }
+
     fn int_lit(&mut self, neg: bool) -> Result<i64, CelcErr> {
         self.skip_ws();
         if !self.src.get(self.pos).is_some_and(u8::is_ascii_digit) {
@@ -332,8 +387,7 @@ impl Celc<'_> {
 
     // ---- expression grammar (each level emits post-order + returns type) --
     // The bool in the return is "the root of this subexpression is a message
-    // construction" — parens are transparent to it, exactly like the host's
-    // `matches!(value, Ast::Construct { .. })` on the parsed tree.
+    // construction" — parens are transparent to it.
 
     fn expr(&mut self) -> Result<(CTy, bool), CelcErr> {
         if self.depth >= CELC_MAX_DEPTH {
@@ -384,7 +438,7 @@ impl Celc<'_> {
         let (lt, root) = self.add_level()?;
         self.skip_ws();
         let rest = &self.src[self.pos..];
-        // Two-char forms first; lone `=` is a parse error (host parity). A
+        // Two-char forms first; lone `=` is a parse error. A
         // `!` here would be `!=` only — bare `!` cannot follow an operand.
         let (tag, len) = if rest.starts_with(b">=") {
             (ir::CMP_GE, 2)
@@ -404,8 +458,12 @@ impl Celc<'_> {
             return Ok((lt, root));
         };
         self.pos += len;
-        let (_rt, _) = self.add_level()?;
-        // Host `check_ast` compares ANY operand types — no check here either.
+        let (_rt, rroot) = self.add_level()?;
+        // Any operand types compare, but a construction is no operand: it
+        // ends the program with its message, so nothing after it would run.
+        if root || rroot {
+            return Err(CelcErr::NestedConstruction);
+        }
         self.put1(tag)?;
         Ok((CTy::Bool, false))
     }
@@ -430,11 +488,8 @@ impl Celc<'_> {
                 root = false;
                 continue;
             }
-            if !cty_is_int(&lt) || !cty_is_int(&rt) {
-                return Err(CelcErr::NotInteger);
-            }
+            lt = arith_ty(&lt, &rt)?;
             self.put1(tag)?;
-            lt = CTy::Int;
             root = false;
         }
         Ok((lt, root))
@@ -447,15 +502,14 @@ impl Celc<'_> {
                 ir::MUL
             } else if self.eat(b"/") {
                 ir::DIV
+            } else if self.eat(b"%") {
+                ir::REM
             } else {
                 break;
             };
             let (rt, _) = self.unary()?;
-            if !cty_is_int(&lt) || !cty_is_int(&rt) {
-                return Err(CelcErr::NotInteger);
-            }
+            lt = arith_ty(&lt, &rt)?;
             self.put1(tag)?;
-            lt = CTy::Int;
             root = false;
         }
         Ok((lt, root))
@@ -480,12 +534,10 @@ impl Celc<'_> {
                 Ok((CTy::Bool, false))
             }
             Some(b'-') => {
-                // Negative INTEGER LITERAL only, as in the host subset.
+                // A negative number LITERAL only: unary minus takes no
+                // other operand.
                 self.pos += 1;
-                let v = self.int_lit(true)?;
-                self.put1(ir::INT)?;
-                self.put(&v.to_le_bytes())?;
-                Ok((CTy::Int, false))
+                self.num_lit(true)
             }
             _ => self.primary(),
         }
@@ -493,12 +545,7 @@ impl Celc<'_> {
 
     fn primary(&mut self) -> Result<(CTy, bool), CelcErr> {
         let (ty, root) = match self.peek().ok_or(CelcErr::Parse(self.pos as u16))? {
-            b'0'..=b'9' => {
-                let v = self.int_lit(false)?;
-                self.put1(ir::INT)?;
-                self.put(&v.to_le_bytes())?;
-                Ok((CTy::Int, false))
-            }
+            b'0'..=b'9' => self.num_lit(false),
             b'"' => self.str_lit(),
             b'(' => {
                 self.pos += 1;
@@ -541,7 +588,7 @@ impl Celc<'_> {
         }
     }
 
-    /// String literal with the host's escape set: `\n` `\r` `\t`, anything else
+    /// String literal with the escape set `\n` `\r` `\t`; anything else
     /// escaped maps to itself. Emits `STR [len:u16][bytes]`.
     fn str_lit(&mut self) -> Result<(CTy, bool), CelcErr> {
         self.pos += 1; // opening quote
@@ -579,14 +626,43 @@ impl Celc<'_> {
         Ok((CTy::Str, false))
     }
 
+    /// `has(<param>.<field>…)` — CEL's presence macro. The argument must be a
+    /// field SELECTION (exactly one `PATH` token), as in CEL: presence is a
+    /// question about a field, not about a computed value. Compiles to the
+    /// path and one `HAS`, which is never an error: it is how a predicate asks
+    /// about absence instead of being made unknown by it.
+    fn has_macro(&mut self, name: Seg) -> Result<(CTy, bool), CelcErr> {
+        let mark = self.w;
+        self.depth += 1;
+        let r = self.expr();
+        self.depth -= 1;
+        r?;
+        let emitted = &self.out[mark..self.w];
+        let is_path = emitted.len() >= 3
+            && emitted[0] == ir::PATH
+            && emitted.len() == 3 + 4 * emitted[2] as usize
+            && emitted[2] > 0;
+        if !is_path {
+            return Err(CelcErr::BadCallArgs(name.s, name.e));
+        }
+        if !self.eat(b")") {
+            return Err(self.err_here());
+        }
+        self.put1(ir::HAS)?;
+        Ok((CTy::Bool, false))
+    }
+
     fn dotted_or_construct(&mut self) -> Result<(CTy, bool), CelcErr> {
         let mut segs = [Seg { s: 0, e: 0 }; CELC_MAX_SEGS];
         let first = self.ident().ok_or(CelcErr::Parse(self.pos as u16))?;
 
-        // Global function form: `ident(` — today only `size(x)`.
+        // Global function form: `ident(` — `size(x)`, `int(x)`, and CEL's `has(m.f)`.
         self.skip_ws();
         if self.src.get(self.pos) == Some(&b'(') {
             self.pos += 1;
+            if self.seg_bytes(first) == b"has" {
+                return self.has_macro(first);
+            }
             let rty = self.call_and_emit(NS_GLOBAL, first, None)?;
             return Ok((rty, false));
         }
@@ -610,10 +686,6 @@ impl Celc<'_> {
                         }
                         b"base64" => {
                             let rty = self.call_and_emit(NS_B64, seg, None)?;
-                            return Ok((rty, false));
-                        }
-                        b"json" => {
-                            let rty = self.call_and_emit(NS_JSON, seg, None)?;
                             return Ok((rty, false));
                         }
                         b"cel" => return self.cel_macro(seg),
@@ -718,7 +790,7 @@ impl Celc<'_> {
         match find_field(self.schema, body, self.seg_bytes(segs[0])) {
             Ok(Some(_)) => {}
             Ok(None) => return Ok(None),
-            Err(at) => return Err(CelcErr::BadSchema(at)),
+            Err(e) => return Err(e),
         }
         // The receiver has no source span; errors inside the path render from
         // the first field, which is what the author wrote.
@@ -784,15 +856,15 @@ impl Celc<'_> {
                     e: me,
                 },
             )?;
-            let (number, fty) = find_field(self.schema, body, self.seg_bytes(*seg))
-                .map_err(CelcErr::BadSchema)?
-                .ok_or(CelcErr::UnknownField {
+            let (number, fty) = find_field(self.schema, body, self.seg_bytes(*seg))?.ok_or(
+                CelcErr::UnknownField {
                     buf: mbuf,
                     msg_s: ms,
                     msg_e: me,
                     field_s: seg.s,
                     field_e: seg.e,
-                })?;
+                },
+            )?;
             numbers[i] = number;
             current = fty;
             path_e = seg.e;
@@ -818,8 +890,9 @@ impl Celc<'_> {
     /// Argument expressions are emitted in order — post-order stack layout,
     /// receiver (if any) already emitted deepest.
     fn call_and_emit(&mut self, ns: u8, name: Seg, recv: Option<CTy>) -> Result<CTy, CelcErr> {
-        // Three for a global/namespaced call (`json.setDefault(doc, path,
-        // raw)`); a method's receiver is not among them.
+        // No pinned overload takes more than two arguments (a method's
+        // receiver is not counted); a third slot lets an extra argument reach
+        // `resolve_builtin` and be reported as `BadCallArgs`.
         let mut args = [CTy::Int; 3];
         let mut nargs = 0usize;
         self.skip_ws();
@@ -858,7 +931,7 @@ impl Celc<'_> {
         Ok(rty)
     }
 
-    /// `cel.<name>(…)` macros — today only `cel.bind(x, init, result)`,
+    /// `cel.<name>(…)` macros — only `cel.bind(x, init, result)`,
     /// which stores `init` in a VM local and makes `x` name it inside
     /// `result`. Purely compiler machinery plus two opcodes; the binding is
     /// lexically scoped and shadowing is innermost-wins.
@@ -905,7 +978,7 @@ impl Celc<'_> {
     }
 
     fn construct(&mut self, type_segs: &[Seg]) -> Result<(CTy, bool), CelcErr> {
-        // The message must exist before any field is examined (host order).
+        // The message must exist before any field is examined.
         let src_span = (type_segs[0].s, type_segs[type_segs.len() - 1].e);
         let not_found = CelcErr::UnknownMessageType {
             buf: BUF_SRC,
@@ -919,29 +992,46 @@ impl Celc<'_> {
         )
         .ok_or(not_found)?;
 
+        // A construction that is itself a field's value is a NESTED message:
+        // its values stay on the stack and one PACK makes them its frame (the
+        // form a nested message takes across a frame boundary). Only the
+        // outermost construction builds the result.
+        let nested = self.in_field > 0;
+        let mut nums = [0u8; 32];
+        let mut n = 0usize;
         if !self.eat(b"}") {
             loop {
                 let fname = self.ident().ok_or(CelcErr::Parse(self.pos as u16))?;
                 if !self.eat(b":") {
                     return Err(self.err_here());
                 }
-                let (_vty, was_construct) = self.expr()?;
-                if was_construct {
-                    return Err(CelcErr::NestedConstruction);
-                }
-                let (number, _fty) = find_field(self.schema, body, self.seg_bytes(fname))
-                    .map_err(CelcErr::BadSchema)?
-                    .ok_or(CelcErr::UnknownField {
+                self.in_field += 1;
+                let r = self.expr();
+                self.in_field -= 1;
+                // A construction here is nested (packed, root flag clear),
+                // so the value is never a construction root.
+                r?;
+                let (number, _fty) = find_field(self.schema, body, self.seg_bytes(fname))?.ok_or(
+                    CelcErr::UnknownField {
                         buf: BUF_SCHEMA,
                         msg_s: name_span.0,
                         msg_e: name_span.1,
                         field_s: fname.s,
                         field_e: fname.e,
-                    })?;
-                // Field value types are NOT checked against the declaration —
-                // host parity (`check_construct` ignores the value's type).
-                self.put1(ir::SETFIELD)?;
-                self.put(&number.to_le_bytes())?;
+                    },
+                )?;
+                // Field value types are NOT checked against the declaration.
+                if nested {
+                    // A frame numbers its fields in one byte.
+                    if number > u8::MAX as u32 || n >= nums.len() {
+                        return Err(CelcErr::Capacity);
+                    }
+                    nums[n] = number as u8;
+                    n += 1;
+                } else {
+                    self.put1(ir::SETFIELD)?;
+                    self.put(&number.to_le_bytes())?;
+                }
                 if self.eat(b",") {
                     continue;
                 }
@@ -950,6 +1040,12 @@ impl Celc<'_> {
                 }
                 break;
             }
+        }
+        if nested {
+            self.put1(ir::PACK)?;
+            self.put1(n as u8)?;
+            self.put(&nums[..n])?;
+            return Ok((CTy::Msg(false, name_span.0, name_span.1), false));
         }
         self.put1(ir::FINISHMSG)?;
         Ok((CTy::Msg(false, name_span.0, name_span.1), true))
@@ -1041,7 +1137,6 @@ impl Celc<'_> {
         match &buf[s as usize..e as usize] {
             b"int" => CTy::Int,
             b"uint" => CTy::Uint,
-            b"double" => CTy::Double,
             b"bool" => CTy::Bool,
             b"str" => CTy::Str,
             b"bytes" => CTy::Bytes,
@@ -1090,10 +1185,9 @@ impl Celc<'_> {
 
 /// Call forms for [`resolve_builtin`].
 const NS_METHOD: u8 = 0; // recv.name(args)
-const NS_GLOBAL: u8 = 1; // name(args)         — `size`
+const NS_GLOBAL: u8 = 1; // name(args)         — `size`, `int`
 const NS_MATH: u8 = 2; // math.name(args)
 const NS_B64: u8 = 3; // base64.name(args)
-const NS_JSON: u8 = 4; // json.name(args)
 
 fn cty_stringish(t: &CTy) -> bool {
     matches!(t, CTy::Str | CTy::Bytes)
@@ -1138,12 +1232,12 @@ fn resolve_builtin(
         NS_METHOD => {
             let r = recv.ok_or(false)?;
             if !cty_stringish(r) {
-                // Every method today is string-ish; a known name on a wrong
+                // Every method takes a string-ish receiver; a known name on a wrong
                 // receiver is bad-args, an unknown name is unknown.
                 return match name {
                     b"size" | b"contains" | b"startsWith" | b"endsWith" | b"indexOf"
                     | b"lastIndexOf" | b"charAt" | b"substring" | b"trim" | b"reverse"
-                    | b"lowerAscii" | b"upperAscii" | b"replace" | b"part" => Err(true),
+                    | b"lowerAscii" | b"upperAscii" | b"replace" => Err(true),
                     _ => Err(false),
                 };
             }
@@ -1212,14 +1306,6 @@ fn resolve_builtin(
                     all_str(2)?;
                     Ok((b::REPLACE, *r))
                 }
-                // `list.part(",", i)`: the i-th delimited part — a policy's
-                // list walked at fixed positions, since a program has no loop.
-                b"part" => {
-                    if args.len() != 2 || !cty_stringish(&args[0]) || !cty_is_int(&args[1]) {
-                        return Err(true);
-                    }
-                    Ok((b::PART, *r))
-                }
                 _ => Err(false),
             }
         }
@@ -1227,6 +1313,13 @@ fn resolve_builtin(
             b"size" => {
                 all_str(1)?;
                 Ok((b::SIZE, CTy::Int))
+            }
+            // CEL's conversion to an integer.
+            b"int" => {
+                if args.len() != 1 || !(cty_is_int(&args[0]) || cty_stringish(&args[0])) {
+                    return Err(true);
+                }
+                Ok((b::INT_OF, CTy::Int))
             }
             _ => Err(false),
         },
@@ -1266,21 +1359,6 @@ fn resolve_builtin(
             b"bitShiftRight" => {
                 all_int(2)?;
                 Ok((b::BIT_SHR, CTy::Int))
-            }
-            _ => Err(false),
-        },
-        NS_JSON => match name {
-            b"get" => {
-                all_str(2)?;
-                Ok((b::JSON_GET, CTy::Str))
-            }
-            b"has" => {
-                all_str(2)?;
-                Ok((b::JSON_HAS, CTy::Bool))
-            }
-            b"setDefault" => {
-                all_str(3)?;
-                Ok((b::JSON_SET_DEFAULT, CTy::Str))
             }
             _ => Err(false),
         },
@@ -1443,8 +1521,14 @@ fn find_message(schema: &[u8], name: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Find `field:ty@N` in a message body. `Ok(None)` = no such field;
-/// `Err(offset)` = the body text itself is malformed at `offset`.
-fn find_field(schema: &[u8], body: (usize, usize), name: &[u8]) -> Result<Option<(u32, CTy)>, u16> {
+/// `BadSchema(offset)` = the body text itself is malformed at `offset`;
+/// `ReservedField` = the field takes a reserved number as the wrong type.
+fn find_field(
+    schema: &[u8],
+    body: (usize, usize),
+    name: &[u8],
+) -> Result<Option<(u32, CTy)>, CelcErr> {
+    let bad = |at: usize| CelcErr::BadSchema(at as u16);
     let mut pos = body.0;
     loop {
         skip_ws_at(schema, &mut pos);
@@ -1452,36 +1536,40 @@ fn find_field(schema: &[u8], body: (usize, usize), name: &[u8]) -> Result<Option
             return Ok(None);
         }
         let fs = pos;
-        let fe = scan_ident(schema, &mut pos).ok_or(pos as u16)?;
+        let fe = scan_ident(schema, &mut pos).ok_or(bad(pos))?;
         skip_ws_at(schema, &mut pos);
         if schema.get(pos) != Some(&b':') {
-            return Err(pos as u16);
+            return Err(bad(pos));
         }
         pos += 1;
         skip_ws_at(schema, &mut pos);
         let ts = pos;
-        let te = scan_dotted(schema, &mut pos).ok_or(pos as u16)?;
+        let te = scan_dotted(schema, &mut pos).ok_or(bad(pos))?;
         skip_ws_at(schema, &mut pos);
         if schema.get(pos) != Some(&b'@') {
-            return Err(pos as u16);
+            return Err(bad(pos));
         }
         pos += 1;
         skip_ws_at(schema, &mut pos);
+        let ns = pos;
         let mut number: u32 = 0;
         let mut any = false;
         while let Some(c) = schema.get(pos).filter(|c| c.is_ascii_digit()) {
             number = number
                 .checked_mul(10)
                 .and_then(|n| n.checked_add((c - b'0') as u32))
-                .ok_or(pos as u16)?;
+                .ok_or(bad(pos))?;
             pos += 1;
             any = true;
         }
         if !any {
-            return Err(pos as u16);
+            return Err(bad(pos));
         }
         if &schema[fs..fe] == name {
             let ty = resolve_schema_type(schema, ts, te);
+            if !reserved_use_ok(number, ty) {
+                return Err(CelcErr::ReservedField(ns as u16));
+            }
             return Ok(Some((number, ty)));
         }
         skip_ws_at(schema, &mut pos);
@@ -1492,7 +1580,7 @@ fn find_field(schema: &[u8], body: (usize, usize), name: &[u8]) -> Result<Option
         if pos >= body.1 {
             return Ok(None);
         }
-        return Err(pos as u16);
+        return Err(bad(pos));
     }
 }
 
@@ -1501,7 +1589,6 @@ fn resolve_schema_type(schema: &[u8], s: usize, e: usize) -> CTy {
     match &schema[s..e] {
         b"int" => CTy::Int,
         b"uint" => CTy::Uint,
-        b"double" => CTy::Double,
         b"bool" => CTy::Bool,
         b"str" => CTy::Str,
         b"bytes" => CTy::Bytes,

@@ -7,8 +7,8 @@
 # The applet's GRAPH is driven directly (argv after `--`, exactly as `cli_in`
 # delivers it) rather than through `fluxor install` + `fluxor exec`. Install
 # writes a fixed bundle path (`target/fluxor/chronicle`) and mutates the global
-# applet registry, so two concurrent runs reinstall over each other mid-exec —
-# observed as a command returning nothing. The install/exec plumbing is fluxor's
+# applet registry, so two concurrent runs would reinstall over each other
+# mid-exec. The install/exec plumbing is fluxor's
 # to test; what chronicle owns is the applet's behaviour, and this drives it
 # with the same isolation every other case uses.
 . "$(dirname "$0")/../lib.sh"
@@ -78,11 +78,33 @@ else
   no "cli decision" "got='$got'"
 fi
 
+# `decide` runs ONE record through that container — the decision module's own
+# decode → run_decision → encode path. A hit, the default, and a record LACKING
+# the field the predicate reads, which must fail closed and say why (on device
+# it bumps inputs_failed and its errors_absent split).
+got=$(cli decide "$want" 0103010800dc05000000000000 2>/dev/null)
+if [ "$got" = "rule 0 01020108000100000000000000" ]; then
+  ok "cli decide fires the matching rule and prints its outcome frame"
+else
+  no "cli decide hit" "got='$got'"
+fi
+got=$(cli decide "$want" 01030108000500000000000000 2>/dev/null)
+if [ "$got" = "default 01020108000000000000000000" ]; then
+  ok "cli decide falls to the default"
+else
+  no "cli decide default" "got='$got'"
+fi
+if got=$(cli decide "$want" 01040108000100000000000000 2>&1); then
+  no "cli decide absent" "exited 0: '$got'"
+elif want "$got" "absent field"; then
+  ok "cli decide fails closed on an absent field and names the failure"
+else
+  no "cli decide absent" "got='$got'"
+fi
+
 # Aggregation authoring on device: key/event-time/emit programs plus the
 # operator set, assembled into the IR-def container the engine lowers at load.
-# Pinned against AGGREGATION_IR_DEF (regenerate: cargo test -p chronicle-canonical
-# --test pack print_ir_example_params -- --nocapture) — the very param
-# examples/aggregation/linux.yaml ships.
+# Pinned to the `ir_def` param every examples/aggregation/ graph ships.
 AS='Order{customer_id:str@1,created_at:int@2,amount:int@3};St{order_count:int@1,gross_total:int@2};Win{start:int@1,end:int@2};Ctx{key:str@1,state:St@2,window:Win@3};CustomerTotal{customer_id:str@1,order_count:int@2,gross_total:int@3,window_start:int@4,window_end:int@5}'
 K=$(cli compile "$AS" 'order:Order' 'order.customer_id' 2>/dev/null)
 T=$(cli compile "$AS" 'order:Order' 'order.created_at' 2>/dev/null)
@@ -91,10 +113,33 @@ E=$(cli compile "$AS" 'ctx:Ctx' 'CustomerTotal{ customer_id: ctx.key, order_coun
 got=$(cli agg 100 10 64 0 0 "$K" "$T" "$E" '0:' "1:$A" 2>/dev/null)
 want=64000000000000000a00000000000000400000000000000000000000000000000000000008000500010100000014080005000102000000144d000500010100000012010000000500020200000001000000120200000005000202000000020000001203000000050002030000000100000012040000000500020300000002000000120500000013020000000108000500010300000014
 if [ "$got" = "$want" ]; then
-  ok "cli agg reproduces the host toolchain's ir_def container"
+  ok "cli agg reproduces the pinned ir_def container"
 else
   no "cli agg" "got='$got'"
 fi
+
+# TopK and Quantile carry their parameter after the kind byte (`6/3` is k = 3),
+# and a pane holds one collection cell, so a second Distinct/TopK/Quantile is
+# refused here rather than by the engine at load.
+# The same container with TopK(3) in Sum's place. The operator section is its
+# tail — `02` operators, Count (`00`, empty selector `0000`), then Sum (`01`)
+# with its selector — and TopK writes `06` followed by k as a u16 LE, `0300`.
+ops_sum=020000000108000500010300000014
+ops_topk=0200000006030008000500010300000014
+want_topk=${want%"$ops_sum"}$ops_topk
+[ "${want%"$ops_sum"}" != "$want" ] || no "cli agg topk" "the pinned container no longer ends in its operators"
+got=$(cli agg 100 10 64 0 0 "$K" "$T" "$E" '0:' "6/3:$A" 2>/dev/null)
+if [ "$got" = "$want_topk" ]; then
+  ok "cli agg writes a TopK's k after its kind"
+else
+  no "cli agg topk" "want '$want_topk', got '$got'"
+fi
+got=$(cli agg 100 10 64 0 0 "$K" "$T" "$E" "5:$A" "6/3:$A" 2>/dev/null)
+case "$got" in
+  "error: at most one distinct (5), topk (6) or quantile (7) operator"*)
+    ok "cli agg refuses a second collection operator" ;;
+  *) no "cli agg collections" "got='$got'" ;;
+esac
 
 # ARTEFACT IDENTITY ON DEVICE: compile a source and seal it into a canonical
 # Expression artefact, entirely in the applet. The digest is the sha256 of the

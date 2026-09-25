@@ -8,8 +8,6 @@ hardware_targets = ["bcm2712", "rp2040", "rp2350"]
 timer_class     = "agnostic"
 
 
-# Input: one typed record frame (see pipeline_core.rs). The decision evaluates
-# its first-hit rules over this record.
 # Feature-set variants. The pinned CEL extension surface
 # (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
 # LEVEL — strings, math, encoders, bindings — so a variant can compose
@@ -23,6 +21,8 @@ name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
 default  = true
 
+# Input: one typed record frame (see pipeline_core.rs). The decision evaluates
+# its first-hit rules over this record.
 [[ports]]
 name         = "record_in"
 direction    = "input"
@@ -42,8 +42,10 @@ buffer_size  = { default = 4096, rp2040 = 512 }
 [observability]
 # Baseline accounting (ids 0..13, canonical order) front-loaded so index == id,
 # then decision's own instruments: `module_mode`, the init/reload fault flag,
-# the two failure-reason splits that refine `inputs_failed`, and the `Fired` audit
-# — `no_match` count and `last_rule` (0xFFFF = the default).
+# the failure-reason splits that refine `inputs_failed`, and the `Fired` audit
+# — `no_match` count and `last_rule` (0xFFFF = the default). `errors_absent`
+# (appended: ids are wire positions) counts predicates an absent field left
+# unknown.
 metrics = [
     "bytes_in", "bytes_out",
     "inputs_observed", "inputs_admitted", "inputs_rejected",
@@ -51,4 +53,5 @@ metrics = [
     "outputs_generated", "outputs_delivered", "outputs_pending", "outputs_failed",
     "pending_output_bytes",
     "module_mode", "faulted", "errors_frame", "errors_encode", "no_match", "last_rule", "work_units",
+    "errors_absent",
 ]

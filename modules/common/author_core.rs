@@ -30,22 +30,27 @@ pub fn parse_i64(b: &[u8]) -> Option<i64> {
 
 /// Split a NUL-separated argv record into `(start, end)` spans over `rec`.
 ///
+/// `cli_in` NUL-JOINS the arguments (no terminator), so every piece is an
+/// argument — an empty one included. Dropping empty pieces would shift every
+/// later argument into the wrong position. An empty record is no arguments.
+///
 /// Returns the number of arguments PRESENT, not the number stored: arguments
 /// past `MAX_ARGV` are counted and not written, so a caller comparing the
 /// result against `MAX_ARGV` refuses an over-long argv rather than acting on a
 /// silently truncated one. Same discipline as `split_on`.
 pub fn split_argv(rec: &[u8], out: &mut [(usize, usize); MAX_ARGV]) -> usize {
+    if rec.is_empty() {
+        return 0;
+    }
     let mut n = 0;
     let mut start = 0;
     let mut i = 0;
     while i <= rec.len() {
         if i == rec.len() || rec[i] == 0 {
-            if i > start {
-                if n < out.len() {
-                    out[n] = (start, i);
-                }
-                n += 1;
+            if n < out.len() {
+                out[n] = (start, i);
             }
+            n += 1;
             start = i + 1;
         }
         i += 1;
@@ -53,27 +58,35 @@ pub fn split_argv(rec: &[u8], out: &mut [(usize, usize); MAX_ARGV]) -> usize {
     n
 }
 
-pub fn celc_err_name(e: CelcErr) -> &'static [u8] {
+/// Append a `CelcErr`'s stable name. Each arm appends its own literal: a
+/// `match` RETURNING literals can lower to a `.rodata` table of fat pointers,
+/// which a PIC build does not relocate.
+pub fn append_celc_err(out: &mut [u8], at: usize, e: CelcErr) -> usize {
     use CelcErr as E;
     match e {
-        E::Empty => b"empty source",
-        E::Parse(_) => b"parse error",
-        E::BadInteger => b"integer out of range",
-        E::Trailing => b"trailing input",
-        E::UnknownName(..) => b"unknown name",
-        E::UnknownParam(..) => b"unknown parameter",
-        E::UnknownField { .. } => b"unknown field",
-        E::UnknownMessageType { .. } => b"unknown message type",
-        E::NotAMessage { .. } => b"selected into a non-message",
-        E::NotBool => b"operand is not bool",
-        E::NotInteger => b"operand is not integer",
-        E::NestedConstruction => b"nested construction",
-        E::Depth => b"expression too deep",
-        E::Capacity => b"input too large",
-        E::BadSchema(_) => b"malformed schema",
-        E::UnknownFunction(..) => b"unknown function",
-        E::BadCallArgs(..) => b"bad call arguments",
-        E::LocalDepth => b"cel.bind nesting too deep",
+        E::Empty => append(out, at, b"empty source"),
+        E::Parse(_) => append(out, at, b"parse error"),
+        E::BadInteger => append(out, at, b"integer out of range"),
+        E::Trailing => append(out, at, b"trailing input"),
+        E::UnknownName(..) => append(out, at, b"unknown name"),
+        E::UnknownParam(..) => append(out, at, b"unknown parameter"),
+        E::UnknownField { .. } => append(out, at, b"unknown field"),
+        E::UnknownMessageType { .. } => append(out, at, b"unknown message type"),
+        E::NotAMessage { .. } => append(out, at, b"selected into a non-message"),
+        E::NotBool => append(out, at, b"operand is not bool"),
+        E::NotInteger => append(out, at, b"operand is not integer"),
+        E::NestedConstruction => append(out, at, b"nested construction"),
+        E::Depth => append(out, at, b"expression too deep"),
+        E::Capacity => append(out, at, b"input too large"),
+        E::BadSchema(_) => append(out, at, b"malformed schema"),
+        E::UnknownFunction(..) => append(out, at, b"unknown function"),
+        E::BadCallArgs(..) => append(out, at, b"bad call arguments"),
+        E::LocalDepth => append(out, at, b"cel.bind nesting too deep"),
+        E::ReservedField(_) => append(
+            out,
+            at,
+            b"reserved field number (240..=255) used other than as its fixed type",
+        ),
     }
 }
 
@@ -94,7 +107,9 @@ pub fn put_prog(cont: &mut [u8], w: &mut usize, code: &[u8], cost: u64) -> bool 
 }
 
 pub fn put_ir_prog(cont: &mut [u8], w: &mut usize, ir: &[u8]) -> bool {
-    if *w + 2 + ir.len() > cont.len() {
+    // Same two-byte length prefix as `put_prog`: a longer program is refused
+    // rather than wrapped into a length that mis-frames the rest.
+    if ir.len() > u16::MAX as usize || *w + 2 + ir.len() > cont.len() {
         return false;
     }
     cont[*w..*w + 2].copy_from_slice(&(ir.len() as u16).to_le_bytes());
@@ -241,6 +256,42 @@ const _: () = assert!(BIN_BUF >= MAX_CONTAINER_BIN_FULL);
 /// costs state and not a PIC frame.
 pub const MAX_RULE: usize = 32;
 
+/// Stages in ONE pipeline declaration. `author` (which seals the Pipeline)
+/// and `graph` (which lowers it) share this bound, so a pipeline one accepts
+/// the other does too.
+pub const MAX_PIPELINE_STAGES: usize = 16;
+
+/// `error:` for a pipeline declaring more than [`MAX_PIPELINE_STAGES`].
+fn too_many_stages(out: &mut [u8]) -> (usize, i32) {
+    let mut p = append(out, 0, b"error: a pipeline declares at most ");
+    p = append_u32(out, p, MAX_PIPELINE_STAGES as u32);
+    (append(out, p, b" stages\n"), 1)
+}
+
+/// `error:` for a run of compute and map stages longer than one pipeline node
+/// runs: the run lowers to one node, which runs at most `MAX_NODE_STAGES`.
+fn run_too_long(out: &mut [u8]) -> (usize, i32) {
+    let mut p = append(out, 0, b"error: a pipeline node runs at most ");
+    p = append_u32(out, p, MAX_NODE_STAGES as u32);
+    (append(out, p, b" consecutive compute or map stages\n"), 1)
+}
+
+/// `error:` for a stage calling a plain expression. An expression yields a
+/// value, not a record, so a stage calls a transformation, map or decision,
+/// or names a resource.
+fn stage_calls_expression(out: &mut [u8], target: &[u8]) -> (usize, i32) {
+    let mut p = append(out, 0, b"error: stage calls expression '");
+    p = append(out, p, target);
+    (
+        append(
+            out,
+            p,
+            b"'; a stage calls a transformation, map or decision, or names a resource\n",
+        ),
+        1,
+    )
+}
+
 /// Bytecode one arm's `when` or outcome program may compile to.
 ///
 /// 512 bytes because the long arm is not the predicate but the outcome: a
@@ -295,9 +346,7 @@ pub fn emit_hex_buf(cont: &[u8], w: usize, out: &mut [u8]) -> (usize, i32) {
 
 pub fn lower_arg_buf(hex: &[u8], ir: &mut [u8], code: &mut [u8]) -> Option<(usize, u64)> {
     let ilen = hex_decode(hex, ir)?;
-    let mut irc = [0u8; BIN_BUF];
-    irc[..ilen].copy_from_slice(&ir[..ilen]);
-    lower_flat(&irc[..ilen], code).ok()
+    lower_flat(&ir[..ilen], code).ok()
 }
 
 pub fn compile_to_code_buf(
@@ -312,7 +361,7 @@ pub fn compile_to_code_buf(
         Ok(n) => n,
         Err(e) => {
             let mut p = append(out, 0, b"error: compile failed: ");
-            p = append(out, p, celc_err_name(e));
+            p = append_celc_err(out, p, e);
             p = append(out, p, b"\n");
             return Err(p);
         }
@@ -414,19 +463,156 @@ pub fn agg_kind_to_op(kind: u8) -> i32 {
         _ => OP_QUANTILE,
     }
 }
-pub fn declared_kind(arena: &UprocArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> i32 {
+/// The kind a LOCAL declaration named `symbol` was declared as, or `None`
+/// when the document declares nothing by that name. A map's predicate is
+/// sealed as an Expression; the iteration is the calling Stage's MapSpec.
+pub fn declared_kind(arena: &UprocArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<i32> {
+    for i in 0..doc.n_expressions {
+        if arena.expressions[i].name.of(src) == symbol {
+            return Some(KIND_EXPRESSION);
+        }
+    }
     for i in 0..doc.n_transformations {
         if arena.transformations[i].name.of(src) == symbol {
-            return KIND_TRANSFORMATION;
+            return Some(KIND_TRANSFORMATION);
         }
     }
     for i in 0..doc.n_decisions {
         if arena.decisions[i].name.of(src) == symbol {
-            return KIND_DECISION;
+            return Some(KIND_DECISION);
         }
     }
-    KIND_EXPRESSION
+    if find_map(arena, doc, src, symbol).is_some() {
+        return Some(KIND_EXPRESSION);
+    }
+    None
 }
+
+/// The local symbol a stage target names: the bare name, or `<pkg>.<name>`
+/// for this document's own package. `None` for a name in another package,
+/// which a document cannot resolve (and so cannot type or lower).
+pub fn local_target<'a>(target: &'a [u8], pkg: &[u8]) -> Option<&'a [u8]> {
+    let (tp, ts) = split_qname(target);
+    if tp.is_empty() || tp == pkg {
+        Some(ts)
+    } else {
+        None
+    }
+}
+
+/// The map declaration named `symbol`, if the document declares one.
+pub fn find_map(arena: &UprocArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<MapDecl> {
+    (0..doc.n_maps)
+        .map(|i| arena.maps[i])
+        .find(|m| m.name.of(src) == symbol)
+}
+
+/// The parameters a map's predicate is compiled against: its element and the
+/// record — `e:E,r:T`, in the order the map stage passes them.
+pub fn map_params_text(src: &[u8], d: &MapDecl, out: &mut [u8]) -> Result<usize, ()> {
+    let mut p = 0usize;
+    let put = |b: &[u8], out: &mut [u8], p: &mut usize| -> Result<(), ()> {
+        let dst = out.get_mut(*p..*p + b.len()).ok_or(())?;
+        for (x, y) in dst.iter_mut().zip(b.iter()) {
+            *x = *y;
+        }
+        *p += b.len();
+        Ok(())
+    };
+    put(d.elem_name.of(src), out, &mut p)?;
+    put(b":", out, &mut p)?;
+    put(schema_type_name(d.elem_type.of(src)), out, &mut p)?;
+    put(b",", out, &mut p)?;
+    put(d.param_name.of(src), out, &mut p)?;
+    put(b":", out, &mut p)?;
+    put(schema_type_name(d.param_type.of(src)), out, &mut p)?;
+    Ok(p)
+}
+
+/// Check a map declaration against the schema and return its container
+/// header `[over][max][out_true][out_false][out_unknown]` (see
+/// `pipeline_core::MAP_HEADER`). `author` and `graph` both call this, so the
+/// two accept and refuse exactly the same maps.
+///
+/// Refused rather than lowered to something else:
+/// * `over`/`count` naming a parameter other than the map's own;
+/// * a `max` outside `1..=255` (the header holds it in one byte);
+/// * a result type other than the parameter type (the stage emits the record
+///   it read, with its counts filled in);
+/// * an `over` field that is not a message, or whose message is not the
+///   declared element type — the predicate would read one message's fields
+///   by another's numbers;
+/// * a count field that is not an int, or two counts naming the same field;
+/// * any field number above 255 (each header slot is one byte).
+pub fn map_validate(schema: &[u8], src: &[u8], d: &MapDecl) -> Result<[u8; MAP_HEADER], ()> {
+    let pn = d.param_name.of(src);
+    if d.over_param.of(src) != pn
+        || d.count_params.iter().any(|c| c.of(src) != pn)
+        || d.max < 1
+        || d.max > u8::MAX as i64
+        || d.result_type.of(src) != d.param_type.of(src)
+    {
+        return Err(());
+    }
+    let body = find_message(schema, schema_type_name(d.param_type.of(src))).ok_or(())?;
+    let field = |name: &[u8]| -> Result<(u8, CTy), ()> {
+        let (n, ty) = find_field(schema, body, name).map_err(|_| ())?.ok_or(())?;
+        if n > u8::MAX as u32 {
+            return Err(());
+        }
+        Ok((n as u8, ty))
+    };
+    let (over, over_ty) = field(d.over.of(src))?;
+    let CTy::Msg(false, ms, me) = over_ty else {
+        return Err(());
+    };
+    if schema.get(ms as usize..me as usize) != Some(schema_type_name(d.elem_type.of(src))) {
+        return Err(());
+    }
+    let mut hdr = [over, d.max as u8, 0, 0, 0];
+    for k in 0..3 {
+        let (n, ty) = field(d.counts[k].of(src))?;
+        if ty != CTy::Int {
+            return Err(());
+        }
+        hdr[2 + k] = n;
+    }
+    if hdr[2] == hdr[3] || hdr[2] == hdr[4] || hdr[3] == hdr[4] {
+        return Err(());
+    }
+    Ok(hdr)
+}
+
+/// Build a map stage's container (`pipeline_core::MAP_HEADER` then the
+/// lowered predicate) from its declaration, after [`map_validate`].
+pub fn map_container(
+    schema: &[u8],
+    src: &[u8],
+    d: &MapDecl,
+    st_ir: &mut [u8],
+    out: &mut [u8],
+) -> Result<usize, ()> {
+    let hdr = map_validate(schema, src, d)?;
+    let mut params = [0u8; 256];
+    let pl = map_params_text(src, d, &mut params)?;
+    let code = out.get_mut(MAP_HEADER + 6..).ok_or(())?;
+    let (clen, cost) = compile_one(schema, &params[..pl], d.when.of(src), st_ir, code)?;
+    if clen > u16::MAX as usize {
+        return Err(());
+    }
+    let head = out.get_mut(..MAP_HEADER + 6).ok_or(())?;
+    for (x, y) in head.iter_mut().zip(hdr.iter()) {
+        *x = *y;
+    }
+    // The cost narrowing is proven at compile time in `lower_core`.
+    let c = (cost as u32).to_le_bytes();
+    let l = (clen as u16).to_le_bytes();
+    for (x, y) in head[MAP_HEADER..].iter_mut().zip(c.iter().chain(l.iter())) {
+        *x = *y;
+    }
+    Ok(MAP_HEADER + 6 + clen)
+}
+
 pub fn append_uproc_reason(out: &mut [u8], at: usize, k: UprocErrorKind) -> usize {
     match k {
         UprocErrorKind::ExpectedModule => append(out, at, b"expected a `module` header"),
@@ -444,6 +630,19 @@ pub fn append_uproc_reason(out: &mut [u8], at: usize, k: UprocErrorKind) -> usiz
         }
         UprocErrorKind::MissingClause => append(out, at, b"a required clause is missing"),
         UprocErrorKind::TooMany => append(out, at, b"too many declarations for this node"),
+        UprocErrorKind::DuplicateClause => {
+            append(out, at, b"a clause appears twice in one declaration")
+        }
+        UprocErrorKind::DuplicateName => append(out, at, b"two declarations share a name"),
+        UprocErrorKind::OutOfRange => append(out, at, b"integer out of range for its field"),
+        UprocErrorKind::UnsupportedType => {
+            append(out, at, b"unsupported type (no double/float scalar)")
+        }
+        UprocErrorKind::TooManyCollections => append(
+            out,
+            at,
+            b"at most one distinct, topk or quantile operator per aggregation",
+        ),
     }
 }
 
@@ -551,6 +750,7 @@ pub fn author_document(
                 &ExpressionSpec {
                     param_name: d.param_name.of(src),
                     param_message: param_message_name(d.param_type.of(src)),
+                    more_params: &[],
                     result_type: d.result_type.of(src),
                     source: d.body.of(src),
                     bytecode: &code[..clen],
@@ -584,6 +784,71 @@ pub fn author_document(
         } else {
             KIND_TRANSFORMATION
         };
+        nrefs += 1;
+        out_p = emit(&mut *st_out, out_p, d.name.of(src), &digest);
+    }
+
+    // ---- Maps: the predicate is an Expression over (element, record); the
+    //      iteration is the calling Stage's MapSpec ----------------------
+    for i in 0..doc.n_maps {
+        let d = arena.maps[i];
+        // The same check `graph` applies, so the two commands accept and
+        // refuse the same documents.
+        if map_validate(&st_prog[..slen], src, &d).is_err() {
+            let mut p = append(&mut *st_out, 0, b"error: map '");
+            p = append(&mut *st_out, p, d.name.of(src));
+            return (
+                append(&mut *st_out, p, b"' is invalid against the schema\n"),
+                1,
+            );
+        }
+        let mut params = [0u8; 256];
+        let Ok(plen) = map_params_text(src, &d, &mut params) else {
+            return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
+        };
+        let mut code = [0u8; 512];
+        let (clen, cost) = match compile_one(
+            &st_prog[..slen],
+            &params[..plen],
+            d.when.of(src),
+            &mut *st_code,
+            &mut code,
+        ) {
+            Ok(v) => v,
+            Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+        };
+        let header = HeaderSpec {
+            package: pkg,
+            symbol: d.name.of(src),
+            kind: KIND_EXPRESSION,
+            capability: b"expression.cel.strict.v1",
+        };
+        let record_param = [(
+            d.param_name.of(src),
+            param_message_name(d.param_type.of(src)),
+        )];
+        let Ok((_, digest)) = seal_expression(
+            &mut *st_cont,
+            &mut *st_scratch,
+            &header,
+            &ExpressionSpec {
+                param_name: d.elem_name.of(src),
+                param_message: param_message_name(d.elem_type.of(src)),
+                more_params: &record_param,
+                result_type: b"bool",
+                source: d.when.of(src),
+                bytecode: &code[..clen],
+                max_cost: cost,
+            },
+        ) else {
+            return (append(&mut *st_out, 0, b"error: seal failed\n"), 1);
+        };
+        if nrefs >= MAX_ART {
+            return (append(&mut *st_out, 0, b"error: too many artefacts\n"), 1);
+        }
+        rdigest[nrefs] = digest;
+        rsym[nrefs] = d.name.of(src);
+        rkind[nrefs] = KIND_EXPRESSION;
         nrefs += 1;
         out_p = emit(&mut *st_out, out_p, d.name.of(src), &digest);
     }
@@ -700,7 +965,7 @@ pub fn author_document(
                 default_source: d.default.of(src),
                 default_code: &dcode[..dlen],
                 default_cost: dcost,
-                // The host always seals decisions explainable; it is part of the
+                // Decisions are always sealed explainable; the flag is part of the
                 // artefact and therefore of its identity.
                 explain: true,
             },
@@ -722,13 +987,11 @@ pub fn author_document(
     //      embed logic, so nothing here is compiled --------------------------
     for i in 0..doc.n_pipelines {
         let pl = arena.pipelines[i];
-        const MAX_ST: usize = 8;
-        if pl.n_stages as usize > MAX_ST {
-            return (
-                append(&mut *st_out, 0, b"error: too many stages for this node\n"),
-                1,
-            );
+        if pl.n_stages as usize > MAX_PIPELINE_STAGES {
+            return too_many_stages(&mut *st_out);
         }
+        // Consecutive compute and map stages so far: they lower to one node.
+        let mut run = 0usize;
         let mut stages = [StageSpec {
             name: b"",
             target_package: b"",
@@ -736,7 +999,8 @@ pub fn author_document(
             target_kind: KIND_EXPRESSION,
             operation: b"",
             argument: b"",
-        }; MAX_ST];
+            map: None,
+        }; MAX_PIPELINE_STAGES];
         for (k, st) in arena
             .stages
             .iter()
@@ -746,19 +1010,61 @@ pub fn author_document(
         {
             let st = *st;
             let target = st.target.of(src);
-            let (tp, ts) = split_qname(target);
+            // An EFFECT targets a Resource; a `call` targets an artefact this
+            // document declares, which is the only way its kind is known.
+            let (target_symbol, target_kind, map) = if st.kind == STAGE_EFFECT {
+                (split_qname(target).1, KIND_RESOURCE, None)
+            } else {
+                let resolved = local_target(target, pkg)
+                    .and_then(|ts| declared_kind(&*arena, &doc, src, ts).map(|k| (ts, k)));
+                let Some((ts, kind)) = resolved else {
+                    let mut p = append(&mut *st_out, 0, b"error: unknown artefact '");
+                    p = append(&mut *st_out, p, target);
+                    return (append(&mut *st_out, p, b"'\n"), 1);
+                };
+                // A call on a `map` carries the declared iteration; the call
+                // itself targets the map's sealed predicate expression.
+                let map = find_map(&*arena, &doc, src, ts).map(|m| MapStageSpec {
+                    over: m.over.of(src),
+                    max: m.max as u64,
+                    count_true: m.counts[0].of(src),
+                    count_false: m.counts[1].of(src),
+                    count_unknown: m.counts[2].of(src),
+                });
+                (ts, kind, map)
+            };
+            if target_kind == KIND_EXPRESSION && map.is_none() {
+                return stage_calls_expression(&mut *st_out, target);
+            }
+            // A decision or an effect ends the run; the graph gives each its
+            // own node.
+            run = if st.kind == STAGE_EFFECT || target_kind == KIND_DECISION {
+                0
+            } else {
+                run + 1
+            };
+            if run > MAX_NODE_STAGES {
+                return run_too_long(&mut *st_out);
+            }
+            // A Stage carries ONE binding; a call naming more arguments would
+            // be sealed as a different call.
+            if st.n_args > 1 {
+                return (
+                    append(
+                        &mut *st_out,
+                        0,
+                        b"error: a call takes exactly one argument\n",
+                    ),
+                    1,
+                );
+            }
             stages[k] = StageSpec {
                 name: st.name.of(src),
-                target_package: if tp.is_empty() { pkg } else { tp },
-                target_symbol: ts,
-                // An EFFECT targets a Resource; only a `call` targets an
-                // artefact whose kind the document declares.
-                target_kind: if st.kind == STAGE_EFFECT {
-                    KIND_RESOURCE
-                } else {
-                    declared_kind(&*arena, &doc, src, ts)
-                },
+                target_package: pkg,
+                target_symbol,
+                target_kind,
                 operation: st.operation.of(src),
+                map,
                 argument: if st.arg0.is_empty() {
                     if st.n_args > 0 {
                         arena.args[st.first_arg as usize].of(src)
@@ -791,12 +1097,13 @@ pub fn author_document(
         ) else {
             return (append(&mut *st_out, 0, b"error: seal failed\n"), 1);
         };
-        if nrefs < MAX_ART {
-            rdigest[nrefs] = digest;
-            rsym[nrefs] = pl.name.of(src);
-            rkind[nrefs] = KIND_PIPELINE;
-            nrefs += 1;
+        if nrefs >= MAX_ART {
+            return (append(&mut *st_out, 0, b"error: too many artefacts\n"), 1);
         }
+        rdigest[nrefs] = digest;
+        rsym[nrefs] = pl.name.of(src);
+        rkind[nrefs] = KIND_PIPELINE;
+        nrefs += 1;
         out_p = emit(&mut *st_out, out_p, pl.name.of(src), &digest);
     }
 
@@ -898,6 +1205,7 @@ pub fn author_document(
             selector_source: b"",
             selector_code: b"",
             selector_cost: 0,
+            parameter: 0,
         }; MAX_OP];
         for k in 0..ag.n_ops as usize {
             let o = arena.operators[ag.first_op as usize + k];
@@ -907,6 +1215,7 @@ pub fn author_document(
                 selector_source: o.selector.of(src),
                 selector_code: &scode[k][..slen_op[k]],
                 selector_cost: scost[k],
+                parameter: o.param as u64,
             };
         }
 
@@ -940,7 +1249,13 @@ pub fn author_document(
                 time_source: ag.event_time.of(src),
                 time_code: &tcode[..tlen],
                 time_cost: tcost,
+                // Non-negative: the parser refuses anything else.
                 window_size_ms: ag.window_size_ms as u64,
+                window_step_ms: if ag.window_kind == WINDOW_SLIDING {
+                    ag.window_step_ms as u64
+                } else {
+                    0
+                },
                 lateness_ms: ag.lateness_ms as u64,
                 guard_ms: ag.guard_ms as u64,
                 emit_source: ag.emit.of(src),
@@ -948,19 +1263,21 @@ pub fn author_document(
                 emit_cost: ecost,
                 max_lanes: ag.max_lanes,
                 // The warn threshold is derived, not authored: three quarters of
-                // the ceiling. It is sealed, so it is part of the identity.
-                warn_lanes: ag.max_lanes * 3 / 4,
+                // the ceiling, computed without overflowing it. It is sealed, so
+                // it is part of the identity.
+                warn_lanes: ag.max_lanes - ag.max_lanes / 4,
             },
             &ops[..ag.n_ops as usize],
         ) else {
             return (append(&mut *st_out, 0, b"error: seal failed\n"), 1);
         };
-        if nrefs < MAX_ART {
-            rdigest[nrefs] = digest;
-            rsym[nrefs] = ag.name.of(src);
-            rkind[nrefs] = KIND_AGGREGATION;
-            nrefs += 1;
+        if nrefs >= MAX_ART {
+            return (append(&mut *st_out, 0, b"error: too many artefacts\n"), 1);
         }
+        rdigest[nrefs] = digest;
+        rsym[nrefs] = ag.name.of(src);
+        rkind[nrefs] = KIND_AGGREGATION;
+        nrefs += 1;
         out_p = emit(&mut *st_out, out_p, ag.name.of(src), &digest);
     }
 
@@ -1012,20 +1329,24 @@ pub fn author_document(
         }
         for k in 0..doc.n_entries as usize {
             let e = arena.entries[k];
-            // An entry names a pipeline; its digest is the one just sealed.
+            // An entry names a pipeline; its digest is the one just sealed. An
+            // entry naming no pipeline is refused, never left out.
             let target = e.pipeline.of(src);
-            for r in 0..nrefs {
-                if rkind[r] == KIND_PIPELINE && rsym[r] == target {
-                    ents[ne] = EntrySpec {
-                        name: e.name.of(src),
-                        package: pkg,
-                        symbol: target,
-                        digest: &rdigest[r],
-                    };
-                    ne += 1;
-                    break;
-                }
-            }
+            let Some(r) = (0..nrefs).find(|&r| rkind[r] == KIND_PIPELINE && rsym[r] == target)
+            else {
+                let mut p = append(&mut *st_out, 0, b"error: entry '");
+                p = append(&mut *st_out, p, e.name.of(src));
+                p = append(&mut *st_out, p, b"' names no pipeline '");
+                p = append(&mut *st_out, p, target);
+                return (append(&mut *st_out, p, b"'\n"), 1);
+            };
+            ents[ne] = EntrySpec {
+                name: e.name.of(src),
+                package: pkg,
+                symbol: target,
+                digest: &rdigest[r],
+            };
+            ne += 1;
         }
         let header = HeaderSpec {
             package: pkg,
@@ -1118,21 +1439,47 @@ pub fn graph_document(
     };
 
     // Compile every stage into the plan. Stage IR accumulates end to end in
-    // `cont`; `plan[]` holds slices into it.
-    const MAX_PLAN_STAGES: usize = 16;
-    let mut spans = [(0usize, 0usize); MAX_PLAN_STAGES];
-    let mut kinds = [0u8; MAX_PLAN_STAGES]; // 0 compute, 1 decision, 2 effect
-                                            // Connectors resolved from the deployment's bindings, parallel to `kinds`.
-    let mut effects = [None::<Connector>; MAX_PLAN_STAGES];
+    // `cont`; `plan[]` holds slices into it. Stage kinds are the executor's
+    // (`STAGE_KIND_*`), plus `EFFECT` for a connector stage.
+    const EFFECT: u8 = 0xff;
+    let mut spans = [(0usize, 0usize); MAX_PIPELINE_STAGES];
+    let mut kinds = [STAGE_KIND_COMPUTE; MAX_PIPELINE_STAGES];
+    // Connectors resolved from the deployment's bindings, parallel to `kinds`.
+    let mut effects = [None::<Connector>; MAX_PIPELINE_STAGES];
     let mut used = 0usize;
     let mut n_stages = 0usize;
+    let (pkg, _) = split_qname(doc.module.of(src));
 
+    if pipe.n_stages as usize > MAX_PIPELINE_STAGES {
+        return too_many_stages(&mut *st_out);
+    }
     for k in 0..pipe.n_stages as usize {
-        if n_stages >= MAX_PLAN_STAGES {
-            return (append(&mut *st_out, 0, b"error: too many stages\n"), 1);
-        }
         let st = arena.stages[pipe.first_stage as usize + k];
-        let target_name = st.target.of(src);
+        let target_name = if st.kind == STAGE_EFFECT {
+            st.target.of(src)
+        } else {
+            // The same resolution `author` applies: a local name, bare or
+            // qualified with this document's package.
+            match local_target(st.target.of(src), pkg) {
+                Some(ts) => ts,
+                None => {
+                    let mut p = append(&mut *st_out, 0, b"error: unknown artefact '");
+                    p = append(&mut *st_out, p, st.target.of(src));
+                    p = append(&mut *st_out, p, b"'\n");
+                    return (p, 1);
+                }
+            }
+        };
+        if st.kind != STAGE_EFFECT && st.n_args > 1 {
+            return (
+                append(
+                    &mut *st_out,
+                    0,
+                    b"error: a call takes exactly one argument\n",
+                ),
+                1,
+            );
+        }
 
         // An EFFECT names a `resource`; the deployment says what serves it.
         // The document deliberately does not, so an unbound resource is a
@@ -1150,15 +1497,15 @@ pub fn graph_document(
                 return (p, 1);
             };
             effects[n_stages] = Some(*connector);
-            kinds[n_stages] = 2;
+            kinds[n_stages] = EFFECT;
             spans[n_stages] = (used, 0);
             n_stages += 1;
             continue;
         }
 
-        // A Call names either a transformation (a compute stage) or a decision
-        // (its own node). Transformations are searched first because that is the
-        // common case; a name in both would be a document the parser rejects.
+        // A Call names a transformation (a compute stage), a map (a stage of
+        // the compute run) or a decision (its own node). The parser refuses two
+        // declarations sharing a name (`DuplicateName`), so at most one matches.
         let mut done = false;
         for i in 0..doc.n_transformations {
             let f = arena.transformations[i];
@@ -1187,7 +1534,7 @@ pub fn graph_document(
                 return (p, 1);
             }
             spans[n_stages] = (used, irn);
-            kinds[n_stages] = 0;
+            kinds[n_stages] = STAGE_KIND_COMPUTE;
             used += irn;
             n_stages += 1;
             done = true;
@@ -1195,6 +1542,26 @@ pub fn graph_document(
         }
         if done {
             continue;
+        }
+
+        // A map is a stage of the compute run, not a node of its own: it does
+        // not branch. Its container is built now, resolved against the schema.
+        if let Some(m) = find_map(&*arena, &doc, src, target_name) {
+            match map_container(schema, src, &m, &mut *st_code, &mut st_cont[used..]) {
+                Ok(n) => {
+                    spans[n_stages] = (used, n);
+                    kinds[n_stages] = STAGE_KIND_MAP;
+                    used += n;
+                    n_stages += 1;
+                    continue;
+                }
+                Err(()) => {
+                    let mut p = append(&mut *st_out, 0, b"error: map '");
+                    p = append(&mut *st_out, p, target_name);
+                    p = append(&mut *st_out, p, b"' did not compile\n");
+                    return (p, 1);
+                }
+            }
         }
 
         for i in 0..doc.n_decisions {
@@ -1240,13 +1607,16 @@ pub fn graph_document(
                 }
             };
             spans[n_stages] = (used, dn);
-            kinds[n_stages] = 1;
+            kinds[n_stages] = STAGE_KIND_DECISION;
             used += dn;
             n_stages += 1;
             done = true;
             break;
         }
         if !done {
+            if declared_kind(&*arena, &doc, src, target_name) == Some(KIND_EXPRESSION) {
+                return stage_calls_expression(&mut *st_out, target_name);
+            }
             let mut p = append(&mut *st_out, 0, b"error: unknown artefact '");
             p = append(&mut *st_out, p, target_name);
             p = append(&mut *st_out, p, b"'\n");
@@ -1254,13 +1624,14 @@ pub fn graph_document(
         }
     }
 
-    let mut plan = [PlanStage::Compute { stage_ir: b"" }; MAX_PLAN_STAGES];
+    let mut plan = [PlanStage::Compute { stage_ir: b"" }; MAX_PIPELINE_STAGES];
     for i in 0..n_stages {
         let (off, len) = spans[i];
         let bytes = &st_cont[off..off + len];
         plan[i] = match kinds[i] {
-            0 => PlanStage::Compute { stage_ir: bytes },
-            1 => PlanStage::Decision { container: bytes },
+            STAGE_KIND_COMPUTE => PlanStage::Compute { stage_ir: bytes },
+            STAGE_KIND_DECISION => PlanStage::Decision { container: bytes },
+            STAGE_KIND_MAP => PlanStage::Map { container: bytes },
             // Resolved above from the deployment's bindings; an effect stage
             // without one cannot reach here, and is refused rather than
             // silently lowered as compute if it ever does.
@@ -1293,12 +1664,23 @@ pub fn graph_document(
         &mut *st_scratch,
     ) {
         Ok(p) => (p, 0),
-        Err(_) => (append(&mut *st_out, 0, b"error: graph too large\n"), 1),
+        Err(e) => {
+            let msg: &[u8] = match e {
+                GraphError::RunTooLong => return run_too_long(&mut *st_out),
+                GraphError::TooLarge => b"error: graph too large\n",
+                GraphError::EffectUnbound => b"error: an effect stage has no binding\n",
+                GraphError::EffectNotChainable => {
+                    b"error: a stage follows an effect that answers with no record\n"
+                }
+            };
+            (append(&mut *st_out, 0, msg), 1)
+        }
     }
 }
 
-/// Compile and seal an AGGREGATION artefact from CLI argv (key / event-time /
-/// selector programs, windows, operators). Flat over caller buffers.
+/// Assemble the aggregation IR-`def` container from CLI argv: the window
+/// scalars, the key / event-time / emit programs and each operator with its
+/// selector. Flat over caller buffers.
 #[allow(
     clippy::too_many_arguments,
     reason = "the CLI State buffers, passed explicitly so the core stays a flat function"
@@ -1307,6 +1689,7 @@ pub fn agg_from_argv(
     arec: &[u8],
     argv: &[(usize, usize)],
     argc: usize,
+    st_ir: &mut [u8],
     st_cont: &mut [u8],
     st_out: &mut [u8],
 ) -> (usize, i32) {
@@ -1316,7 +1699,7 @@ pub fn agg_from_argv(
                 &mut *st_out,
                 0,
                 b"error: agg needs <window> <lateness> <lanes> <step> <horizon> \
-                  <key_ir> <time_ir> <emit_ir> [<kind>:<sel_ir>]...\n",
+                  <key_ir> <time_ir> <emit_ir> [<kind>[/<param>]:<sel_ir>]...\n",
             ),
             1,
         );
@@ -1334,6 +1717,17 @@ pub fn agg_from_argv(
             }
         }
     }
+    // Lanes travel as a u32: a value that does not fit is refused, never
+    // wrapped into a different ceiling.
+    if !(0..=u32::MAX as i64).contains(&nums[2]) {
+        return (
+            append(&mut *st_out, 0, b"error: lanes must be 0..4294967295\n"),
+            1,
+        );
+    }
+    if st_cont.len() < 36 {
+        return (append(&mut *st_out, 0, b"error: container too large\n"), 1);
+    }
     let mut w = 0usize;
     // 36-byte header: window, lateness, lanes(u32), step, horizon.
     st_cont[0..8].copy_from_slice(&nums[0].to_le_bytes());
@@ -1344,21 +1738,22 @@ pub fn agg_from_argv(
     w += 36;
 
     // key / time / emit, each a flat checked IR.
+    // Each program decodes into `st_ir` (module state) before it is framed.
     for k in 0..3 {
         let (a, b) = argv[6 + k];
-        let mut irc = [0u8; BIN_BUF];
-        let Some(ilen) = hex_decode(&arec[a..b], &mut irc) else {
+        let Some(ilen) = hex_decode(&arec[a..b], &mut *st_ir) else {
             return (
                 append(&mut *st_out, 0, b"error: a program is not valid IR hex\n"),
                 1,
             );
         };
-        if !put_ir_prog(&mut *st_cont, &mut w, &irc[..ilen]) {
+        if !put_ir_prog(&mut *st_cont, &mut w, &st_ir[..ilen]) {
             return (append(&mut *st_out, 0, b"error: container too large\n"), 1);
         }
     }
 
-    // Operators: `<kind>:<selector_ir_hex>`, selector optionally empty.
+    // Operators: `<kind>[/<param>]:<selector_ir_hex>`, selector optionally
+    // empty. TopK (6) and Quantile (7) take their parameter; no other kind does.
     let nops = argc - 9;
     if nops > 255 {
         return (append(&mut *st_out, 0, b"error: too many operators\n"), 1);
@@ -1368,6 +1763,9 @@ pub fn agg_from_argv(
     }
     st_cont[w] = nops as u8;
     w += 1;
+    // A pane holds one collection cell, so the engine refuses a second
+    // Distinct (5), TopK (6) or Quantile (7) at load; refused here first.
+    let mut has_collection = false;
     for k in 0..nops {
         let (a, b) = argv[9 + k];
         let arg = &arec[a..b];
@@ -1376,23 +1774,56 @@ pub fn agg_from_argv(
                 append(
                     &mut *st_out,
                     0,
-                    b"error: an operator must be <kind>:<sel_ir>\n",
+                    b"error: an operator must be <kind>[/<param>]:<sel_ir>\n",
                 ),
                 1,
             );
         };
-        let Some(kind) = parse_i64(&arg[..colon]).filter(|k| (0..=255).contains(k)) else {
+        let head = &arg[..colon];
+        let (kind_text, param_text) = match head.iter().position(|c| *c == b'/') {
+            Some(slash) => (&head[..slash], Some(&head[slash + 1..])),
+            None => (head, None),
+        };
+        let Some(kind) = parse_i64(kind_text).filter(|k| (0..=255).contains(k)) else {
             return (
                 append(&mut *st_out, 0, b"error: operator kind must be 0..255\n"),
                 1,
             );
         };
-        let mut irc = [0u8; BIN_BUF];
+        if (5..=7).contains(&kind) {
+            if has_collection {
+                return (
+                    append(
+                        &mut *st_out,
+                        0,
+                        b"error: at most one distinct (5), topk (6) or quantile (7) operator\n",
+                    ),
+                    1,
+                );
+            }
+            has_collection = true;
+        }
+        let param = match param_text {
+            None => 0,
+            Some(t) => match parse_i64(t).filter(|v| (0..=u16::MAX as i64).contains(v)) {
+                Some(v) => v as u16,
+                None => {
+                    return (
+                        append(
+                            &mut *st_out,
+                            0,
+                            b"error: operator parameter must be 0..65535\n",
+                        ),
+                        1,
+                    )
+                }
+            },
+        };
         let sel = &arg[colon + 1..];
         let ilen = if sel.is_empty() {
             0
         } else {
-            match hex_decode(sel, &mut irc) {
+            match hex_decode(sel, &mut *st_ir) {
                 Some(n) => n,
                 None => {
                     return (
@@ -1402,12 +1833,22 @@ pub fn agg_from_argv(
                 }
             }
         };
-        if w >= st_cont.len() {
-            return (append(&mut *st_out, 0, b"error: container too large\n"), 1);
-        }
-        st_cont[w] = kind as u8;
-        w += 1;
-        if !put_ir_prog(&mut *st_cont, &mut w, &irc[..ilen]) {
+        w = match pack_op_head(&mut *st_cont, w, kind as u8, param) {
+            Ok(p) => p,
+            Err(PackError::BadParameter) => {
+                return (
+                    append(
+                        &mut *st_out,
+                        0,
+                        b"error: topk (6) takes k 1..65535, quantile (7) permille 0..1000; \
+                          no other kind takes a parameter\n",
+                    ),
+                    1,
+                )
+            }
+            Err(_) => return (append(&mut *st_out, 0, b"error: container too large\n"), 1),
+        };
+        if !put_ir_prog(&mut *st_cont, &mut w, &st_ir[..ilen]) {
             return (append(&mut *st_out, 0, b"error: container too large\n"), 1);
         }
     }
@@ -1533,8 +1974,8 @@ pub fn release_from_argv(
 // says whether the provider answers with data a next stage could read: `r` for
 // a `stream.ordered_ack.exchange` or request/reply provider, `n` for a sink.
 //
-//   orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,endpoint=7f000001;user=app
-//   feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,broker_ip=#167772161;topic=orders
+//   orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;cid_len=#4
+//   feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,authority=10.0.0.1:9092;topic=orders
 //
 // Every field is the PROVIDER's, not chronicle's: the param names, the port
 // names and the module name all arrive from the deployment, which is what

@@ -4,8 +4,8 @@
 // module (`modules/app/aggregation/mod.rs`) — one source of truth, host and
 // device.
 //
-// This is the on-device aggregation engine (spec artefact 5),
-// reduced to what a bounded, allocation-free runtime can hold:
+// This is the on-device aggregation engine, reduced to what a bounded,
+// allocation-free runtime can hold:
 //   * event-time TUMBLING and SLIDING windows (pane-aligned: size + step) with a
 //     guard watermark (max_event_time - lateness) and on-watermark finalization;
 //   * MULTIPLE concurrent open panes per lane (a fixed pane array), so
@@ -13,11 +13,15 @@
 //   * KEYED lanes with bounded cardinality (a fixed lane array; a new key past
 //     the ceiling is dropped + audited);
 //   * the fixed-size monoid operators COUNT/SUM/MIN/MAX/AVG (all retractable,
-//     each a couple of i64s), plus the COLLECTION operators DISTINCT/TOPK/
-//     QUANTILE over a bounded sorted multiset (`Coll`). The collection operators
+//     each a couple of i64s), plus ONE COLLECTION operator (DISTINCT/TOPK/
+//     QUANTILE) over a bounded sorted multiset (`Coll`). The collection operators
 //     are NON-RETRACTABLE: a late correction freezes them and audits the skipped
 //     value (`non_retractable_drops`) rather than mutating an answer already
 //     reported.
+//   * EXACT or ABSENT: arithmetic is checked, never wrapped or saturated. A value
+//     that overflowed, and a collection answer from a cell that could not keep
+//     every value it needed, is emitted ABSENT (its `state` field left null) and
+//     counted (`arith_overflows`, `coll_overflows`) — never as a wrong number.
 //   * RETRACTABLE CORRECTIONS: a late event within `correction_horizon` of the
 //     watermark re-folds into its finalized (still-retained) pane and re-emits;
 //     beyond the horizon (or once the pane is reclaimed) it is dropped + audited.
@@ -81,6 +85,10 @@ pub const KEY_CAP: usize = 48;
 const _: () = assert!(MAX_LANES >= 1 && MAX_PANES >= 1 && MAX_OPS >= 1);
 const _: () = assert!(MAX_WIN_PER_EVENT <= MAX_PANES);
 const _: () = assert!(COLL_CAP >= 1);
+// The checkpoint writes the lane, pane and operator counts as bytes, and a
+// cell's length below its saturation bit.
+const _: () = assert!(MAX_LANES <= 255 && MAX_PANES <= 255 && MAX_OPS <= 255);
+const _: () = assert!(COLL_CAP < COLL_SATURATED as usize);
 
 /// An aggregation operator.
 ///
@@ -115,18 +123,25 @@ impl AggOp {
 /// The checkpoint format version. Exactly one is written and exactly one is
 /// accepted — a snapshot that is not this version is refused, not half-understood.
 ///
-/// There is one format, and it is the current one. The byte exists to reject a
-/// foreign or corrupt snapshot, NOT to carry old shapes forward: when the format
-/// changes, this stays 1 and the old shape is deleted.
-pub const CKPT_VER: u8 = 1;
+/// There is one format, and it is the current one. The version increments on
+/// every layout change and only the current version is accepted, so a
+/// checkpoint written under another layout is refused rather than misread. The
+/// capacities the layout is sized by (`MAX_OPS`, `MAX_PANES`) are recorded in
+/// the header and must match, so a checkpoint from another tier is refused too;
+/// and a checkpoint with bytes past its end is refused, not partly read.
+pub const CKPT_VER: u8 = 2;
+
+/// The bit of a checkpointed cell's length byte that marks the cell saturated.
+const COLL_SATURATED: u8 = 0x80;
 
 /// How many selected values one collection cell retains.
 ///
 /// This is the device's bounded-state ceiling for Distinct/TopK/Quantile, which
 /// are mathematically unbounded. It is deliberately small: the pool is a fixed
 /// `MAX_LANES × MAX_PANES` array, so every value here costs 1 KiB of module
-/// state. Saturation is COUNTED (`coll_overflows`), never silently absorbed — an
-/// operator whose result stopped being exact says so.
+/// state. Saturation is COUNTED (`coll_overflows`) and the saturated cell's
+/// answer is emitted ABSENT — an operator whose result stopped being exact
+/// gives no number rather than a wrong one.
 pub const COLL_CAP: usize = AGG_CAP_COLL;
 
 /// A bounded, sorted-ascending multiset of `i64` — the single structure behind
@@ -138,6 +153,8 @@ pub const COLL_CAP: usize = AGG_CAP_COLL;
 struct Coll {
     vals: [i64; COLL_CAP],
     len: u8,
+    /// A value the operator needed could not be kept: the answer is not exact.
+    saturated: bool,
 }
 
 impl Coll {
@@ -145,6 +162,7 @@ impl Coll {
         Coll {
             vals: [0; COLL_CAP],
             len: 0,
+            saturated: false,
         }
     }
 
@@ -173,9 +191,18 @@ impl Coll {
         self.len += 1;
     }
 
-    /// Fold one selected value. Returns `false` when the cell was already full
-    /// and the value could not be retained exactly (the caller counts it).
+    /// Fold one selected value. Returns `false` when the value could not be
+    /// retained exactly (the caller counts it); the cell is then saturated and
+    /// answers absent.
     fn fold(&mut self, kind: AggOp, v: i64) -> bool {
+        let exact = self.fold_exact(kind, v);
+        if !exact {
+            self.saturated = true;
+        }
+        exact
+    }
+
+    fn fold_exact(&mut self, kind: AggOp, v: i64) -> bool {
         let at = self.lower_bound(v);
         match kind {
             AggOp::Distinct => {
@@ -192,7 +219,8 @@ impl Coll {
             AggOp::TopK(k) => {
                 // Only the k largest matter, so a full cell can still accept a
                 // value exactly — by evicting the smallest, which TopK would
-                // have discarded anyway. Exact whenever k <= COLL_CAP.
+                // have discarded anyway. Exact whenever k <= COLL_CAP; past it,
+                // exact until a value has to be let go.
                 let cap = if (k as usize) < COLL_CAP {
                     k as usize
                 } else {
@@ -217,7 +245,7 @@ impl Coll {
                     return k as usize <= COLL_CAP;
                 }
                 self.insert_at(at, v);
-                k as usize <= COLL_CAP
+                true
             }
             AggOp::Quantile(_) => {
                 if self.len as usize == COLL_CAP {
@@ -230,25 +258,29 @@ impl Coll {
         }
     }
 
-    fn value(&self, kind: AggOp) -> i64 {
+    /// The cell's answer, or `None` when there is no exact one: the cell
+    /// saturated, a TopK sum overflowed i64, or a quantile has no values.
+    fn value(&self, kind: AggOp) -> Option<i64> {
+        if self.saturated {
+            return None;
+        }
         let n = self.len as usize;
         match kind {
-            AggOp::Distinct => n as i64,
-            AggOp::TopK(k) => {
+            AggOp::Distinct => Some(n as i64),
+            AggOp::TopK(_) => {
                 // `vals` is ascending and already truncated to k, so this is the
-                // sum of the k largest.
+                // sum of the k largest — checked, never saturated.
                 let mut s: i64 = 0;
                 let mut i = 0;
                 while i < n {
-                    s = s.saturating_add(self.vals[i]);
+                    s = s.checked_add(self.vals[i])?;
                     i += 1;
                 }
-                let _ = k;
-                s
+                Some(s)
             }
             AggOp::Quantile(permille) => {
                 if n == 0 {
-                    return 0;
+                    return None;
                 }
                 // Nearest-rank: rank = ceil(p/1000 * n), 1-based, clamped to n.
                 let nn = n as u64;
@@ -266,9 +298,9 @@ impl Coll {
                 if rank > nn {
                     rank = nn;
                 }
-                self.vals[(rank - 1) as usize]
+                Some(self.vals[(rank - 1) as usize])
             }
-            _ => 0,
+            _ => Some(0),
         }
     }
 }
@@ -297,9 +329,8 @@ pub enum EmitTrigger {
 impl EmitTrigger {
     /// Decode the def container's trailing trigger bytes. Kind byte: `0`/absent =
     /// OnClose, `1` = Continuous, `2` = OnCount and `3` = OnProcessing, each
-    /// followed by `[count:u32 LE]`. Any unknown kind — or a truncated count — is
-    /// `OnClose`, so a container written before triggers existed (no trailing
-    /// bytes) keeps the original semantics. Panic-free over an arbitrary tail.
+    /// followed by `[count:u32 LE]`. No trailing bytes, any unknown kind, or a
+    /// truncated count is `OnClose`. Panic-free over an arbitrary tail.
     pub fn decode(tail: &[u8]) -> Self {
         let u32_at1 = || {
             tail.get(1..5)
@@ -380,14 +411,25 @@ pub enum AggError {
     /// two distinct keys sharing their first `KEY_CAP` bytes must never alias into
     /// one lane and combine their aggregates.
     KeyTooLong,
+    /// More than one collection operator (Distinct/TopK/Quantile): the pane
+    /// holds one collection cell, so a second could only report a wrong answer.
+    TooManyCollections,
+    /// A negative event time. Windows start at 0, so no window holds it;
+    /// refused rather than folded into nothing.
+    BadTime,
 }
 
 /// One monoid accumulator cell; interpreted by the operator's kind.
 #[derive(Debug, Clone, Copy)]
 struct Acc {
     a: i64, // Count/Sum/Min/Max value; Avg sum
-    b: i64, // Avg count
+    b: i64, // Avg count; `ACC_OVERFLOWED` once Count/Sum/Avg overflowed
 }
+
+/// `Acc::b` of a Count/Sum/Avg that overflowed i64: its value is absent from
+/// then on. No count is negative, so the mark cannot be a real one, and it rides
+/// in the checkpoint with the accumulator.
+const ACC_OVERFLOWED: i64 = -1;
 
 impl Acc {
     fn init(kind: AggOp) -> Self {
@@ -399,9 +441,18 @@ impl Acc {
         }
     }
     fn fold(&mut self, kind: AggOp, v: i64) {
+        if self.b == ACC_OVERFLOWED {
+            return;
+        }
         match kind {
-            AggOp::Count => self.a += 1,
-            AggOp::Sum => self.a += v,
+            AggOp::Count => match self.a.checked_add(1) {
+                Some(a) => self.a = a,
+                None => self.b = ACC_OVERFLOWED,
+            },
+            AggOp::Sum => match self.a.checked_add(v) {
+                Some(a) => self.a = a,
+                None => self.b = ACC_OVERFLOWED,
+            },
             AggOp::Min => {
                 if v < self.a {
                     self.a = v;
@@ -412,20 +463,26 @@ impl Acc {
                     self.a = v;
                 }
             }
-            AggOp::Avg => {
-                self.a += v;
-                self.b += 1;
-            }
+            AggOp::Avg => match (self.a.checked_add(v), self.b.checked_add(1)) {
+                (Some(a), Some(b)) => {
+                    self.a = a;
+                    self.b = b;
+                }
+                _ => self.b = ACC_OVERFLOWED,
+            },
             // Handled by the pane's `Coll` cell, not here.
             AggOp::Distinct | AggOp::TopK(_) | AggOp::Quantile(_) => {}
         }
     }
-    fn value(&self, kind: AggOp) -> i64 {
+    /// The accumulator's answer, or `None` when it overflowed (or an average
+    /// has no values).
+    fn value(&self, kind: AggOp) -> Option<i64> {
         match kind {
+            AggOp::Count | AggOp::Sum | AggOp::Avg if self.b == ACC_OVERFLOWED => None,
             // `checked_div` (not `/`) so a freestanding module links no
-            // panic-on-overflow path; None (b==0 or MIN/-1) folds to 0.
-            AggOp::Avg => self.a.checked_div(self.b).unwrap_or(0),
-            _ => self.a,
+            // panic-on-overflow path; `b` is a positive count here.
+            AggOp::Avg => self.a.checked_div(self.b),
+            _ => Some(self.a),
         }
     }
 }
@@ -551,12 +608,13 @@ pub struct AggState {
     /// Backing store for the collection operators (Distinct/TopK/Quantile).
     ///
     /// Indexed by `lane_idx * MAX_PANES + pane_idx` — DERIVED, never allocated,
-    /// so there is no free list to keep consistent and a restored checkpoint
-    /// lands every cell back under the same pane it left. Slots are stable
-    /// because neither lanes nor panes are ever compacted.
+    /// so there is no free list to keep consistent. Slots are stable while the
+    /// engine runs, because neither lanes nor panes are compacted; a checkpoint
+    /// carries each cell with its pane, so a restore — which packs a lane's
+    /// panes into its first slots — lands every cell under the pane it left.
     ///
-    /// One collection operator per aggregation (the first one declared); a
-    /// second is rejected at ingest rather than silently mis-scored. Keeping the
+    /// One collection operator per aggregation; a second is rejected at ingest
+    /// (`AggError::TooManyCollections`) rather than silently mis-scored. Keeping the
     /// pool off `Acc` is what stops Distinct/TopK/Quantile from charging their
     /// storage to every Sum-only deployment.
     colls: [Coll; MAX_LANES * MAX_PANES],
@@ -564,6 +622,8 @@ pub struct AggState {
     coll_overflows: u32,
     /// Late values skipped by a NON-RETRACTABLE operator during a correction.
     non_retractable_drops: u32,
+    /// Emitted values withheld (absent) because their arithmetic overflowed.
+    arith_overflows: u32,
 }
 
 /// Index of the single collection operator in `spec.ops`, if any.
@@ -585,6 +645,28 @@ impl Default for AggState {
 }
 
 impl AggState {
+    /// Return to the empty state in place. On a small part the state is a
+    /// large fraction of RAM, so a module initialises it where it lives rather
+    /// than building one on the stack and copying it in.
+    pub fn reset(&mut self) {
+        for lane in self.lanes.iter_mut() {
+            *lane = Lane::empty();
+        }
+        for coll in self.colls.iter_mut() {
+            *coll = Coll::empty();
+        }
+        self.lane_count = 0;
+        self.max_event_time = i64::MIN;
+        self.lane_overflows = 0;
+        self.late_drops = 0;
+        self.corrections = 0;
+        self.pane_overflows = 0;
+        self.processing_clock = 0;
+        self.coll_overflows = 0;
+        self.non_retractable_drops = 0;
+        self.arith_overflows = 0;
+    }
+
     pub fn new() -> Self {
         AggState {
             lanes: [Lane::empty(); MAX_LANES],
@@ -598,13 +680,19 @@ impl AggState {
             colls: [Coll::empty(); MAX_LANES * MAX_PANES],
             coll_overflows: 0,
             non_retractable_drops: 0,
+            arith_overflows: 0,
         }
     }
     /// Selected values a collection operator could not retain exactly because
-    /// its bounded cell was full. Non-zero means Distinct/Quantile results are
-    /// lower bounds rather than exact — surfaced, not hidden.
+    /// its bounded cell was full. The saturated cell's answer is emitted absent
+    /// from then on — surfaced, not hidden.
     pub fn coll_overflows(&self) -> u32 {
         self.coll_overflows
+    }
+    /// Emitted values withheld (emitted absent) because a Count/Sum/Avg or a
+    /// TopK sum overflowed i64 — counted once per emission that withheld one.
+    pub fn arith_overflows(&self) -> u32 {
+        self.arith_overflows
     }
     /// Late values a collection operator refused during a correction, because
     /// Distinct/TopK/Quantile cannot retract an answer they already reported.
@@ -640,14 +728,17 @@ impl AggState {
     /// Serialize the full aggregation state into `out` deterministically — a
     /// CHECKPOINT for replay/recovery (the durable-state capability).
     /// Layout, all little-endian:
-    ///   [ver=1][max_event_time:i64][lane_overflows:u32][late_drops:u32]
-    ///   [corrections:u32][pane_overflows:u32][coll_overflows:u32]
-    ///   [non_retractable_drops:u32][nlanes:u8]
+    ///   [ver=2][max_ops:u8][max_panes:u8][max_event_time:i64]
+    ///   [lane_overflows:u32][late_drops:u32][corrections:u32][pane_overflows:u32]
+    ///   [coll_overflows:u32][non_retractable_drops:u32][arith_overflows:u32]
+    ///   [nlanes:u8]
     ///   per active lane: [key_is_int:u8] then (int) [key_int:i64] or (bytes)
     ///     [key_len:u16][key…]; [finalized_high:i64][npanes:u8]
     ///   per used pane: [finalized:u8][window_start:i64] [a:i64][b:i64]×MAX_OPS
-    ///     [since_emit:u32][coll_len:u8][coll value:i64 × coll_len]
+    ///     [since_emit:u32][coll_len:u8, 0x80 set when saturated]
+    ///     [coll value:i64 × coll_len]
     ///   [processing_clock:u64]
+    /// and nothing after it.
     /// Every accumulator is written (not just active ops), so snapshot/restore
     /// need no `AggSpec` — and the collection cell rides with its pane for the
     /// same reason, length-prefixed so an empty cell costs one byte. Returns the
@@ -655,7 +746,7 @@ impl AggState {
     /// lanes/panes are emitted in slot order and each cell is already sorted.
     pub fn snapshot(&self, out: &mut [u8]) -> Option<usize> {
         let mut p = 0usize;
-        ckpt_put(out, &mut p, &[CKPT_VER])?;
+        ckpt_put(out, &mut p, &[CKPT_VER, MAX_OPS as u8, MAX_PANES as u8])?;
         ckpt_put(out, &mut p, &self.max_event_time.to_le_bytes())?;
         ckpt_put(out, &mut p, &self.lane_overflows.to_le_bytes())?;
         ckpt_put(out, &mut p, &self.late_drops.to_le_bytes())?;
@@ -663,6 +754,7 @@ impl AggState {
         ckpt_put(out, &mut p, &self.pane_overflows.to_le_bytes())?;
         ckpt_put(out, &mut p, &self.coll_overflows.to_le_bytes())?;
         ckpt_put(out, &mut p, &self.non_retractable_drops.to_le_bytes())?;
+        ckpt_put(out, &mut p, &self.arith_overflows.to_le_bytes())?;
         let mut nlanes = 0u8;
         let mut li = 0;
         while li < self.lane_count {
@@ -710,7 +802,8 @@ impl AggState {
                     }
                     ckpt_put(out, &mut p, &pane.since_emit.to_le_bytes())?;
                     let cell = &self.colls[li * MAX_PANES + pi];
-                    ckpt_put(out, &mut p, &[cell.len])?;
+                    let mark = if cell.saturated { COLL_SATURATED } else { 0 };
+                    ckpt_put(out, &mut p, &[cell.len | mark])?;
                     let mut c = 0;
                     while c < cell.len as usize {
                         ckpt_put(out, &mut p, &cell.vals[c].to_le_bytes())?;
@@ -726,16 +819,34 @@ impl AggState {
     }
 
     /// Reconstruct an `AggState` from a [`snapshot`](Self::snapshot). `None` on a
-    /// truncated or malformed checkpoint (bad version, over-cap counts) —
+    /// truncated or malformed checkpoint (another version, another tier's
+    /// `MAX_OPS`/`MAX_PANES`, over-cap counts, bytes past its end) —
     /// fail-closed, never a half-built state. Every count is range-checked
-    /// against MAX_LANES / MAX_PANES / KEY_CAP before use.
+    /// against MAX_LANES / MAX_PANES / KEY_CAP / COLL_CAP before use.
     pub fn restore(bytes: &[u8]) -> Option<AggState> {
+        let mut st = AggState::new();
+        st.restore_into(bytes)?;
+        Some(st)
+    }
+
+    /// [`restore`](Self::restore) in place, for a state too large to build on
+    /// the stack. On `None` the state is left empty, never half-built.
+    pub fn restore_into(&mut self, bytes: &[u8]) -> Option<()> {
+        self.reset();
+        let r = self.fill_from(bytes);
+        if r.is_none() {
+            self.reset();
+        }
+        r
+    }
+
+    fn fill_from(&mut self, bytes: &[u8]) -> Option<()> {
         let mut p = 0usize;
-        let ver = ckpt_get(bytes, &mut p, 1)?[0];
-        if ver != CKPT_VER {
+        let hdr = ckpt_get(bytes, &mut p, 3)?;
+        if hdr[0] != CKPT_VER || hdr[1] as usize != MAX_OPS || hdr[2] as usize != MAX_PANES {
             return None;
         }
-        let mut st = AggState::new();
+        let st = self;
         st.max_event_time = i64::from_le_bytes(ckpt_get(bytes, &mut p, 8)?.try_into().ok()?);
         st.lane_overflows = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
         st.late_drops = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
@@ -743,6 +854,7 @@ impl AggState {
         st.pane_overflows = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
         st.coll_overflows = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
         st.non_retractable_drops = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
+        st.arith_overflows = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
         let nlanes = ckpt_get(bytes, &mut p, 1)?[0] as usize;
         if nlanes > MAX_LANES {
             return None;
@@ -784,12 +896,14 @@ impl AggState {
                 }
                 pane.since_emit = u32::from_le_bytes(ckpt_get(bytes, &mut p, 4)?.try_into().ok()?);
                 // The pane's collection cell rides with it, so a restored pane
-                // lands its values back under its (possibly compacted) slot.
-                let clen = ckpt_get(bytes, &mut p, 1)?[0] as usize;
+                // lands its values back under its (packed) slot.
+                let craw = ckpt_get(bytes, &mut p, 1)?[0];
+                let clen = (craw & !COLL_SATURATED) as usize;
                 if clen > COLL_CAP {
                     return None;
                 }
                 let mut cell = Coll::empty();
+                cell.saturated = craw & COLL_SATURATED != 0;
                 let mut c = 0;
                 while c < clen {
                     cell.vals[c] = i64::from_le_bytes(ckpt_get(bytes, &mut p, 8)?.try_into().ok()?);
@@ -805,7 +919,11 @@ impl AggState {
         }
         st.lane_count = nlanes;
         st.processing_clock = u64::from_le_bytes(ckpt_get(bytes, &mut p, 8)?.try_into().ok()?);
-        Some(st)
+        // Bytes past the end are not this layout: refused, not ignored.
+        if p != bytes.len() {
+            return None;
+        }
+        Some(())
     }
 }
 
@@ -984,17 +1102,14 @@ pub fn read_prog(buf: &[u8], off: usize) -> Option<(u64, &[u8], usize)> {
     Some((cost, &buf[start..start + len], start + len))
 }
 
-/// Map a container operator-kind byte to an `AggOp` (0=Count,1=Sum,2=Min,3=Max,
-/// 4=Avg,5=Distinct,6=TopK,7=Quantile — the `AggOp` declaration order).
+/// Read one operator from a `def` container at `off`: its kind byte (0=Count,
+/// 1=Sum, 2=Min, 3=Max, 4=Avg, 5=Distinct, 6=TopK, 7=Quantile — the `AggOp`
+/// declaration order) and, for TopK and Quantile, the `u16` LE parameter after
+/// it ([`def_op_param_len`]). Returns the operator and the offset past it.
 ///
-/// Kinds 6 and 7 are parameterised, so this reports 0 for their parameter; use
-/// [`agg_op_kind_p`] when the container carries one.
-pub fn agg_op_kind(b: u8) -> Option<AggOp> {
-    agg_op_kind_p(b, 0)
-}
-
-/// [`agg_op_kind`] with the operator's canonical parameter: `k` for TopK,
-/// permille for Quantile. Ignored by the unparameterised kinds.
+/// `None` for an unknown kind, a truncated parameter, or a parameter the
+/// authoring grammar would not have produced: TopK's `k` is at least 1 and
+/// Quantile's permille at most 1000.
 ///
 /// NOTE these bytes are the EXECUTION container's vocabulary and are NOT the
 /// `OperatorKind` proto values in `artefact_core` (`OP_SUM = 1`, `OP_COUNT = 2`,
@@ -1002,24 +1117,34 @@ pub fn agg_op_kind(b: u8) -> Option<AggOp> {
 /// container's 7 is Quantile where the proto's 7 is TopK — because one encodes
 /// artefact IDENTITY and the other encodes a runtime program. Translate
 /// deliberately; never pass a value from one into the other.
-pub fn agg_op_kind_p(b: u8, param: u16) -> Option<AggOp> {
-    match b {
-        0 => Some(AggOp::Count),
-        1 => Some(AggOp::Sum),
-        2 => Some(AggOp::Min),
-        3 => Some(AggOp::Max),
-        4 => Some(AggOp::Avg),
-        5 => Some(AggOp::Distinct),
-        6 => Some(AggOp::TopK(param)),
-        7 => Some(AggOp::Quantile(param)),
-        _ => None,
-    }
+pub fn agg_op_read(c: &[u8], off: usize) -> Option<(AggOp, usize)> {
+    let kind = *c.get(off)?;
+    let n = def_op_param_len(kind);
+    let p = c.get(off + 1..off + 1 + n)?;
+    let param = if n == 2 {
+        u16::from_le_bytes([p[0], p[1]])
+    } else {
+        0
+    };
+    let op = match kind {
+        0 => AggOp::Count,
+        1 => AggOp::Sum,
+        2 => AggOp::Min,
+        3 => AggOp::Max,
+        4 => AggOp::Avg,
+        5 => AggOp::Distinct,
+        6 if param >= 1 => AggOp::TopK(param),
+        7 if param <= 1000 => AggOp::Quantile(param),
+        _ => return None,
+    };
+    Some((op, off + 1 + n))
 }
 
 fn agg_as_int(v: Value) -> Result<i64, AggError> {
     match v {
         Value::Int(i) => Ok(i),
-        Value::Uint(u) => Ok(u as i64),
+        // Past i64 an unsigned value has no exact i64: refused, never wrapped.
+        Value::Uint(u) => i64::try_from(u).map_err(|_| AggError::BadType),
         _ => Err(AggError::BadType),
     }
 }
@@ -1035,6 +1160,9 @@ pub fn ingest<F: FnMut(&[u8])>(
     if spec.ops.len() > MAX_OPS {
         return Err(AggError::TooManyOps);
     }
+    if spec.ops.iter().filter(|o| o.kind.is_collection()).count() > 1 {
+        return Err(AggError::TooManyCollections);
+    }
 
     // Decode the event.
     let mut fields = [Field {
@@ -1048,25 +1176,42 @@ pub fn ingest<F: FnMut(&[u8])>(
         fields: &fields[..nf],
     }];
 
-    // Advance the logical processing clock — one tick per ingested event. Drives
-    // the deterministic OnProcessing flush after this event's windows are folded.
-    state.processing_clock = state.processing_clock.wrapping_add(1);
-
-    // key + event_time.
+    // Everything the event is judged by — key, time, every operator's value —
+    // is evaluated BEFORE any state moves: an event refused here leaves the
+    // clock, the watermark and the lane table exactly as they were.
     let key_val = eval(spec.key_code, &ev, spec.key_cost).map_err(AggError::Eval)?;
     let (key_is_int, key_int, key_bytes): (bool, i64, &[u8]) = match key_val {
         Value::Int(i) => (true, i, &[]),
-        Value::Uint(u) => (true, u as i64, &[]),
-        Value::Bytes(b) => (false, 0, b),
+        Value::Uint(u) => (true, i64::try_from(u).map_err(|_| AggError::BadType)?, &[]),
+        Value::Bytes(b) | Value::Frame(b) => (false, 0, b),
         Value::Str(s) => (false, 0, s.as_bytes()),
         _ => return Err(AggError::BadType),
     };
-    // Reject an over-long key BEFORE any lane is created or mutated — never
-    // prefix-truncate it into an alias of another key.
+    // Reject an over-long key — never prefix-truncate it into an alias of
+    // another key.
     if !key_is_int && key_bytes.len() > KEY_CAP {
         return Err(AggError::KeyTooLong);
     }
     let t = agg_as_int(eval(spec.time_code, &ev, spec.time_cost).map_err(AggError::Eval)?)?;
+    if t < 0 {
+        return Err(AggError::BadTime);
+    }
+    // Per-operator selected values for this event (Count ignores the value).
+    let mut vals = [0i64; MAX_OPS];
+    let mut k = 0;
+    while k < spec.ops.len() {
+        vals[k] = match spec.ops[k].kind {
+            AggOp::Count => 0,
+            _ => agg_as_int(
+                eval(spec.ops[k].selector, &ev, spec.ops[k].sel_cost).map_err(AggError::Eval)?,
+            )?,
+        };
+        k += 1;
+    }
+
+    // Advance the logical processing clock — one tick per ingested event. Drives
+    // the deterministic OnProcessing flush after this event's windows are folded.
+    state.processing_clock = state.processing_clock.wrapping_add(1);
     if t > state.max_event_time {
         state.max_event_time = t;
     }
@@ -1100,20 +1245,6 @@ pub fn ingest<F: FnMut(&[u8])>(
     };
 
     if let Some(i) = lane_idx {
-        // Per-operator selected values for this event (Count ignores the value).
-        let mut vals = [0i64; MAX_OPS];
-        let mut k = 0;
-        while k < spec.ops.len() {
-            vals[k] = match spec.ops[k].kind {
-                AggOp::Count => 0,
-                _ => agg_as_int(
-                    eval(spec.ops[k].selector, &ev, spec.ops[k].sel_cost)
-                        .map_err(AggError::Eval)?,
-                )?,
-            };
-            k += 1;
-        }
-
         // Route the event into every window it belongs to (one for tumbling,
         // several for sliding).
         let mut wins = [0i64; MAX_WIN_PER_EVENT];
@@ -1281,11 +1412,13 @@ fn finalize_and_gc<F: FnMut(&[u8])>(
             li += 1;
         }
         let Some((w, li, pi)) = best else { break };
+        // Finalized only once its final has been emitted: a failed emit leaves
+        // the pane open, so the next pass emits it again rather than never.
+        emit_pane(state, spec, li, pi, emit)?;
         state.lanes[li].panes[pi].finalized = true;
         if w > state.lanes[li].finalized_high {
             state.lanes[li].finalized_high = w;
         }
-        emit_pane(state, spec, li, pi, emit)?;
     }
 
     // Reclaim finalized panes that can receive no further corrections.
@@ -1307,8 +1440,12 @@ fn finalize_and_gc<F: FnMut(&[u8])>(
 
 /// Project a lane pane's window through the emit bytecode and deliver the encoded
 /// output frame to `cb`. Used for both on-time finalization and corrections.
+///
+/// An operator with no exact answer (overflowed, saturated, or no values) is
+/// left null in `state` — absent, never a wrong number; an overflow withheld
+/// this way is counted in `arith_overflows`.
 fn emit_pane<F: FnMut(&[u8])>(
-    state: &AggState,
+    state: &mut AggState,
     spec: &AggSpec,
     lane_idx: usize,
     pane_idx: usize,
@@ -1324,17 +1461,32 @@ fn emit_pane<F: FnMut(&[u8])>(
         value: Value::Null,
     }; MAX_OPS];
     let ck = coll_op_index(spec);
+    let mut withheld = 0u32;
     let mut k = 0;
     while k < spec.ops.len() {
         let kind = spec.ops[k].kind;
         let v = if Some(k) == ck {
-            state.colls[lane_idx * MAX_PANES + pane_idx].value(kind)
+            let cell = &state.colls[lane_idx * MAX_PANES + pane_idx];
+            let v = cell.value(kind);
+            // Absent for a reason other than saturation (counted at fold):
+            // a TopK sum past i64.
+            if v.is_none() && !cell.saturated && matches!(kind, AggOp::TopK(_)) {
+                withheld += 1;
+            }
+            v
         } else {
-            pane.accs[k].value(kind)
+            let v = pane.accs[k].value(kind);
+            if v.is_none() && pane.accs[k].b == ACC_OVERFLOWED {
+                withheld += 1;
+            }
+            v
         };
         state_fields[k] = Field {
             number: (k + 1) as u32,
-            value: Value::Int(v),
+            value: match v {
+                Some(v) => Value::Int(v),
+                None => Value::Null,
+            },
         };
         k += 1;
     }
@@ -1388,6 +1540,7 @@ fn emit_pane<F: FnMut(&[u8])>(
             let mut scratch = [0u8; 256];
             let n = encode_frame(&builder.message(), &mut scratch).map_err(AggError::Emit)?;
             cb(&scratch[..n]);
+            state.arith_overflows = state.arith_overflows.saturating_add(withheld);
             Ok(())
         }
         Ok(EvalResult::Scalar(_)) => Err(AggError::Emit(PipeError::NotConstructed)),

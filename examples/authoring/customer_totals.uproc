@@ -1,6 +1,7 @@
 // The spec's commerce.customer_totals aggregation, authored in the .uproc DSL.
-// Lowers to chronicle-aggregation::build_aggregation: a pane-aligned event-time
-// window with monoid operators, a watermark, bounded lanes, and a typed emit.
+// `chronicle author` seals it as an Aggregation artefact: a pane-aligned
+// event-time window with monoid operators, a watermark, bounded lanes, and a
+// typed emit.
 module commerce.metrics {
 
   message commerce.Money { units: int = 1; }

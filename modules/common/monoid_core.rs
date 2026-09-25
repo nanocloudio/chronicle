@@ -5,12 +5,15 @@
 // `Value`.
 //
 // Exactness rules:
-//   * `sum` / `avg` use checked i64 arithmetic; an overflow makes the value
-//     absent and flags the accumulator (`overflowed`), never a wrapped number.
-//   * `avg` rounds toward negative infinity (floor division), so the answer does
-//     not depend on the sign convention of `/`.
-//   * `min` / `max` take ints or bytes: ints order numerically, bytes
-//     lexicographically, and any int orders before any bytes.
+//   * `sum` / `avg` over ints use checked i64 arithmetic; an overflow makes the
+//     value absent and flags the accumulator (`overflowed`), never a wrapped
+//     number. `avg` over ints rounds toward negative infinity (floor division),
+//     so the answer does not depend on the sign convention of `/`.
+//   * `min` / `max` take booleans, integers or bytes, ordered as the sort's keys
+//     order them (`encode_key_part`): false before true, every boolean before
+//     any integer, integers numerically, every integer before any bytes, bytes
+//     lexicographically. A boolean is its own type, never the integer 0 or 1,
+//     so `sum` / `avg` over one is a type error.
 //   * `distinct(x)` is exact because its input arrives ordered by `x` within the
 //     group: it counts runs of equal values, holding one value.
 //   * `quantile(q, x)` is exact on the same ordered input given the group's
@@ -57,6 +60,7 @@ impl AggKind {
 #[derive(Clone, Copy)]
 enum Held {
     None,
+    Bool(bool),
     Int(i64),
     Bytes { len: u16, truncated: bool },
 }
@@ -103,8 +107,10 @@ impl Acc {
                 self.target = 0;
                 return;
             }
-            // Nearest rank: ceil(q/1000 * len), at least 1.
-            let r = (u128::from(q) * u128::from(len)).div_ceil(1000) as u64;
+            // Nearest rank: ceil(q/1000 * len), at least 1 — in u64 (a u128
+            // division does not link in a PIC module): split `len` at 1000.
+            let q = u64::from(q);
+            let r = (len / 1000) * q + ((len % 1000) * q).div_ceil(1000);
             self.target = r.clamp(1, len);
         }
     }
@@ -182,7 +188,7 @@ impl Acc {
     /// aggregate over no values, an overflow, a type error, a truncated bytes
     /// value, or a `distinct` count that could not be decided.
     pub fn result<'b>(&'b self) -> Option<Value<'b>> {
-        if self.overflowed || self.type_error {
+        if self.type_error || self.overflowed {
             return None;
         }
         match self.kind {
@@ -197,8 +203,17 @@ impl Acc {
                 if self.n == 0 {
                     return None;
                 }
-                let n = i64::try_from(self.n).ok()?;
-                Some(Value::Int(self.sum.checked_div_euclid(n)?))
+                // The floor of sum / n, in unsigned division: a signed one
+                // carries an overflow panic a PIC module cannot link.
+                let n = self.n as u64;
+                let m = self.sum.unsigned_abs();
+                let (q, r) = (m / n, m % n);
+                let v = if self.sum >= 0 {
+                    q as i64
+                } else {
+                    (q as i64).wrapping_neg() - i64::from(r != 0)
+                };
+                Some(Value::Int(v))
             }
             AggKind::Distinct => {
                 if self.ambiguous {
@@ -213,6 +228,7 @@ impl Acc {
     fn held_value(&self) -> Option<Value<'_>> {
         match self.held {
             Held::None => None,
+            Held::Bool(b) => Some(Value::Bool(b)),
             Held::Int(i) => Some(Value::Int(i)),
             Held::Bytes { len, truncated } => {
                 if truncated {
@@ -225,6 +241,10 @@ impl Acc {
     }
 
     fn hold(&mut self, v: Value<'_>) {
+        if let Value::Bool(b) = v {
+            self.held = Held::Bool(b);
+            return;
+        }
         if let Some(i) = monoid_int(v) {
             self.held = Held::Int(i);
             return;
@@ -268,13 +288,24 @@ impl Acc {
     /// cap and share the kept prefix the answer is a tie-break, not an order
     /// (see `undecidable`); callers that need it exact check that first.
     fn compare_held(&self, v: Value<'_>) -> Option<core::cmp::Ordering> {
+        // Across types, the key order's type rank decides: bool < int < bytes.
+        let vr = monoid_rank(v)?;
+        let hr = match self.held {
+            Held::None => return None,
+            Held::Bool(_) => 0u8,
+            Held::Int(_) => 1,
+            Held::Bytes { .. } => 2,
+        };
+        if hr != vr {
+            return Some(hr.cmp(&vr));
+        }
         match self.held {
             Held::None => None,
-            Held::Int(h) => match (monoid_int(v), monoid_bytes(v)) {
-                (Some(i), _) => Some(h.cmp(&i)),
-                (None, Some(_)) => Some(core::cmp::Ordering::Less),
+            Held::Bool(h) => match v {
+                Value::Bool(b) => Some(h.cmp(&b)),
                 _ => None,
             },
+            Held::Int(h) => monoid_int(v).map(|i| h.cmp(&i)),
             Held::Bytes { len, truncated } => {
                 if let Some(b) = monoid_bytes(v) {
                     let held = &self.buf[..len as usize];
@@ -287,8 +318,6 @@ impl Acc {
                         }
                         o => Some(o),
                     }
-                } else if monoid_int(v).is_some() {
-                    Some(core::cmp::Ordering::Greater)
                 } else {
                     None
                 }
@@ -297,18 +326,28 @@ impl Acc {
     }
 }
 
+/// A value's type rank in the key order (bool < int < bytes); `None` for a
+/// value no aggregate orders.
+fn monoid_rank(v: Value<'_>) -> Option<u8> {
+    match v {
+        Value::Bool(_) => Some(0),
+        Value::Int(_) | Value::Uint(_) => Some(1),
+        Value::Bytes(_) | Value::Frame(_) | Value::Str(_) => Some(2),
+        _ => None,
+    }
+}
+
 fn monoid_int(v: Value<'_>) -> Option<i64> {
     match v {
         Value::Int(i) => Some(i),
         Value::Uint(u) => i64::try_from(u).ok(),
-        Value::Bool(b) => Some(i64::from(b)),
         _ => None,
     }
 }
 
 fn monoid_bytes<'v>(v: Value<'v>) -> Option<&'v [u8]> {
     match v {
-        Value::Bytes(b) => Some(b),
+        Value::Bytes(b) | Value::Frame(b) => Some(b),
         Value::Str(s) => Some(s.as_bytes()),
         _ => None,
     }

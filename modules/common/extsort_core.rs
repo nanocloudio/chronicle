@@ -17,16 +17,20 @@
 // of sorting, spilling or merging; `next` hands out one record of the result. A
 // store read may answer `Pending` ("ask again"): the core keeps the request and
 // repeats it unchanged on the next call. Store writes are synchronous and bounded
-// by the store's write chunk.
+// by the store's write chunk; a store that cannot take one yet answers `ready`
+// false, and the step pauses with nothing lost.
 //
 // Runs. A run is a sequence of BLOCKS: `[payload_len: u32 LE][crc32c: u32 LE]
-// [payload]`, where the payload is whole records. When a block is loaded, before
-// any of its records is compared or handed out, its length is bounded by what
-// was read, its CRC is checked, and every record in it is checked to frame
-// within it. A torn or corrupted spill therefore ends the sort with
-// `ExtErr::Corrupt` instead of emitting a wrong answer — or indexing past a
-// block, which on a device with no unwinder is a hang. The CRC detects accidental
-// damage; it is not a defence against a store that forges its contents.
+// [payload]`, where the payload is whole, non-empty records. The sorter records
+// each run's byte length when it commits the run. When a block is loaded, before
+// any of its records is compared or handed out, its length is bounded by what is
+// left of the run, it must carry at least one record, its CRC is checked, and
+// every record in it is checked to frame within it; and a run the store ends
+// before its recorded length has lost blocks. A torn, truncated or corrupted
+// spill therefore ends the sort with `ExtErr::Corrupt` instead of emitting a
+// wrong answer — or indexing past a block, which on a device with no unwinder is
+// a hang. The CRC detects accidental damage; it is not a defence against a store
+// that forges its contents.
 //
 // Record layout (buffer and runs):
 //   [rec_len: u32 LE][seq: u64 LE][gkey_len: u16 LE][key_len: u16 LE][key][frame]
@@ -87,9 +91,18 @@ pub trait RunStore {
     fn create(&mut self, run: u32) -> Result<(), i32>;
     fn write(&mut self, run: u32, bytes: &[u8]) -> Result<(), i32>;
     fn commit(&mut self, run: u32) -> Result<(), i32>;
-    /// Read up to `buf.len()` bytes at `offset` of committed run `run`.
+    /// Read up to `buf.len()` bytes at `offset` of committed run `run`. A
+    /// short read is legal: the sorter asks again at the offset after it.
     fn read_at(&mut self, run: u32, offset: u64, buf: &mut [u8]) -> Read;
     fn delete(&mut self, run: u32) -> Result<(), i32>;
+    /// Whether `write`s of `bytes` to `run` are taken now. A store that
+    /// persists behind its calls (a write-behind buffer on a slow volume)
+    /// answers false while it is full; the sort then pauses — `step` returns
+    /// with nothing lost — and flushes when asked again. The default is
+    /// always ready.
+    fn ready(&mut self, _run: u32, _bytes: usize) -> bool {
+        true
+    }
 }
 
 // ---- normalised keys ------------------------------------------------------
@@ -100,15 +113,16 @@ const TAG_NUM: u8 = 0x03;
 const TAG_BYTES: u8 = 0x04;
 
 /// Append `v` to `out[at..]` as an order-preserving key component: byte-wise
-/// comparison of encodings orders the values (null < bool < numbers < bytes;
-/// numbers by value across signed/unsigned; bytes lexicographically). `desc`
-/// inverts the component. Returns the new end, or `None` if `out` is full.
+/// comparison of encodings orders the values null < bool < integers < bytes —
+/// integers by value across signed and unsigned, bytes lexicographically.
+/// `desc` inverts the component. Returns the new end, or `None` if `out` is
+/// full.
 ///
-/// `Double`, `Msg` and an unresolved `Scratch` have no encoding here and are
-/// written as NULL, so they sort with nulls and compare equal to one another.
-/// A caller keys on them only after resolving a scratch value to its bytes and
-/// deciding what the others mean — as a grouping key, silently merging them
-/// with nulls would be a wrong answer.
+/// A nested message held as a frame keys as the bytes of that frame. `Msg` and
+/// an unresolved scratch value have no encoding and are written as NULL, so
+/// they sort with nulls and compare equal to one another. A caller resolves a
+/// scratch value before keying on it; as a grouping key, merging either with
+/// nulls would be a wrong answer.
 pub fn encode_key_part(v: Value<'_>, desc: bool, out: &mut [u8], at: usize) -> Option<usize> {
     let start = at;
     let mut p = at;
@@ -137,9 +151,9 @@ pub fn encode_key_part(v: Value<'_>, desc: bool, out: &mut [u8], at: usize) -> O
                 put(b, &mut p)?;
             }
         }
-        Value::Bytes(_) | Value::Str(_) => {
+        Value::Bytes(_) | Value::Frame(_) | Value::Str(_) => {
             let bytes: &[u8] = match v {
-                Value::Bytes(b) => b,
+                Value::Bytes(b) | Value::Frame(b) => b,
                 Value::Str(s) => s.as_bytes(),
                 _ => &[],
             };
@@ -321,13 +335,19 @@ pub enum Phase {
 struct RunInfo {
     id: u32,
     live: bool,
+    /// The run's byte length, recorded when it is committed.
+    bytes: u64,
 }
 
 #[derive(Clone, Copy)]
 struct Reader {
     run: u32,
+    /// The run's recorded byte length: where it must end.
+    end: u64,
     /// Offset of the next block to load.
     next_block: u64,
+    /// Bytes of the block being loaded read so far (a store may answer short).
+    filled: usize,
     /// Block buffer region in the work buffer.
     buf_at: usize,
     blen: usize,
@@ -339,7 +359,9 @@ struct Reader {
 
 const NO_READER: Reader = Reader {
     run: 0,
+    end: 0,
     next_block: 0,
+    filled: 0,
     buf_at: 0,
     blen: 0,
     pos: 0,
@@ -396,6 +418,8 @@ pub struct Sorter {
     reduce_emitted: u64,
     /// A reduce pass runs while input is still arriving; resume filling after.
     reduce_then_fill: bool,
+    /// The store had no room for a block: `step` returns and resumes later.
+    blocked: bool,
     /// Only the first `limit` records of the result are wanted (0 = all).
     limit: u64,
     served: u64,
@@ -504,7 +528,11 @@ impl Sorter {
             wrun: 0,
             wrun_open: false,
             wrun_bytes: 0,
-            runs: [RunInfo { id: 0, live: false }; EXT_MAX_RUNS],
+            runs: [RunInfo {
+                id: 0,
+                live: false,
+                bytes: 0,
+            }; EXT_MAX_RUNS],
             nruns: 0,
             next_id: 0,
             readers: [NO_READER; EXT_MAX_FANIN],
@@ -516,6 +544,7 @@ impl Sorter {
             reduce_out: 0,
             reduce_emitted: 0,
             reduce_then_fill: false,
+            blocked: false,
             limit: 0,
             served: 0,
             stats: ExtStats::default(),
@@ -633,6 +662,11 @@ impl Sorter {
                 self.fail(store, e);
                 return self.phase;
             }
+            if self.blocked {
+                // The store is full: come back next step.
+                self.blocked = false;
+                return self.phase;
+            }
             if matches!(self.phase, Phase::Filling | Phase::Output | Phase::Done) {
                 return self.phase;
             }
@@ -743,11 +777,27 @@ impl Sorter {
         let id = self.next_id;
         self.next_id += 1;
         store.create(id).map_err(ExtErr::Store)?;
-        self.runs[self.nruns] = RunInfo { id, live: true };
+        self.runs[self.nruns] = RunInfo {
+            id,
+            live: true,
+            bytes: 0,
+        };
         self.nruns += 1;
         self.stats.runs_written += 1;
         self.wrun_bytes = 0;
         Ok(id)
+    }
+
+    /// Whether a record of `len` bytes can join the write block now — true
+    /// unless it would flush a block the store has no room for (`usize::MAX`:
+    /// the block is about to be flushed as it is). Sets `blocked` when not.
+    fn room_for<S: RunStore>(&mut self, store: &mut S, run: u32, len: usize) -> bool {
+        let flushing = len == usize::MAX || EXT_BLOCK_HDR + self.wlen + len > self.block;
+        if !flushing || self.wlen == 0 || store.ready(run, EXT_BLOCK_HDR + self.wlen) {
+            return true;
+        }
+        self.blocked = true;
+        false
     }
 
     /// Append the record at `m[at..at + len]` (in the fill area or a reader
@@ -812,6 +862,9 @@ impl Sorter {
             let off = idx(m, self.back, self.spill_i);
             let len = rd_u32(m, off);
             let run = self.wrun;
+            if !self.room_for(store, run, len) {
+                return Ok(());
+            }
             self.emit(m, store, run, off, len)?;
             self.spill_i += 1;
         }
@@ -819,9 +872,13 @@ impl Sorter {
             return Ok(());
         }
         let run = self.wrun;
+        if self.wrun_open && !self.room_for(store, run, usize::MAX) {
+            return Ok(());
+        }
         if self.wrun_open {
             self.flush_block(m, store, run)?;
             store.commit(run).map_err(ExtErr::Store)?;
+            self.sealed(run);
             self.wrun_open = false;
         }
         // Buffer empty again.
@@ -898,7 +955,9 @@ impl Sorter {
         while i < runs.len() {
             self.readers[i] = Reader {
                 run: runs[i],
+                end: self.run_bytes(runs[i]),
                 next_block: 0,
+                filled: 0,
                 buf_at: self.block * (i + 1),
                 blen: 0,
                 pos: 0,
@@ -912,6 +971,11 @@ impl Sorter {
     /// Make sure reader `r` holds a record at `pos` (loading its next block if
     /// needed). `Ok(true)`: ready; `Ok(false)`: pending; readers at end report
     /// `eof`.
+    ///
+    /// A block is read until whole: a short read continues at the offset after
+    /// it, and a pending one is asked again unchanged. The run's recorded
+    /// length bounds every block, so a store that ends the run sooner, or a
+    /// header claiming more than the run holds, is `Corrupt`.
     fn fill_reader<S: RunStore>(
         &mut self,
         m: &mut [u8],
@@ -925,43 +989,67 @@ impl Sorter {
         if !rd.loading && rd.pos < rd.blen {
             return Ok(true);
         }
+        if rd.filled == 0 && rd.next_block >= rd.end {
+            self.readers[r].eof = true;
+            self.readers[r].loading = false;
+            return Ok(true);
+        }
         let block = self.block;
-        let buf = &mut m[rd.buf_at..rd.buf_at + block];
-        match store.read_at(rd.run, rd.next_block, buf) {
-            Read::Pending => {
-                self.readers[r].loading = true;
-                Ok(false)
-            }
-            Read::Err(e) => Err(ExtErr::Store(e)),
-            Read::Done(0) => {
-                self.readers[r].eof = true;
-                self.readers[r].loading = false;
-                Ok(true)
-            }
-            Read::Done(n) => {
+        // What is left of the run, up to one block: the most this block spans.
+        let left = rd.end - rd.next_block;
+        let avail = if left < block as u64 {
+            left as usize
+        } else {
+            block
+        };
+        if avail < EXT_BLOCK_HDR {
+            return Err(ExtErr::Corrupt);
+        }
+        // Each pass returns or adds at least one byte to `filled`, which never
+        // passes `avail`: at most `avail` reads.
+        loop {
+            let rd = self.readers[r];
+            if rd.filled >= EXT_BLOCK_HDR {
+                let buf = &m[rd.buf_at..rd.buf_at + avail];
                 // `plen` comes off the medium, so it is compared against the
                 // room left rather than added to the header size: on a 32-bit
                 // core `EXT_BLOCK_HDR + plen` wraps for a torn length near
                 // `u32::MAX` and would pass the very check meant to refuse it.
-                let n = n.min(block);
-                if n < EXT_BLOCK_HDR {
-                    return Err(ExtErr::Corrupt);
-                }
+                // An empty block is never written, and all zeros — a torn
+                // write's padding — would otherwise pass its CRC.
                 let plen = rd_u32(buf, 0);
-                let crc = rd_u32(buf, 4) as u32;
-                if plen > n - EXT_BLOCK_HDR {
+                if plen == 0 || plen > avail - EXT_BLOCK_HDR {
                     return Err(ExtErr::Corrupt);
                 }
-                let payload = &buf[EXT_BLOCK_HDR..EXT_BLOCK_HDR + plen];
-                if crc32c(payload) != crc || !block_frames(payload) {
-                    return Err(ExtErr::Corrupt);
+                if rd.filled >= EXT_BLOCK_HDR + plen {
+                    let crc = rd_u32(buf, 4) as u32;
+                    let payload = &buf[EXT_BLOCK_HDR..EXT_BLOCK_HDR + plen];
+                    if crc32c(payload) != crc || !block_frames(payload) {
+                        return Err(ExtErr::Corrupt);
+                    }
+                    let rd = &mut self.readers[r];
+                    rd.next_block += (EXT_BLOCK_HDR + plen) as u64;
+                    rd.blen = EXT_BLOCK_HDR + plen;
+                    rd.pos = EXT_BLOCK_HDR;
+                    rd.filled = 0;
+                    rd.loading = false;
+                    return Ok(true);
                 }
-                let rd = &mut self.readers[r];
-                rd.next_block += (EXT_BLOCK_HDR + plen) as u64;
-                rd.blen = EXT_BLOCK_HDR + plen;
-                rd.pos = EXT_BLOCK_HDR;
-                rd.loading = false;
-                Ok(true)
+            }
+            let buf = &mut m[rd.buf_at + rd.filled..rd.buf_at + avail];
+            match store.read_at(rd.run, rd.next_block + rd.filled as u64, buf) {
+                Read::Pending => {
+                    self.readers[r].loading = true;
+                    return Ok(false);
+                }
+                Read::Err(e) => return Err(ExtErr::Store(e)),
+                // The run is recorded longer than the store holds.
+                Read::Done(0) => return Err(ExtErr::Corrupt),
+                Read::Done(n) => {
+                    let n = n.min(avail - rd.filled);
+                    self.readers[r].filled += n;
+                    self.readers[r].loading = true;
+                }
             }
         }
     }
@@ -1034,14 +1122,21 @@ impl Sorter {
                     let at = rd.buf_at + rd.pos;
                     let len = rd_u32(m, at);
                     let out = self.reduce_out;
+                    if !self.room_for(store, out, len) {
+                        return Ok(());
+                    }
                     self.emit(m, store, out, at, len)?;
                     self.advance(m, r)?;
                     self.reduce_emitted += 1;
                 }
                 None => {
                     let out = self.reduce_out;
+                    if !self.room_for(store, out, usize::MAX) {
+                        return Ok(());
+                    }
                     self.flush_block(m, store, out)?;
                     store.commit(out).map_err(ExtErr::Store)?;
+                    self.sealed(out);
                     // The inputs are consumed.
                     let mut i = 0;
                     while i < self.nreaders {
@@ -1062,6 +1157,30 @@ impl Sorter {
             }
         }
         Ok(())
+    }
+
+    /// Record the length of run `id`, just committed: what the write block
+    /// flushes have added since `new_run`.
+    fn sealed(&mut self, id: u32) {
+        let mut i = 0;
+        while i < self.nruns {
+            if self.runs[i].id == id {
+                self.runs[i].bytes = self.wrun_bytes;
+            }
+            i += 1;
+        }
+    }
+
+    /// The recorded length of run `id` (0 for a run not tracked).
+    fn run_bytes(&self, id: u32) -> u64 {
+        let mut i = 0;
+        while i < self.nruns {
+            if self.runs[i].id == id {
+                return self.runs[i].bytes;
+            }
+            i += 1;
+        }
+        0
     }
 
     fn mark_dead(&mut self, id: u32) {

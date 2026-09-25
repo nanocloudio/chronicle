@@ -7,7 +7,7 @@
 // EAGAIN is a host test rather than a claim about an unsafe function.
 //
 // Mounted after vm_core, pipeline_core, outcome_core and io_core (it uses
-// `decode_frame`/`frame_len`/`eval_scratch`/`Scratch`/`Field`/`Message`/`Value`,
+// `decode_frame`/`frame_len`/`eval_scratch_metered`/`Scratch`/`Field`/`Message`/`Value`,
 // the `io_core` lifecycle and `outcome_core::Reason`).
 
 // `StepResult` is shared from io_core (expression never returns `Dropped`).
@@ -108,7 +108,7 @@ pub fn expr_step(
         acct.add_work(spent);
         match ev {
             Ok(v) => match resolve_scratch(v, &scratch) {
-                Value::Bytes(result) => {
+                Value::Bytes(result) | Value::Frame(result) => {
                     if result.len() > out_buf.len() {
                         acct.input_failed();
                         return StepResult::Failed(Reason::TooLarge);
@@ -121,9 +121,9 @@ pub fn expr_step(
                     return StepResult::Failed(Reason::Unsupported);
                 }
             },
-            Err(_) => {
+            Err(e) => {
                 acct.input_failed();
-                return StepResult::Failed(Reason::CostExceeded);
+                return StepResult::Failed(eval_reason(e));
             }
         }
     };
@@ -146,5 +146,27 @@ pub fn expr_step(
             acct.input_failed();
             StepResult::Failed(r)
         }
+    }
+}
+
+/// The disposition an evaluation fault records: the budget, a bound on the
+/// result, a program this build cannot run, a value the program cannot
+/// evaluate, or a program fault `scan_code` should have refused at load.
+fn eval_reason(e: EvalError) -> Reason {
+    match e {
+        EvalError::CostExceeded => Reason::CostExceeded,
+        EvalError::ScratchOverflow | EvalError::BuildOverflow => Reason::TooLarge,
+        EvalError::BadOpcode(_) | EvalError::BadBuiltin(_) | EvalError::BadLocal(_) => {
+            Reason::Unsupported
+        }
+        EvalError::TypeError
+        | EvalError::NotAMessage
+        | EvalError::DivByZero
+        | EvalError::Overflow => Reason::Malformed,
+        EvalError::Truncated
+        | EvalError::StackOverflow
+        | EvalError::StackUnderflow
+        | EvalError::BadParam(_)
+        | EvalError::BadResultArity => Reason::Internal,
     }
 }

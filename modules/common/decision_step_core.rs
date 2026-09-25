@@ -97,6 +97,12 @@ pub fn decision_step(
         match outcome {
             Ok(Fired::Rule(i)) => *fired = i as i16,
             Ok(Fired::Default) => *fired = -1,
+            // A predicate left UNKNOWN by an absent field: a required item was
+            // not there. Named apart from a broken program so it can be counted.
+            Err(DecisionError::Absent) => {
+                acct.input_failed();
+                return StepResult::Failed(Reason::NotFound);
+            }
             Err(_) => {
                 acct.input_failed();
                 return StepResult::Failed(Reason::Internal);

@@ -1,0 +1,52 @@
+# THE CARRY ACROSS AN EXCHANGE — a request's context leaves in the msg_key and
+# comes back on the reply, so the stage handling the answer has what the stage
+# that asked had, and nothing between them holds state.
+#
+#   cli_in ─▶ pipeline ─publish_out─▶ http (exchange client) ─▶ origin
+#                ▲ reply_in ◀─reply_out─┘   (the reply IS the ack)
+#                └─ result_out ─▶ cli_out
+#
+# The record carries its context in field 254 (a nested message, as a frame).
+# The pipeline lifts it into the publish's msg_key; the reply echoes the key;
+# the pipeline restores it as 254 on the reply record, beside the decoded body
+# (5) and the exchange status (253). `tools/e2e/exchange-carry.sh` drives it.
+target: linux
+tick_us: 100
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  cli: {}
+  net: {}
+
+modules:
+  - name: pipeline
+    params:
+      # Rec{method, path, body, ctx} copied whole — `ctx: r.ctx` is the carry.
+      ir_stages: "01ff3100050001020000001202000000050001030000001203000000050001040000001204000000050001fe00000012fe00000013"
+      # [method:u8][path_len:u16 LE][body_len:u16 LE][path][body] — the http
+      # client's request record, from fields 2, 3, 4.
+      encode: "0100020200000062010101000203000000646202010100020400000064620201010002030000006101000204000000616a"
+      # The reply payload (the response body) whole, as field 5.
+      reply_decode: "78400500000041"
+  - name: http
+    variant: exchange
+    params:
+      mode: 1              # client
+      protocol: 0          # HTTP/1.1
+      authority: "127.0.0.1:18080"
+
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.publish_out
+    to: http.publish_in
+  - from: http.reply_out
+    to: pipeline.reply_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: http.net_in

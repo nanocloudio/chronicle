@@ -106,7 +106,8 @@ buffer_size  = 256
 # inputs, window emissions are fan-out outputs — then aggregation's own
 # instruments: `module_mode`, then the saturation / late / correction, checkpoint
 # and term state an edge counter cannot express. `emit_overflow` and the overflow
-# counters refine `outputs_failed`.
+# counters refine `outputs_failed`; `arith_overflows` counts emissions that
+# withheld a value because its exact result overflowed i64.
 metrics = [
     "bytes_in", "bytes_out",
     "inputs_observed", "inputs_admitted", "inputs_rejected",
@@ -116,5 +117,5 @@ metrics = [
     "module_mode",
     "emit_overflow", "lane_overflows", "late_drops", "corrections",
     "pane_overflows", "coll_overflows", "non_retractable_drops",
-    "events_since_ckpt", "current_term", "work_units",
+    "events_since_ckpt", "current_term", "work_units", "arith_overflows",
 ]

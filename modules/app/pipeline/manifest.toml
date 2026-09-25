@@ -11,10 +11,6 @@ timer_class     = "agnostic"
 # been processed and the result accepted downstream. See the ingress ports.
 capabilities = ["stream.ordered_ack.sink"]
 
-
-# Input: a typed record frame (see mod.rs / pipeline_core.rs `decode_frame`):
-# [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload], where
-# type 0 = byte string and type 1 = i64 (8 bytes LE).
 # Feature-set variants. The pinned CEL extension surface
 # (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
 # LEVEL — strings, math, encoders, bindings — so a variant can compose
@@ -28,6 +24,10 @@ name     = "full"
 features = ["strings", "math", "encoders", "bindings"]
 default  = true
 
+# Input: a typed record frame (see mod.rs / pipeline_core.rs `decode_frame`):
+# [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload], where
+# type 0 = byte string, type 1 = i64 (8 bytes LE) and type 3 = a nested
+# message (its own frame).
 [[ports]]
 name         = "record_in"
 direction    = "input"
@@ -43,9 +43,6 @@ content_type = "OctetStream"
 max_record   = { default = 4096, rp2040 = 512 }
 buffer_size  = { default = 4096, rp2040 = 512 }
 
-# Control: hot-reload ops for the version table (add a version / flip the default
-# / remove a drained one). See version_core.rs `vctl`. Optional — a config that
-# doesn't wire it just runs the versions loaded at startup.
 # ── Egress: the ordered-ack exchange surface ──────────────────────────
 #
 # When wired, a pipeline's result leaves as a `Publish` frame instead of a
@@ -67,10 +64,10 @@ content_type = "OctetStream"
 # edge — not "some module in the graph declares it".
 requires_capability = "stream.ordered_ack"
 # One framed publish at this module's ceiling: the 3-byte envelope, the
-# contract's 13-byte overhead, and a 4096-byte result frame (no key). See
-# `PUB_FRAME_MAX` in mod.rs.
-max_record   = { default = 4112, rp2040 = 528 }
-buffer_size  = { default = 16448, rp2040 = 2112 }
+# contract's 13-byte overhead, the carry as msg_key (`KEY_BUF`: 512, 64 on a
+# tiny target) and a 4096-byte result frame. See `PUB_FRAME_MAX` in mod.rs.
+max_record   = { default = 4624, rp2040 = 592 }
+buffer_size  = { default = 18496, rp2040 = 2368 }
 
 [[ports]]
 name         = "ack_in"
@@ -87,16 +84,19 @@ buffer_size  = 512
 # record's output is accepted downstream, OVERSIZE for a payload beyond the
 # contract ceiling, UNROUTABLE when the payload cannot be processed. LINK_UP
 # is announced once the module is ready to take records; it never goes down.
-# A payload is taken whole up to PAYLOAD_MAX (`INGRESS_BUF`): a raw chunk for
-# the `decode` program, or — without one — itself one typed record.
+# A payload is taken whole up to `INGRESS_BUF` — PAYLOAD_MAX, or one 512-byte
+# record on a tiny target — as a raw chunk for the `decode` program, or, without
+# one, itself one typed record. A larger payload is answered OVERSIZE.
 [[ports]]
 name         = "publish_in"
 index        = 2
 direction    = "input"
 content_type = "OctetStream"
-# Any producer's frame, whole: PUBLISH_FRAME_MAX + the 3-byte envelope.
-max_record   = 8720
-buffer_size  = 34880
+# Any producer's frame, whole: PUBLISH_FRAME_MAX + the 3-byte envelope. On a
+# tiny target: the envelope, the 13-byte overhead, a KEY_MAX (512) key — read
+# past, never buffered — and the 512-byte `INGRESS_BUF` payload.
+max_record   = { default = 8720, rp2040 = 1040 }
+buffer_size  = { default = 34880, rp2040 = 4160 }
 
 [[ports]]
 name         = "ack_out"
@@ -106,6 +106,28 @@ content_type = "OctetStream"
 max_record   = 12
 buffer_size  = 512
 
+# ── Replies: the exchange role's answers ───────────────────────────
+#
+# When a replying destination (`stream.ordered_ack.exchange`) is wired back
+# here, each reply IS the ack for its publish: it frees the in-flight window
+# and becomes a record on `result_out` — the payload through `reply_decode`
+# (or itself one record frame), the echoed msg_key restored as the carry
+# (field 254), the exchange status at 253. The request's context crossed the
+# destination in the key, so nothing is held here between the two.
+[[ports]]
+name         = "reply_in"
+index        = 3
+direction    = "input"
+content_type = "OctetStream"
+# A whole reply frame: `REPLY_BUF` (REPLY_FRAME_MAX; on a tiny target the
+# 13-byte overhead, the 64-byte carry and a 512-byte record) + the 3-byte
+# envelope.
+max_record   = { default = 8720, rp2040 = 592 }
+buffer_size  = { default = 17440, rp2040 = 1184 }
+
+# Control: hot-reload ops for the version table (add a version / flip the default
+# / remove a drained one). See version_core.rs `vctl`. Optional — a config that
+# doesn't wire it just runs the versions loaded at startup.
 [[ports]]
 name         = "control"
 direction    = "ctrl_input"
@@ -131,12 +153,19 @@ metrics = [
     "inflight", "refused", "invalidated", "link_downs",
     # Ingress: publishes accepted and refused as a sink.
     "sink_acked", "sink_refused",
+    # Replies taken as records, replies that could not be, and records whose
+    # carry did not fit a msg_key (appended: ids are wire positions).
+    "replies", "replies_failed", "carry_refused",
+    # Records refused for exceeding the field table or a map stage's maximum.
+    "over_bound",
 ]
 
 # The sink role's terms. `transport`: an ack means the record's output was
 # accepted by the next channel — handed on, not made durable; one destination
 # is one ordering unit, so a broadcast is a plain publish; any contract
-# payload is taken (`INGRESS_BUF`).
+# payload is taken (`INGRESS_BUF`). Capability facts take no per-target value:
+# these are the full-tier ceilings; a tiny target takes a 512-byte payload and
+# answers a larger one OVERSIZE.
 [capability_facts."stream.ordered_ack.sink"]
 ack        = "transport"
 ordering   = "single"
@@ -145,6 +174,6 @@ max_payload = 8192
 
 # The largest payload a pipeline result can carry, against a provider's
 # declared backend ceiling. Fact against fact: `max_record` above frames a
-# whole record, this is the payload alone.
+# whole record, this is the payload alone (512 on a tiny target; see above).
 [capability_facts."stream.ordered_ack"]
 max_payload = 4096

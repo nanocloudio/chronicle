@@ -1,12 +1,7 @@
-// The `.uproc` authoring DSL document parser, on device.
+// The `.uproc` authoring DSL document parser, on device: a `.uproc` file goes
+// in, a structured document of declaration spans comes out.
 //
-// The last thing that required a Linux host to author. A device could already
-// compile CEL (`celc_core`), seal artefacts (`artefact_core`), store, publish,
-// verify and activate them — but it could not read a MODULE DOCUMENT, so
-// authoring on device meant assembling artefacts one CLI call at a time. This
-// closes that: a `.uproc` file goes in, a structured document comes out.
-//
-// Like the host parser this is deliberately THIN. It recognizes document
+// This is deliberately THIN. It recognizes document
 // structure and captures every expression body as a verbatim span; the spans go
 // to `celc_core` unchanged, so the DSL reuses the proven CEL grammar,
 // type-checker and lowerer rather than growing a second one.
@@ -19,9 +14,12 @@
 // The caller supplies the declaration arrays (`UprocArena`), so this core has no
 // ceiling of its own and a node parses whatever its memory allows. Overflowing
 // an array is reported as `TooMany` rather than truncated: a document parsed in
-// part is a document silently missing artefacts.
+// part is a document silently missing artefacts. For the same reason a clause
+// given twice is `DuplicateClause`, two artefacts sharing a name are
+// `DuplicateName`, and an integer outside the range its field can hold is
+// `OutOfRange` — none is resolved by silently keeping one reading.
 //
-// Grammar (identical to the host's — see chronicle-authoring/src/parse.rs):
+// Grammar:
 //   document      := 'module' QNAME '{' decl* '}'
 //   message       := 'message' QNAME '{' field* '}'
 //   field         := IDENT ':' type '=' INT ';'
@@ -42,6 +40,10 @@
 //                  | 'operator' IDENT '=' opkind ';' | 'emit' EXPR ';'
 //   opkind        := 'count' | ('sum'|'avg'|'min'|'max'|'distinct') '(' EXPR ')'
 //                  | ('topk'|'quantile') '(' INT ',' EXPR ')'
+//   map           := 'map' IDENT '(' IDENT ':' type ')' '->' type '{' mclause* '}'
+//   mclause       := 'over' IDENT '.' IDENT 'as' IDENT ':' type 'max' INT ';'
+//                  | 'count' IDENT '.' IDENT ',' IDENT '.' IDENT ',' IDENT '.' IDENT ';'
+//                  | 'when' EXPR ';'
 //   entry         := 'entry' IDENT '=' IDENT ';'
 //   provenance    := 'provenance' 'revision' STRING 'toolchain' STRING ';'
 //
@@ -97,6 +99,20 @@ pub enum UprocErrorKind {
     MissingClause,
     /// A declaration array in the arena is full.
     TooMany,
+    /// A clause that may appear once in its declaration appeared again.
+    DuplicateClause,
+    /// Two artefact declarations (expression, transformation, decision, map,
+    /// aggregation, pipeline) share a name, or two entries do.
+    DuplicateName,
+    /// An integer outside the range the field it sets can hold.
+    OutOfRange,
+    /// A type this toolchain has no scalar for (`double`, `float`) — refused
+    /// rather than read as a message of that name.
+    UnsupportedType,
+    /// A second collection operator (`distinct`, `topk`, `quantile`) in one
+    /// aggregation. A pane holds one collection cell, so the engine would
+    /// refuse the definition at load; it is refused here instead.
+    TooManyCollections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -180,7 +196,8 @@ pub struct PipelineDecl {
     pub return_stage: Span,
 }
 
-/// Operator kinds, matching the host's `AggOpKind` declaration order.
+/// Operator kinds, in the DSL's declaration order (`agg_kind_to_op` maps
+/// them to the proto's `OperatorKind`).
 pub const AGG_SUM: u8 = 0;
 pub const AGG_COUNT: u8 = 1;
 pub const AGG_AVG: u8 = 2;
@@ -228,6 +245,27 @@ pub struct EnumDecl {
     pub value: i64,
 }
 
+/// `map NAME(r: T) -> T { over r.F as e: E max N; count r.A, r.B, r.C;
+/// when PRED; }` — a bounded map stage: PRED (an expression over `e` and `r`)
+/// is applied to every element of the repeated field `r.F`, at most N of them,
+/// and its true/false/unknown verdicts are counted into `r.A`/`r.B`/`r.C`.
+/// Every name is a span; the lowering resolves them against the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapDecl {
+    pub name: Span,
+    pub param_name: Span,
+    pub param_type: Span,
+    pub result_type: Span,
+    pub over_param: Span,
+    pub over: Span,
+    pub elem_name: Span,
+    pub elem_type: Span,
+    pub max: i64,
+    pub counts: [Span; 3],
+    pub count_params: [Span; 3],
+    pub when: Span,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EntryDecl {
     pub name: Span,
@@ -250,6 +288,7 @@ pub struct UprocArena<'a> {
     pub aggregations: &'a mut [AggregationDecl],
     pub operators: &'a mut [OperatorDecl],
     pub entries: &'a mut [EntryDecl],
+    pub maps: &'a mut [MapDecl],
 }
 
 /// How much of each arena array the parse filled.
@@ -270,6 +309,7 @@ pub struct Doc {
     pub n_aggregations: usize,
     pub n_operators: usize,
     pub n_entries: usize,
+    pub n_maps: usize,
     /// `provenance revision "..." toolchain "..."`; empty when absent.
     pub provenance_revision: Span,
     pub provenance_toolchain: Span,
@@ -411,7 +451,15 @@ impl<'a> P<'a> {
         if self.i >= self.s.len() || !is_ident_start(self.s[self.i]) {
             return self.err(UprocErrorKind::ExpectedType);
         }
-        self.qname()
+        let at = self.i;
+        let t = self.qname()?;
+        if matches!(t.of(self.s), b"double" | b"float") {
+            return Err(UprocError {
+                kind: UprocErrorKind::UnsupportedType,
+                offset: at,
+            });
+        }
+        Ok(t)
     }
 
     fn int(&mut self) -> Result<i64, UprocError> {
@@ -440,6 +488,30 @@ impl<'a> P<'a> {
             };
         }
         Ok(if neg { -v } else { v })
+    }
+
+    /// An integer that must lie in `min..=max`; outside it is `OutOfRange`,
+    /// never wrapped or clamped into the field that holds it.
+    fn int_in(&mut self, min: i64, max: i64) -> Result<i64, UprocError> {
+        self.ws();
+        let at = self.i;
+        let v = self.int()?;
+        if v < min || v > max {
+            return Err(UprocError {
+                kind: UprocErrorKind::OutOfRange,
+                offset: at,
+            });
+        }
+        Ok(v)
+    }
+
+    /// Refuse a clause already seen in this declaration.
+    fn once(&self, seen: &mut bool) -> Result<(), UprocError> {
+        if *seen {
+            return self.err(UprocErrorKind::DuplicateClause);
+        }
+        *seen = true;
+        Ok(())
     }
 
     /// A double-quoted string; the span excludes the quotes.
@@ -624,6 +696,7 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
     }
     doc.module = p.qname()?;
     p.expect_byte(b'{')?;
+    let mut seen_provenance = false;
 
     loop {
         if p.eat_byte(b'}') {
@@ -642,7 +715,7 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
                 p.expect_byte(b':')?;
                 let fty = p.ty()?;
                 p.expect_byte(b'=')?;
-                let num = p.int()? as u32;
+                let num = p.int_in(1, u32::MAX as i64)? as u32;
                 p.expect_byte(b';')?;
                 push!(
                     p,
@@ -689,6 +762,7 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
             p.expect_byte(b'{')?;
             let first = doc.n_rules;
             let mut default = Span::default();
+            let mut seen_default = false;
             while !p.eat_byte(b'}') {
                 if p.keyword(b"when") {
                     let when = p.expr_until_arrow()?;
@@ -697,6 +771,7 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
                     p.expect_byte(b';')?;
                     push!(p, arena.rules, doc.n_rules, RuleDecl { when, outcome });
                 } else if p.keyword(b"default") {
+                    p.once(&mut seen_default)?;
                     p.arrow()?;
                     default = p.expr_until(b';')?;
                     p.expect_byte(b';')?;
@@ -737,6 +812,9 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
         } else if p.keyword(b"aggregation") {
             let d = parse_aggregation(&mut p, arena, &mut doc)?;
             push!(p, arena.aggregations, doc.n_aggregations, d);
+        } else if p.keyword(b"map") {
+            let d = parse_map(&mut p)?;
+            push!(p, arena.maps, doc.n_maps, d);
         } else if p.keyword(b"entry") {
             let name = p.ident()?;
             p.expect_byte(b'=')?;
@@ -749,6 +827,7 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
                 EntryDecl { name, pipeline }
             );
         } else if p.keyword(b"provenance") {
+            p.once(&mut seen_provenance)?;
             if !p.keyword(b"revision") {
                 return p.err(UprocErrorKind::UnknownDeclaration);
             }
@@ -765,13 +844,128 @@ pub fn uproc_parse(src: &[u8], arena: &mut UprocArena) -> Result<Doc, UprocError
     // Nothing may follow the module's closing brace. Without this, a document
     // with junk appended parses as though the junk were not there — so a file
     // and that file plus arbitrary trailing bytes would seal to the SAME
-    // digests, and a content digest would no longer identify one source. Found
-    // by the generated-document differential; the host has always refused it.
+    // digests, and a content digest would no longer identify one source.
     p.ws();
     if p.peek().is_some() {
         return p.err(UprocErrorKind::TrailingInput);
     }
+    check_unique_names(src, arena, &doc)?;
     Ok(doc)
+}
+
+/// Refuse two artefact declarations of any kind sharing a name, and two
+/// entries sharing one. A stage names its target by bare symbol, so a name
+/// declared twice would resolve to whichever lookup ran first — and the
+/// sealed Module would carry two refs under one name.
+fn check_unique_names(src: &[u8], arena: &UprocArena, doc: &Doc) -> Result<(), UprocError> {
+    // Plain matches, not a table of closures: a PIC module cannot hold a
+    // vtable or pointer table, so each kind is reached through code.
+    let count = |k: usize| match k {
+        0 => doc.n_expressions,
+        1 => doc.n_transformations,
+        2 => doc.n_decisions,
+        3 => doc.n_maps,
+        4 => doc.n_aggregations,
+        _ => doc.n_pipelines,
+    };
+    let name = |k: usize, i: usize| match k {
+        0 => arena.expressions[i].name,
+        1 => arena.transformations[i].name,
+        2 => arena.decisions[i].name,
+        3 => arena.maps[i].name,
+        4 => arena.aggregations[i].name,
+        _ => arena.pipelines[i].name,
+    };
+    for ka in 0..6 {
+        for ia in 0..count(ka) {
+            let a = name(ka, ia).of(src);
+            for kb in ka..6 {
+                let from = if kb == ka { ia + 1 } else { 0 };
+                for ib in from..count(kb) {
+                    let b = name(kb, ib);
+                    if b.of(src) == a {
+                        return Err(UprocError {
+                            kind: UprocErrorKind::DuplicateName,
+                            offset: b.start as usize,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for ia in 0..doc.n_entries {
+        for ib in ia + 1..doc.n_entries {
+            if arena.entries[ib].name.of(src) == arena.entries[ia].name.of(src) {
+                return Err(UprocError {
+                    kind: UprocErrorKind::DuplicateName,
+                    offset: arena.entries[ib].name.start as usize,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `IDENT '.' IDENT` — a parameter's field, as two spans.
+fn param_field(p: &mut P) -> Result<(Span, Span), UprocError> {
+    let a = p.ident()?;
+    p.expect_byte(b'.')?;
+    let b = p.ident()?;
+    Ok((a, b))
+}
+
+/// The `map` declaration (see [`MapDecl`]). Clauses may come in any order;
+/// `over`, `count` and `when` are each required exactly once.
+fn parse_map(p: &mut P) -> Result<MapDecl, UprocError> {
+    let mut d = MapDecl {
+        name: p.ident()?,
+        ..MapDecl::default()
+    };
+    p.expect_byte(b'(')?;
+    d.param_name = p.ident()?;
+    p.expect_byte(b':')?;
+    d.param_type = p.ty()?;
+    p.expect_byte(b')')?;
+    p.arrow()?;
+    d.result_type = p.ty()?;
+    p.expect_byte(b'{')?;
+    let (mut over, mut count, mut when) = (false, false, false);
+    while !p.eat_byte(b'}') {
+        if p.keyword(b"over") {
+            p.once(&mut over)?;
+            (d.over_param, d.over) = param_field(p)?;
+            if !p.keyword(b"as") {
+                return p.err(UprocErrorKind::MissingClause);
+            }
+            d.elem_name = p.ident()?;
+            p.expect_byte(b':')?;
+            d.elem_type = p.ty()?;
+            if !p.keyword(b"max") {
+                return p.err(UprocErrorKind::MissingClause);
+            }
+            d.max = p.int_in(1, u8::MAX as i64)?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"count") {
+            p.once(&mut count)?;
+            for k in 0..3 {
+                if k > 0 {
+                    p.expect_byte(b',')?;
+                }
+                (d.count_params[k], d.counts[k]) = param_field(p)?;
+            }
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"when") {
+            p.once(&mut when)?;
+            d.when = p.expr_until(b';')?;
+            p.expect_byte(b';')?;
+        } else {
+            return p.err(UprocErrorKind::UnknownDeclaration);
+        }
+    }
+    if !over || !count || d.when.is_empty() {
+        return p.err(UprocErrorKind::MissingClause);
+    }
+    Ok(d)
 }
 
 /// `NAME '(' PARAM ':' TYPE ')' '->' TYPE BODY` — expression and transformation.
@@ -812,6 +1006,7 @@ fn parse_pipeline(
     let first = doc.n_stages;
     let mut commit_after = Span::default();
     let mut return_stage = Span::default();
+    let (mut seen_commit, mut seen_return) = (false, false);
     while !p.eat_byte(b'}') {
         if p.keyword(b"call") {
             let sname = p.ident()?;
@@ -874,12 +1069,14 @@ fn parse_pipeline(
                 }
             );
         } else if p.keyword(b"commit") {
+            p.once(&mut seen_commit)?;
             if !p.keyword(b"after") {
                 return p.err(UprocErrorKind::UnknownDeclaration);
             }
             commit_after = p.ident()?;
             p.expect_byte(b';')?;
         } else if p.keyword(b"return") {
+            p.once(&mut seen_return)?;
             return_stage = p.ident()?;
             p.expect_byte(b';')?;
         } else {
@@ -925,40 +1122,55 @@ fn parse_aggregation(
         first_op: first as u16,
         ..Default::default()
     };
-    let mut seen_window = false;
+    // One flag per clause that may appear once: key, event_time, window,
+    // lateness, guard, lanes, emit.
+    let mut seen = [false; 7];
+    // A pane holds one collection cell: see `TooManyCollections`.
+    let mut has_collection = false;
     while !p.eat_byte(b'}') {
         if p.keyword(b"key") {
+            p.once(&mut seen[0])?;
             d.key = p.expr_until(b';')?;
             p.expect_byte(b';')?;
         } else if p.keyword(b"event_time") {
+            p.once(&mut seen[1])?;
             d.event_time = p.expr_until(b';')?;
             p.expect_byte(b';')?;
         } else if p.keyword(b"window") {
+            p.once(&mut seen[2])?;
             if p.keyword(b"tumbling") {
                 d.window_kind = WINDOW_TUMBLING;
-                d.window_size_ms = p.int()?;
+                d.window_size_ms = p.int_in(1, i64::MAX)?;
             } else if p.keyword(b"sliding") {
                 d.window_kind = WINDOW_SLIDING;
-                d.window_size_ms = p.int()?;
-                d.window_step_ms = p.int()?;
+                d.window_size_ms = p.int_in(1, i64::MAX)?;
+                d.window_step_ms = p.int_in(1, i64::MAX)?;
             } else {
                 return p.err(UprocErrorKind::UnknownDeclaration);
             }
             p.expect_byte(b';')?;
-            seen_window = true;
         } else if p.keyword(b"lateness") {
-            d.lateness_ms = p.int()?;
+            p.once(&mut seen[3])?;
+            d.lateness_ms = p.int_in(0, i64::MAX)?;
             p.expect_byte(b';')?;
         } else if p.keyword(b"guard") {
-            d.guard_ms = p.int()?;
+            p.once(&mut seen[4])?;
+            d.guard_ms = p.int_in(0, i64::MAX)?;
             p.expect_byte(b';')?;
         } else if p.keyword(b"lanes") {
-            d.max_lanes = p.int()? as u32;
+            p.once(&mut seen[5])?;
+            d.max_lanes = p.int_in(1, u32::MAX as i64)? as u32;
             p.expect_byte(b';')?;
         } else if p.keyword(b"operator") {
             let oname = p.ident()?;
             p.expect_byte(b'=')?;
             let op = parse_opkind(p)?;
+            if matches!(op.0, AGG_DISTINCT | AGG_TOPK | AGG_QUANTILE) {
+                if has_collection {
+                    return p.err(UprocErrorKind::TooManyCollections);
+                }
+                has_collection = true;
+            }
             p.expect_byte(b';')?;
             push!(
                 p,
@@ -972,13 +1184,14 @@ fn parse_aggregation(
                 }
             );
         } else if p.keyword(b"emit") {
+            p.once(&mut seen[6])?;
             d.emit = p.expr_until(b';')?;
             p.expect_byte(b';')?;
         } else {
             return p.err(UprocErrorKind::UnknownDeclaration);
         }
     }
-    if !seen_window || d.key.is_empty() || d.event_time.is_empty() || d.emit.is_empty() {
+    if !seen[2] || d.key.is_empty() || d.event_time.is_empty() || d.emit.is_empty() {
         return p.err(UprocErrorKind::MissingClause);
     }
     d.n_ops = (doc.n_operators - first) as u16;
@@ -1010,7 +1223,13 @@ fn parse_opkind(p: &mut P) -> Result<(u8, u32, Span), UprocError> {
     ] {
         if p.keyword(kw) {
             p.expect_byte(b'(')?;
-            let n = p.int()? as u32;
+            // TOPK's k is 1..=65535, the `u16` the execution container
+            // carries; QUANTILE's permille is 0..=1000.
+            let n = if kind == AGG_TOPK {
+                p.int_in(1, u16::MAX as i64)?
+            } else {
+                p.int_in(0, 1000)?
+            } as u32;
             p.expect_byte(b',')?;
             let sel = p.expr_until(b')')?;
             p.expect_byte(b')')?;

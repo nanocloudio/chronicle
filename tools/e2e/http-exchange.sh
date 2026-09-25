@@ -28,6 +28,19 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 
+# The origin gives up after 30 s without a connection, and the graph build can
+# take longer than that. A bare connect-and-close resets that clock without
+# recording a request (the origin records only a complete request head), so the
+# origin's lifetime is this run's, not the build's.
+if [ -n "${HTTP_PORT:-}" ]; then
+  ( while :; do
+      (exec 3<>"/dev/tcp/127.0.0.1/$HTTP_PORT") 2>/dev/null
+      sleep 5
+    done ) &
+  E2E_PIDS="$E2E_PIDS $!"
+  disown "$!" 2>/dev/null || true
+fi
+
 # Publish carrying a GET for /hello, msg_key "job-42", corr 7.
 #   [0xED][len][corr:u64][flags][klen][plen][key][method][path_len][body_len][path]
 REQ_HEX=$(python3 - <<'PY'

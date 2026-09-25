@@ -67,7 +67,7 @@ mod agg {
     include!("../../common/hex_core.rs");
     // Lower a shipped checked IR-`def` at load (the `ir_def` param), transcoding
     // it to the bytecode `def` `build_spec` consumes. `op::`/`ir::` resolve here
-    // because core.rs is include!'d into this same block. Same self-validation
+    // because vm_core.rs is include!'d into this same block. Same self-validation
     // as the expression/pipeline modules: "it lowered" == "it can run it".
     include!("../../common/lower_core.rs");
     include!("../../common/outcome_core.rs");
@@ -76,7 +76,7 @@ mod agg {
     include!("../../common/syschan_core.rs");
 }
 use agg::{
-    admit_frame, agg_op_kind, drain_all, frame_len, hex_decode, ingest, lower_def, read_prog,
+    admit_frame, agg_op_read, drain_all, frame_len, hex_decode, ingest, lower_def, read_prog,
     Accounting, Admit, AggSpec, AggState, BarrierGate, Durability, EmitTrigger, Mode, OpSpec,
     Pending, Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, COLL_CAP, KEY_CAP, MAX_LANES,
     MAX_OPS, MAX_PANES,
@@ -90,7 +90,7 @@ include!("../../common/telemetry_core.rs");
 ///
 /// Three tiers rather than two, because this module's buffers span two orders of
 /// magnitude and the middle one carries its own answer: at the full capacities the
-/// engine asks 312,512 B, which exceeds RP2350's 245,760 B arena as well as
+/// engine asks 312,576 B, which exceeds RP2350's 245,760 B arena as well as
 /// RP2040's 65,536 B. A single MCU tier would therefore have to be the smallest
 /// one, and an RP2350 would hold a fraction of what its arena can afford.
 const ARENA: usize = abi::config::kernel::STATE_ARENA_SIZE;
@@ -152,12 +152,12 @@ const EMIT_Q_CAP: usize = EMIT_FRAMES_PER_EVENT * (2 + EMIT_FRAME_MAX);
 /// layout (`agg_core::snapshot`). Every term is a capacity this module already
 /// declares, so the three cannot drift apart:
 ///
-/// - global: `[ver:u8][max_event_time:i64]` + six `u32` counters + `[nlanes:u8]`
-///   + `[processing_clock:u64]`;
+/// - global: `[ver:u8][max_ops:u8][max_panes:u8][max_event_time:i64]` + seven
+///   `u32` counters + `[nlanes:u8]` + `[processing_clock:u64]`;
 /// - per lane: `[key_is_int:u8][key_len:u16][key…KEY_CAP][finalized_high:i64][npanes:u8]`;
 /// - per pane: `[finalized:u8][window_start:i64]` + `[a:i64][b:i64]×MAX_OPS`
 ///   + `[since_emit:u32][coll_len:u8]` + `[i64 × COLL_CAP]`.
-const SNAPSHOT_GLOBAL_BYTES: usize = 1 + 8 + 6 * 4 + 1 + 8;
+const SNAPSHOT_GLOBAL_BYTES: usize = 3 + 8 + 7 * 4 + 1 + 8;
 const SNAPSHOT_LANE_BYTES: usize = 1 + 2 + KEY_CAP + 8 + 1;
 const SNAPSHOT_PANE_BYTES: usize = 1 + 8 + 16 * MAX_OPS + 4 + 1 + 8 * COLL_CAP;
 // One line, and pinned that way: the limit register extracts a constant's
@@ -429,7 +429,7 @@ pub extern "C" fn module_new(
         s.corr = 1;
         s.proposed = false;
         s.faulted = false;
-        core::ptr::write(&mut s.agg, AggState::new());
+        s.agg.reset();
 
         parse_tlv(s, params, params_len);
         // A param truncated at its buffer is a terminal fault — a truncated def could
@@ -459,20 +459,18 @@ pub extern "C" fn module_new(
             }
         }
         // Resume from a checkpoint if one was supplied — durable deterministic
-        // state. Decode the hex into ir_scratch (reused), restore over
-        // the fresh AggState. A malformed/oversized checkpoint fails closed:
-        // restore returns None, so we keep the fresh state rather than a
-        // half-built one and log it.
+        // state. Decode the hex into the checkpoint stage and restore in place
+        // over the fresh AggState. A malformed or oversized checkpoint leaves
+        // the state empty, never half-built, and is a terminal fault.
         if s.has_state {
             // A checkpoint was SUPPLIED. It restores, or it is a terminal fault —
             // never a silent fall-back to a fresh state, which would erase the very
             // history the checkpoint exists to preserve. Absent state (the
             // `!has_state` case) is what legitimately starts fresh.
             let restored = hex_decode(&s.state_hex[..s.state_hex_len as usize], &mut s.ckpt_stage)
-                .and_then(|n| AggState::restore(&s.ckpt_stage[..n]));
+                .and_then(|n| s.agg.restore_into(&s.ckpt_stage[..n]));
             match restored {
-                Some(r) => {
-                    s.agg = r;
+                Some(()) => {
                     dev_log(
                         sys,
                         3,
@@ -755,12 +753,8 @@ fn build_spec<'a>(
     let mut off = o3 + 1;
     let mut i = 0usize;
     while i < nops {
-        if off >= cont.len() {
-            return None;
-        }
-        let kind = agg_op_kind(cont[off])?;
-        off += 1;
-        let (sel_cost, selector, next) = read_prog(cont, off)?;
+        let (kind, after) = agg_op_read(cont, off)?;
+        let (sel_cost, selector, next) = read_prog(cont, after)?;
         off = next;
         ops[i] = OpSpec {
             kind,
@@ -768,6 +762,15 @@ fn build_spec<'a>(
             sel_cost,
         };
         i += 1;
+    }
+    // One collection operator per definition: the pane holds a single
+    // collection cell. Refused here, at load, rather than on every event.
+    let collections = ops[..nops]
+        .iter()
+        .filter(|o| o.kind.is_collection())
+        .count();
+    if collections > 1 {
+        return None;
     }
     // Optional trailing trigger bytes (backward-compatible: absent = OnClose).
     // Kind byte, plus a u32 count for OnCount.
@@ -872,6 +875,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             tlm_gauge(sys, midx, t, b + 9, s.current_term);
             // work units — window emissions produced (fold/finalize work).
             tlm_counter(sys, midx, t, b + 10, s.acct.work_units);
+            // Emissions that withheld a value because a Count/Sum/Avg or a
+            // TopK sum overflowed i64.
+            tlm_counter(sys, midx, t, b + 11, s.agg.arith_overflows() as u64);
         }
 
         // A present-but-invalid supplied checkpoint is a terminal fault: refuse

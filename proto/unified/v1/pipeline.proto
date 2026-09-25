@@ -47,6 +47,23 @@ message Stage {
 
   StagePolicy policy = 5;    // retries/timeouts/backpressure/compensation
   string on_failure = 6;     // stage name to route to on failure (failure routing)
+
+  // A MAP stage: the Call's Expression (params: element, record; bool result)
+  // is applied to every element of a repeated field. The iteration is
+  // declarative and bounded here, never in the expression.
+  MapSpec map = 7;
+}
+
+// The bounded iteration of a map stage (bytecode_policy.md, "constrained
+// artefact kinds"): field names in the stage's input message.
+message MapSpec {
+  string over = 1;           // the repeated field whose elements are mapped
+  uint64 max = 2;            // declared element cap; more refuses the stage
+  reserved 3, 4, 5;
+  reserved "lookup", "element_key", "lookup_key";
+  string count_true = 6;     // where the verdict counts land (int fields)
+  string count_false = 7;
+  string count_unknown = 8;
 }
 
 message Call {

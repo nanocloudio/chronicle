@@ -1,6 +1,6 @@
 // CEL extension builtins — the `CALL` opcode's dispatch table and
 // implementations. Pure, dependency-free, no_std; `include!`d wherever
-// `vm_core.rs` is (all five engines + the host crate), same one-source rule.
+// `vm_core.rs` is (all five engines + the host test harness), same one-source rule.
 //
 // THE SURFACE IS PINNED, NOT INVENTED. Functions are the ASCII/byte-scoped
 // subset of CEL's standard library and its versioned extension libraries
@@ -24,7 +24,7 @@
 // `EvalError::BadBuiltin` — never a silent identity, never a guess.
 //
 // OUTPUT DISCIPLINE: functions that produce bytes which do not exist in the
-// input (`reverse`, case mapping, `replace`, base64) append into the caller's
+// input (`reverse`, case mapping, `replace`, base64, string `+`) append into the caller's
 // bounded scratch arena and return `Value::Scratch{off,len}`. Functions that
 // can answer with a SUBSLICE of an argument (`substring`, `trim`, `charAt`)
 // do so — zero copies. Predicates and indexes return scalars. Overflowing
@@ -69,12 +69,10 @@ pub mod builtin {
                                  // ── encoders (feature "encoders") ───────────────────────────────────
     pub const B64_ENCODE: u16 = 25; //  (str|bytes) -> str   [std alphabet, pad]
     pub const B64_DECODE: u16 = 26; //  (str) -> bytes       [strict]
-                                    // ── documents (feature "strings") ───────────────────────────────────
-    pub const JSON_GET: u16 = 27; //  json.get(doc, path) -> str   [EMPTY when absent]
-    pub const JSON_HAS: u16 = 28; //  json.has(doc, path) -> bool
-    pub const JSON_SET_DEFAULT: u16 = 29; //  json.setDefault(doc, path, raw) -> str
-    pub const PART: u16 = 30; //  (s, delim, i) -> str      [the i-th part; EMPTY past the end]
+                                    // 27..=30 and 33: unassigned, never reused
+                                    // (docs/bytecode_policy.md, "Unassigned codes").
     pub const CONCAT: u16 = 31; //  a + b (strings) -> str      [scratch]
+    pub const INT_OF: u16 = 32; //  int(x): int|uint|str -> int     [conversion]
 }
 
 /// Bounded output arena for scratch-producing builtins. The caller owns the
@@ -116,12 +114,14 @@ pub fn builtin_available(id: u16) -> bool {
         #[cfg(feature = "strings")]
         SIZE | CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF | CHAR_AT
         | SUBSTRING | SUBSTRING_RANGE | TRIM | REVERSE_STR | REVERSE_BYTES | LOWER_ASCII
-        | UPPER_ASCII | REPLACE | JSON_GET | JSON_HAS | JSON_SET_DEFAULT | PART | CONCAT => true,
+        | UPPER_ASCII | REPLACE | CONCAT => true,
         #[cfg(feature = "math")]
         MATH_GREATEST | MATH_LEAST | MATH_ABS | MATH_SIGN | BIT_AND | BIT_OR | BIT_XOR
         | BIT_SHL | BIT_SHR => true,
         #[cfg(feature = "encoders")]
         B64_ENCODE | B64_DECODE => true,
+        // CEL's standard conversions: every build.
+        INT_OF => true,
         _ => false,
     }
 }
@@ -135,11 +135,10 @@ pub fn builtin_arity(id: u16) -> Option<usize> {
     use builtin::*;
     Some(match id {
         SIZE | TRIM | REVERSE_STR | REVERSE_BYTES | LOWER_ASCII | UPPER_ASCII | MATH_ABS
-        | MATH_SIGN | B64_ENCODE | B64_DECODE => 1,
+        | MATH_SIGN | B64_ENCODE | B64_DECODE | INT_OF => 1,
         CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF | CHAR_AT | SUBSTRING
-        | MATH_GREATEST | MATH_LEAST | BIT_AND | BIT_OR | BIT_XOR | BIT_SHL | BIT_SHR
-        | JSON_GET | JSON_HAS | CONCAT => 2,
-        SUBSTRING_RANGE | REPLACE | JSON_SET_DEFAULT | PART => 3,
+        | MATH_GREATEST | MATH_LEAST | BIT_AND | BIT_OR | BIT_XOR | BIT_SHL | BIT_SHR | CONCAT => 2,
+        SUBSTRING_RANGE | REPLACE => 3,
         _ => return None,
     })
 }
@@ -221,7 +220,8 @@ impl<'a> Source<'a> {
 fn arg_int(v: &Value<'_>) -> Result<i64, EvalError> {
     match v {
         Value::Int(i) => Ok(*i),
-        Value::Uint(u) => Ok(*u as i64),
+        // A `Uint` above `i64::MAX` has no i64 value: refused, not wrapped.
+        Value::Uint(u) => i64::try_from(*u).map_err(|_| EvalError::Overflow),
         _ => Err(EvalError::TypeError),
     }
 }
@@ -307,196 +307,6 @@ fn b64_val(c: u8) -> Option<u8> {
     }
 }
 
-// ---- JSON: a bounded path reader over a document's bytes -------------------
-//
-// Shared by the `json.*` builtins and the decoder's `rd::JSON`. It reads where
-// the document lives and allocates nothing. Every step moves forward through the
-// bytes — a member or element that is not followed by `,` or its closer ends the
-// read as absent — so the work is bounded by the document's length, whatever
-// index or path a caller names. Keys are compared as written: a key the document
-// spells with an escape is matched only by a path spelling it the same way.
-
-/// Skip JSON whitespace from `i`.
-fn json_ws(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
-        i += 1;
-    }
-    i
-}
-
-/// The end of the JSON value starting at `i` (bounded by the bytes: a
-/// malformed document ends early rather than overruns).
-fn json_skip(b: &[u8], i: usize) -> usize {
-    let i = json_ws(b, i);
-    if i >= b.len() {
-        return i;
-    }
-    match b[i] {
-        b'"' => {
-            let mut j = i + 1;
-            while j < b.len() && b[j] != b'"' {
-                if b[j] == b'\\' {
-                    j += 1;
-                }
-                j += 1;
-            }
-            (j + 1).min(b.len())
-        }
-        b'{' | b'[' => {
-            let mut depth = 0usize;
-            let mut j = i;
-            while j < b.len() {
-                match b[j] {
-                    b'"' => {
-                        j = json_skip(b, j);
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return j + 1;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            j
-        }
-        _ => {
-            let mut j = i;
-            while j < b.len() && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
-            {
-                j += 1;
-            }
-            j
-        }
-    }
-}
-
-/// The value at one step (`key` of an object, or index of an array) from the
-/// value starting at `i`: its start. `None` when the step is absent or the
-/// container is malformed on the way to it.
-fn json_step(b: &[u8], i: usize, seg: &[u8]) -> Option<usize> {
-    let i = json_ws(b, i);
-    match *b.get(i)? {
-        b'{' => {
-            let mut j = json_ws(b, i + 1);
-            loop {
-                // `"key": value`, then `,` or the end of the object.
-                if b.get(j) != Some(&b'"') {
-                    return None;
-                }
-                let ke = json_skip(b, j);
-                let key = b.get(j + 1..ke.checked_sub(1)?)?;
-                j = json_ws(b, ke);
-                if b.get(j) != Some(&b':') {
-                    return None;
-                }
-                let vs = json_ws(b, j + 1);
-                if key == seg {
-                    return Some(vs);
-                }
-                j = json_ws(b, json_skip(b, vs));
-                match b.get(j) {
-                    Some(b',') => j = json_ws(b, j + 1),
-                    _ => return None,
-                }
-            }
-        }
-        b'[' => {
-            let mut want = 0usize;
-            for &c in seg {
-                if !c.is_ascii_digit() {
-                    return None;
-                }
-                want = want.checked_mul(10)?.checked_add((c - b'0') as usize)?;
-            }
-            let mut j = json_ws(b, i + 1);
-            let mut k = 0usize;
-            loop {
-                // An element must be there and must move the cursor; then `,`
-                // or the end of the array. An index past the last element is
-                // therefore reached only by walking the array, never by counting
-                // in place.
-                let e = json_skip(b, j);
-                if j >= b.len() || e == j {
-                    return None;
-                }
-                if k == want {
-                    return Some(j);
-                }
-                j = json_ws(b, e);
-                match b.get(j) {
-                    Some(b',') => j = json_ws(b, j + 1),
-                    _ => return None,
-                }
-                k += 1;
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The raw span `[start, end)` of the value at a dotted path (object keys;
-/// decimal array indices), or `None` when absent. Empty segments are skipped, so
-/// an empty path names the document itself.
-fn json_locate(doc: &[u8], path: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0usize;
-    for seg in path.split(|&c| c == b'.') {
-        if seg.is_empty() {
-            continue;
-        }
-        i = json_step(doc, i, seg)?;
-    }
-    let i = json_ws(doc, i);
-    if i >= doc.len() {
-        return None;
-    }
-    Some((i, json_skip(doc, i)))
-}
-
-/// A span as a value reads: a string's content without its quotes, anything
-/// else as written.
-fn json_unquote(doc: &[u8], (i, e): (usize, usize)) -> (usize, usize) {
-    if e >= i + 2 && doc[i] == b'"' {
-        (i + 1, e - 1)
-    } else {
-        (i, e)
-    }
-}
-
-/// The value at a dotted path as [`json_unquote`] reads it; EMPTY when absent.
-fn json_value<'a>(doc: &'a [u8], path: &[u8]) -> &'a [u8] {
-    match json_locate(doc, path) {
-        Some(span) => {
-            let (i, e) = json_unquote(doc, span);
-            &doc[i..e]
-        }
-        None => &[],
-    }
-}
-
-/// Append `src[lo..hi]` into the scratch at `*w` (a reserved range).
-fn put_src(src: &Source<'_>, lo: usize, hi: usize, s: &mut Scratch<'_>, w: &mut usize) {
-    let mut i = lo;
-    while i < hi {
-        let b = src.at(i, s);
-        s.buf[*w] = b;
-        *w += 1;
-        i += 1;
-    }
-}
-
-/// Append literal bytes into the scratch at `*w` (a reserved range).
-fn put_lit(bytes: &[u8], s: &mut Scratch<'_>, w: &mut usize) {
-    for &b in bytes {
-        s.buf[*w] = b;
-        *w += 1;
-    }
-}
-
 /// Dispatch one builtin call. `args` are in declaration order (receiver
 /// first). Scratch-producing functions append into `s`. Ids absent from this
 /// build (feature off) or unknown fail closed with `BadBuiltin`.
@@ -512,86 +322,20 @@ pub fn call_builtin<'a>(
 ) -> Result<Value<'a>, EvalError> {
     use builtin::*;
     match id {
+        INT_OF => match args[0] {
+            Value::Int(i) => Ok(Value::Int(i)),
+            Value::Uint(u) => i64::try_from(u)
+                .map(Value::Int)
+                .map_err(|_| EvalError::TypeError),
+            _ => {
+                let src = Source::of(&args[0])?;
+                parse_i64_text(src.bytes(s))
+                    .map(Value::Int)
+                    .ok_or(EvalError::TypeError)
+            }
+        },
         #[cfg(feature = "strings")]
         SIZE => Ok(Value::Int(Source::of(&args[0])?.len() as i64)),
-        #[cfg(feature = "strings")]
-        JSON_GET | JSON_HAS | JSON_SET_DEFAULT => {
-            // Read in place: an external document is a borrowed slice and a
-            // scratch one is read where it sits. Every position is taken from
-            // those borrows before anything is written.
-            let docs = Source::of(&args[0])?;
-            let paths = Source::of(&args[1])?;
-            let found = json_locate(docs.bytes(s), paths.bytes(s));
-            match id {
-                JSON_HAS => Ok(Value::Bool(found.is_some())),
-                JSON_GET => Ok(match found {
-                    Some(span) => {
-                        let (i, e) = json_unquote(docs.bytes(s), span);
-                        docs.window_value(i, e)
-                    }
-                    None => docs.window_value(0, 0),
-                }),
-                _ => {
-                    // The default goes in only where there is nothing: a
-                    // present field — whatever its value — is the caller's.
-                    if found.is_some() {
-                        return Ok(args[0]);
-                    }
-                    let raws = Source::of(&args[2])?;
-                    let p = paths.bytes(s);
-                    // `k` (top level) or `parent.k` (one level down, the parent
-                    // an object that exists); any other path leaves the document
-                    // as it is.
-                    let (parent, key) = match p.iter().position(|&c| c == b'.') {
-                        None => (None, 0..p.len()),
-                        Some(d) if p.iter().rposition(|&c| c == b'.') == Some(d) => {
-                            (Some(0..d), d + 1..p.len())
-                        }
-                        Some(_) => return Ok(args[0]),
-                    };
-                    // The key is written verbatim, so one that JSON would need
-                    // escaped is not written at all: the document comes back
-                    // unchanged, not malformed or carrying members the path
-                    // smuggled in.
-                    if p[key.clone()]
-                        .iter()
-                        .any(|&c| c == b'"' || c == b'\\' || c < 0x20)
-                    {
-                        return Ok(args[0]);
-                    }
-                    let d = docs.bytes(s);
-                    let obj_at = match parent {
-                        None => json_ws(d, 0),
-                        Some(pp) => match json_locate(d, &p[pp]) {
-                            Some((i, _)) => i,
-                            None => return Ok(args[0]),
-                        },
-                    };
-                    if d.get(obj_at) != Some(&b'{') {
-                        return Ok(args[0]);
-                    }
-                    let empty = d.get(json_ws(d, obj_at + 1)) == Some(&b'}');
-                    let (dl, rl) = (d.len(), raws.len());
-                    // doc[..=obj_at] "key":raw [,] doc[obj_at+1..]
-                    let total = dl + 1 + key.len() + 2 + rl + usize::from(!empty);
-                    let off = s.reserve(total)?;
-                    let mut w = off;
-                    put_src(&docs, 0, obj_at + 1, s, &mut w);
-                    put_lit(b"\"", s, &mut w);
-                    put_src(&paths, key.start, key.end, s, &mut w);
-                    put_lit(b"\":", s, &mut w);
-                    put_src(&raws, 0, rl, s, &mut w);
-                    if !empty {
-                        put_lit(b",", s, &mut w);
-                    }
-                    put_src(&docs, obj_at + 1, dl, s, &mut w);
-                    Ok(Value::Scratch {
-                        off: off as u32,
-                        len: total as u32,
-                    })
-                }
-            }
-        }
         #[cfg(feature = "strings")]
         CONCAT => {
             let a = Source::of(&args[0])?;
@@ -607,43 +351,6 @@ pub fn call_builtin<'a>(
             Ok(Value::Scratch {
                 off: off as u32,
                 len: (al + bl) as u32,
-            })
-        }
-        #[cfg(feature = "strings")]
-        PART => {
-            let src = Source::of(&args[0])?;
-            let delim = Source::of(&args[1])?;
-            // A negative index is a type error; one past the address space is
-            // past the last part, on every target. `try_from` rather than `as`,
-            // which would truncate on a 32-bit core.
-            let want = arg_int(&args[2])?;
-            if want < 0 {
-                return Err(EvalError::TypeError);
-            }
-            let want = usize::try_from(want).unwrap_or(usize::MAX);
-            let (n, dn) = (src.len(), delim.len());
-            if dn == 0 {
-                return Err(EvalError::TypeError);
-            }
-            let mut start = 0usize;
-            let mut k = 0usize;
-            let mut i = 0usize;
-            while i + dn <= n {
-                if src.window_eq(i, &delim, s) {
-                    if k == want {
-                        return Ok(src.window_value(start, i));
-                    }
-                    k += 1;
-                    i += dn;
-                    start = i;
-                } else {
-                    i += 1;
-                }
-            }
-            Ok(if k == want {
-                src.window_value(start, n)
-            } else {
-                src.window_value(0, 0)
             })
         }
         #[cfg(feature = "strings")]
@@ -804,7 +511,7 @@ pub fn call_builtin<'a>(
             arg_int(&args[0])?
                 .checked_abs()
                 .map(Value::Int)
-                .ok_or(EvalError::TypeError)
+                .ok_or(EvalError::Overflow)
         }
         #[cfg(feature = "math")]
         MATH_SIGN => Ok(Value::Int(arg_int(&args[0])?.signum())),
@@ -920,5 +627,29 @@ pub fn call_builtin<'a>(
             })
         }
         _ => Err(EvalError::BadBuiltin(id)),
+    }
+}
+
+/// A decimal integer (`[-+]digits`), checked; `None` otherwise.
+fn parse_i64_text(b: &[u8]) -> Option<i64> {
+    let (neg, d) = match b.first() {
+        Some(b'-') => (true, &b[1..]),
+        Some(b'+') => (false, &b[1..]),
+        _ => (false, b),
+    };
+    if d.is_empty() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for &c in d {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_sub(i64::from(c - b'0'))?;
+    }
+    if neg {
+        Some(v)
+    } else {
+        v.checked_neg()
     }
 }

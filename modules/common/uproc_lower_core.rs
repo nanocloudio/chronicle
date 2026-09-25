@@ -13,9 +13,11 @@
 // the same, and a message type is its qualified name in both. Getting this wrong
 // would not fail loudly — an unknown type name reads as a message name, so
 // `string` would silently become "a message called string" and the error would
-// surface later as a type mismatch inside an expression body. So the mapping is
-// explicit and total, and unknown names are passed through as message names
-// deliberately rather than by accident.
+// surface later as a type mismatch inside an expression body. So `string` is
+// mapped explicitly, a scalar the toolchain does not have (`double`, `float`)
+// is refused by the parser (`UnsupportedType`) before it gets here, and any
+// other name is passed through as a message name deliberately rather than by
+// accident.
 //
 // Requires `uproc_core`.
 
@@ -79,14 +81,13 @@ fn put_i64(out: &mut [u8], p: usize, v: i64) -> Result<usize, LowerDocError> {
 
 /// Translate a DSL type name to the compiler's schema vocabulary.
 ///
-/// The scalars are spelled identically except `string`, which the schema text
-/// writes as `str`. Anything else is a MESSAGE name and passes through — which
-/// is why the scalar list is exhaustive rather than a default case.
+/// The scalars (`int`, `uint`, `bool`, `bytes`, `str`) are spelled
+/// identically except `string`, which the schema text writes as `str`; they
+/// and every MESSAGE name pass through unchanged.
 pub fn schema_type_name(dsl: &[u8]) -> &[u8] {
     match dsl {
         b"string" => b"str",
-        b"int" | b"uint" | b"double" | b"bool" | b"bytes" | b"str" => dsl,
-        other => other, // a qualified message name
+        other => other,
     }
 }
 
@@ -94,7 +95,7 @@ pub fn schema_type_name(dsl: &[u8]) -> &[u8] {
 ///
 /// Emits every declared message as `Name{field:ty@number,...};` then every enum
 /// constant as `NAME=value;` — each entry TERMINATED by `;`, including the last,
-/// matching the host byte for byte. Declaration order is preserved, so the same
+/// byte for byte as the pinned digests require. Declaration order is preserved, so the same
 /// document always yields the same text, and therefore the same bytecode and the
 /// same digests.
 pub fn uproc_schema_text(
@@ -120,8 +121,8 @@ pub fn uproc_schema_text(
             p = put_u32(out, p, f.number)?;
         }
         // Each entry is TERMINATED by `;`, not separated by it — including the
-        // last. Matching the host exactly matters more than looking tidy: the
-        // schema text is the input every digest is ultimately a function of.
+        // last. The exact bytes matter more than looking tidy: the schema
+        // text is the input every digest is ultimately a function of.
         p = put(out, p, b"};")?;
     }
     for ei in 0..doc.n_enums {
@@ -152,7 +153,7 @@ pub fn uproc_params_text(
 /// name; a scalar parameter has none.
 pub fn param_message_name(param_type: &[u8]) -> &[u8] {
     match param_type {
-        b"int" | b"uint" | b"double" | b"bool" | b"bytes" | b"string" | b"str" => b"",
+        b"int" | b"uint" | b"bool" | b"bytes" | b"string" | b"str" => b"",
         other => other,
     }
 }
@@ -190,7 +191,7 @@ pub fn split_qname(qualified: &[u8]) -> (&[u8], &[u8]) {
 /// two aggregations in one module cannot collide.
 ///
 /// `base_len` is the length of the schema text already in `out`; the context is
-/// appended after it, in the same order the host adds it.
+/// appended after it, in a fixed order (State, Window, EmitCtx).
 pub fn uproc_agg_emit_schema(
     src: &[u8],
     agg: &AggregationDecl,

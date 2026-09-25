@@ -1,34 +1,34 @@
 // Bounded, no_std, no-alloc BYTE-SERIALIZATION VM. Like the other `*_core.rs`
 // files it has NO inner attributes and NO test module, so it is `include!`d
-// verbatim by both this crate and the on-device modules — one source of truth.
+// verbatim by both the host harness and the on-device module — one source of
+// truth.
 //
-// This turns "build a wire request from a record" into ordinary bytecode: an
-// encoder is a Transformation whose result is a byte buffer, not a message. The
-// value machinery (LOAD_PARAM / GET_FIELD / PUSH_* / arithmetic) is shared with
-// `core.rs`; these opcodes append bytes to an output buffer and frame regions
-// (length prefixes, varints, CRC-32C) so protocols like RESP, the Postgres
-// simple-query stream, MQTT packets, and Kafka RecordBatches are all expressible
-// with no protocol-specific module and no external payload builder.
+// This turns framing a single message — literals, binary integers, length
+// prefixes, varints, a CRC-32C — into ordinary bytecode: an encoder is a
+// Transformation whose result is a byte buffer, not a message. The value
+// machinery (LOAD_PARAM / GET_FIELD / PUSH_* / arithmetic) is shared with
+// `vm_core.rs`; these opcodes append bytes to an output buffer and frame
+// regions. It frames messages; it does not speak protocols — handshakes and
+// reply-dependent state are out of scope (see docs/guides/wire-codec.md).
 //
 // Region model: emitting always appends at the tail, which is the innermost open
 // region. Closing a region prepends its frame (len / varint / crc) by shifting
 // the region's bytes right and writing the prefix — so nested framing composes.
 
-/// Byte-serialization opcodes (0x60+, disjoint from the value/message opcodes in
-/// `core.rs::op`).
-// Decimal ASCII rendering, used by the `LEN`/`VAL` integer paths below and by
-// length-prefix regions. Lived in the retired `resp_core` (Redis reply framing,
-// now lattice's `redis_client`); it is pure integer formatting with no protocol
-// in it, so it moved to its only remaining consumer rather than being deleted.
+// Decimal ASCII rendering, for the `VAL` integer paths and `RGN_DECLEN`.
 /// Write `v` as decimal ASCII into `out`; returns the length, or `None` if `out`
 /// is too small. No allocation, no panic path (freestanding-module safe).
 pub fn itoa(v: i64, out: &mut [u8]) -> Option<usize> {
-    let neg = v < 0;
-    let mut u: u64 = if neg {
-        (v as i128).unsigned_abs() as u64
-    } else {
-        v as u64
-    };
+    utoa_signed(v.unsigned_abs(), v < 0, out)
+}
+
+/// [`itoa`] for an unsigned value: all of `u64`, never read as negative.
+pub fn utoa(u: u64, out: &mut [u8]) -> Option<usize> {
+    utoa_signed(u, false, out)
+}
+
+/// The magnitude `u` as decimal ASCII, after a `-` when `neg`.
+fn utoa_signed(mut u: u64, neg: bool, out: &mut [u8]) -> Option<usize> {
     let mut tmp = [0u8; 20];
     let mut n = 0usize;
     if u == 0 {
@@ -58,24 +58,37 @@ pub fn itoa(v: i64, out: &mut [u8]) -> Option<usize> {
     Some(total)
 }
 
+/// Byte-serialization opcodes (0x60+, disjoint from the value/message opcodes in
+/// `vm_core.rs`'s `op`).
 pub mod ser {
     pub const LIT: u8 = 0x60; // len:u16 LE, bytes — append literal
     pub const VAL: u8 = 0x61; // pop value → append (bytes raw / int decimal / bool "0"/"1")
-    pub const INT: u8 = 0x62; // width:u8, endian:u8(0=BE,1=LE) — pop int → append binary
-    pub const VARINT: u8 = 0x63; // pop int → append zig-zag varint
+    pub const INT: u8 = 0x62; // width:u8, endian:u8(0=BE,1=LE) — pop int → append binary; `Overflow` when it does not fit `width` bytes (a Uint or non-negative Int unsigned, a negative Int two's complement)
+    pub const VARINT: u8 = 0x63; // pop int → append varint: an Int zig-zagged, a Uint as its plain unsigned value
     pub const LEN: u8 = 0x64; // pop bytes/str → push Int(byte length)
     pub const RGN_BEGIN: u8 = 0x65; // open a region
     pub const RGN_END: u8 = 0x66; // close: merge into parent (no prefix)
-    pub const RGN_LEN: u8 = 0x67; // width:u8, endian:u8, delta:i8 — prepend length
+    pub const RGN_LEN: u8 = 0x67; // width:u8, endian:u8, delta:i8 — prepend length + delta; `Overflow` when that is negative or does not fit `width` bytes
     pub const RGN_VARINT: u8 = 0x68; // prepend varint(len)
     pub const RGN_CRC: u8 = 0x69; // prepend crc32c (4 bytes BE)
-    pub const FINISH: u8 = 0x6A; // terminator: result = the serialized bytes
+    pub const FINISH: u8 = 0x6A; // terminator: result = the serialized bytes; `TypeError` while a region is still open
     pub const RGN_DECLEN: u8 = 0x6B; // prepend "<decimal len>\r\n" (RESP bulk header)
     pub const RGN_ZIGVARINT: u8 = 0x6C; // prepend zig-zag (signed) varint(len) (Kafka)
 }
 
 const SER_STACK: usize = 32;
 const MAX_REGIONS: usize = 12;
+
+/// An integer operand as its 64-bit two's-complement pattern: a `Uint` above
+/// `i64::MAX` keeps its bits, which is what the wire carries. Arithmetic reads
+/// an operand's value instead (`as_arith_int`), where such a `Uint` overflows.
+fn as_int(v: Value<'_>) -> Result<i64, EvalError> {
+    match v {
+        Value::Int(i) => Ok(i),
+        Value::Uint(u) => Ok(u as i64),
+        _ => Err(EvalError::TypeError),
+    }
+}
 
 /// CRC-32C (Castagnoli, reflected) — used by `ser::RGN_CRC` (Kafka RecordBatch).
 fn ser_crc32c(data: &[u8]) -> u32 {
@@ -169,7 +182,7 @@ pub fn eval_bytes<'a>(
         let opcode = code[pc];
         pc += 1;
 
-        // Shared value-load and arithmetic ops (see core.rs).
+        // Shared value-load and arithmetic ops (see vm_core.rs).
         if let Some(res) = load_op(opcode, code, &mut pc, params, &mut stack, &mut sp) {
             res?;
             continue;
@@ -183,7 +196,7 @@ pub fn eval_bytes<'a>(
             // ---- byte serialization ----
             ser::LEN => {
                 let n = match pop!() {
-                    Value::Bytes(b) => b.len() as i64,
+                    Value::Bytes(b) | Value::Frame(b) => b.len() as i64,
                     Value::Str(s) => s.len() as i64,
                     _ => return Err(EvalError::TypeError),
                 };
@@ -198,7 +211,7 @@ pub fn eval_bytes<'a>(
                 put!(bytes);
             }
             ser::VAL => match pop!() {
-                Value::Bytes(b) => put!(b),
+                Value::Bytes(b) | Value::Frame(b) => put!(b),
                 Value::Str(s) => put!(s.as_bytes()),
                 Value::Int(i) => {
                     let mut tmp = [0u8; 20];
@@ -207,7 +220,7 @@ pub fn eval_bytes<'a>(
                 }
                 Value::Uint(u) => {
                     let mut tmp = [0u8; 20];
-                    let n = itoa(u as i64, &mut tmp).ok_or(EvalError::BuildOverflow)?;
+                    let n = utoa(u, &mut tmp).ok_or(EvalError::BuildOverflow)?;
                     put!(&tmp[..n]);
                 }
                 Value::Bool(bl) => put!(if bl { b"1".as_slice() } else { b"0".as_slice() }),
@@ -217,16 +230,34 @@ pub fn eval_bytes<'a>(
                 let width = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
                 let endian = *code.get(pc + 1).ok_or(EvalError::Truncated)?;
                 pc += 2;
-                let v = as_int(pop!())?;
+                let val = pop!();
                 if width == 0 || width > 8 {
                     return Err(EvalError::TypeError);
                 }
-                let le = v.to_le_bytes();
+                // The value must fit: a Uint or a non-negative Int unsigned, a
+                // negative Int in two's complement. Refused, never truncated.
+                let bits = 8 * width as u32;
+                let (le, fits) = match val {
+                    Value::Uint(u) => (u.to_le_bytes(), width == 8 || u >> bits == 0),
+                    other => {
+                        let v = as_int(other)?;
+                        let fits = width == 8
+                            || if v >= 0 {
+                                (v as u64) >> bits == 0
+                            } else {
+                                v >> (bits - 1) == -1
+                            };
+                        (v.to_le_bytes(), fits)
+                    }
+                };
+                if !fits {
+                    return Err(EvalError::Overflow);
+                }
                 let mut buf = [0u8; 8];
                 if endian == 1 {
                     buf[..width].copy_from_slice(&le[..width]); // little-endian: low bytes
                 } else {
-                    // big-endian: high `width` bytes of the value, MSB first
+                    // big-endian: the low `width` bytes, most significant first
                     for k in 0..width {
                         buf[k] = le[width - 1 - k];
                     }
@@ -234,8 +265,15 @@ pub fn eval_bytes<'a>(
                 put!(&buf[..width]);
             }
             ser::VARINT => {
-                let v = as_int(pop!())?;
-                let mut u = ((v << 1) ^ (v >> 63)) as u64;
+                // A signed Int zig-zags; a Uint is already unsigned and writes
+                // its true value, never read as a negative i64.
+                let mut u = match pop!() {
+                    Value::Uint(u) => u,
+                    other => {
+                        let v = as_int(other)?;
+                        ((v << 1) ^ (v >> 63)) as u64
+                    }
+                };
                 loop {
                     let mut byte = (u & 0x7f) as u8;
                     u >>= 7;
@@ -275,6 +313,10 @@ pub fn eval_bytes<'a>(
                 rsp -= 1;
                 let s = regions[rsp];
                 let len = (end - s) as i64 + delta;
+                // A length the prefix cannot carry is refused, never truncated.
+                if len < 0 || (width < 8 && (len as u64) >> (8 * width as u32) != 0) {
+                    return Err(EvalError::Overflow);
+                }
                 shift_for_prefix!(s, width);
                 let le = len.to_le_bytes();
                 if endian == 1 {
@@ -343,7 +385,12 @@ pub fn eval_bytes<'a>(
                 out[s + dl] = b'\r';
                 out[s + dl + 1] = b'\n';
             }
-            ser::FINISH => return Ok(end),
+            ser::FINISH => {
+                if rsp != 0 {
+                    return Err(EvalError::TypeError); // a region left unframed
+                }
+                return Ok(end);
+            }
             other => return Err(EvalError::BadOpcode(other)),
         }
     }

@@ -27,6 +27,10 @@ pub enum PackError {
     TooManyItems,
     /// A program's code is longer than the two-byte length prefix allows.
     ProgramTooLong,
+    /// An aggregation operator's parameter is outside its kind's range: TopK's
+    /// `k` below 1, Quantile's permille above 1000, or any parameter on a kind
+    /// that takes none.
+    BadParameter,
 }
 
 /// One bytecode program as the containers carry it: a `max_cost` budget paired
@@ -38,10 +42,13 @@ pub struct Prog<'a> {
 }
 
 /// One aggregation operator: its kind byte (0=Count, 1=Sum, 2=Min, 3=Max,
-/// 4=Avg, 5=Distinct, 6=TopK, 7=Quantile) and selector program (empty for Count).
+/// 4=Avg, 5=Distinct, 6=TopK, 7=Quantile), its parameter (TopK's `k`,
+/// Quantile's permille; 0 for every other kind) and selector program (empty for
+/// Count).
 #[derive(Clone, Copy)]
 pub struct PackedOp<'a> {
     pub kind: u8,
+    pub param: u16,
     pub selector: Prog<'a>,
 }
 
@@ -177,7 +184,7 @@ pub fn pack_decision(
 /// ```text
 ///   [window:i64][lateness:i64][max_lanes:u32][window_step:i64][correction_horizon:i64]
 ///   [key prog][time prog][emit prog]
-///   [nops:u8] then per op [kind:u8][selector prog]
+///   [nops:u8] then per op [kind:u8][param:u16, TopK and Quantile only][selector prog]
 /// ```
 pub fn pack_agg_def(
     out: &mut [u8],
@@ -193,7 +200,7 @@ pub fn pack_agg_def(
     p = pk_prog(out, p, emit)?;
     p = pk_u8(out, p, count_u8(ops.len())?)?;
     for op in ops {
-        p = pk_u8(out, p, op.kind)?;
+        p = pack_op_head(out, p, op.kind, op.param)?;
         p = pk_prog(out, p, &op.selector)?;
     }
     Ok(p)
@@ -210,18 +217,37 @@ pub fn pack_agg_ir_def(
     key_ir: &[u8],
     time_ir: &[u8],
     emit_ir: &[u8],
-    ops: &[(u8, &[u8])],
+    ops: &[(u8, u16, &[u8])],
 ) -> Result<usize, PackError> {
     let mut p = pk_agg_header(out, hdr)?;
     p = pk_ir_prog(out, p, key_ir)?;
     p = pk_ir_prog(out, p, time_ir)?;
     p = pk_ir_prog(out, p, emit_ir)?;
     p = pk_u8(out, p, count_u8(ops.len())?)?;
-    for (kind, sel_ir) in ops {
-        p = pk_u8(out, p, *kind)?;
+    for (kind, param, sel_ir) in ops {
+        p = pack_op_head(out, p, *kind, *param)?;
         p = pk_ir_prog(out, p, sel_ir)?;
     }
     Ok(p)
+}
+
+/// An operator's kind byte and, for TopK and Quantile, its `u16` parameter
+/// ([`def_op_param_len`]). A parameter the engine would refuse at load is
+/// refused here instead.
+pub fn pack_op_head(out: &mut [u8], p: usize, kind: u8, param: u16) -> Result<usize, PackError> {
+    let ok = match kind {
+        6 => param >= 1,
+        7 => param <= 1000,
+        _ => param == 0,
+    };
+    if !ok {
+        return Err(PackError::BadParameter);
+    }
+    let p = pk_u8(out, p, kind)?;
+    if def_op_param_len(kind) == 0 {
+        return Ok(p);
+    }
+    pk_put(out, p, &param.to_le_bytes())
 }
 
 /// The 36-byte scalar header both `def` container forms share.

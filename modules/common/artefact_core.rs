@@ -1,10 +1,10 @@
 // Canonical artefact encoding — ONE implementation, host and device.
 //
 // An artefact's identity is the sha256 of its canonical protobuf encoding. This
-// encodes artefacts directly with `pb_core`, so the same source runs in the
-// authoring crate and inside a `.fmod` — there is no second encoder to drift
-// against, only one that `tests/harness/tests/chronicle_cli.rs (corpus suite)` pins to
-// prost.
+// encodes artefacts directly with `pb_core`, so the same source runs in the host
+// harness and inside a `.fmod` — there is no second encoder to drift against.
+// Its output is pinned by the baked digests in
+// `tests/harness/tests/chronicle_cli_suites/` (the corpus suite).
 //
 // FIELD ORDER IS SIGNIFICANT. prost writes fields in ascending tag order and
 // omits proto3 defaults; every writer below follows the schema's tag order
@@ -110,6 +110,10 @@ pub fn pb_header(
 pub struct ExpressionSpec<'a> {
     pub param_name: &'a [u8],
     pub param_message: &'a [u8],
+    /// Further `(name, message)` parameters, after the first — a map
+    /// stage's predicate reads its element and then the record. Empty for
+    /// every single-parameter expression, whose encoding is then unchanged.
+    pub more_params: &'a [(&'a [u8], &'a [u8])],
     pub result_type: &'a [u8],
     pub source: &'a [u8],
     pub bytecode: &'a [u8],
@@ -119,8 +123,8 @@ pub struct ExpressionSpec<'a> {
 /// `Expression { header = 1, parameters = 2, result = 3, compiled = 4,
 /// environment = 5, max_cost = 6 }`.
 ///
-/// Mirrors the host `build_expression`: one parameter, the strict-CEL
-/// capability, and the deterministic integer/NFC environment.
+/// The first parameter, then any `more_params`, the strict-CEL capability, and
+/// the deterministic integer/NFC environment.
 pub fn encode_expression(
     out: &mut [u8],
     header: &HeaderSpec,
@@ -135,6 +139,12 @@ pub fn encode_expression(
     w.bytes_field(1, spec.param_name)?;
     pb_type_ref(&mut w, 2, spec.param_message)?;
     w.close(p)?;
+    for (name, msg) in spec.more_params {
+        let q = w.open(2)?;
+        w.bytes_field(1, name)?;
+        pb_type_ref(&mut w, 2, msg)?;
+        w.close(q)?;
+    }
 
     pb_type_ref(&mut w, 3, spec.result_type)?;
 
@@ -342,7 +352,7 @@ pub fn pb_artefact_ref(
 }
 
 /// One artefact a Module contains: which repeated field it belongs to is
-/// decided by its `kind`, exactly as the host `build_module` classifies refs.
+/// decided by its `kind` (see [`module_field_for_kind`]).
 #[derive(Clone, Copy)]
 pub struct ModuleRef<'a> {
     pub package: &'a [u8],
@@ -353,7 +363,7 @@ pub struct ModuleRef<'a> {
 
 /// The Module field number a contained artefact of `kind` is listed under.
 /// Schemas=2, expressions=3, transformations=4, decisions=5, aggregations=6,
-/// pipelines=7 — the classification the host builder performs.
+/// pipelines=7.
 pub fn module_field_for_kind(kind: i32) -> Option<u32> {
     match kind {
         KIND_SCHEMA => Some(2),
@@ -366,7 +376,6 @@ pub fn module_field_for_kind(kind: i32) -> Option<u32> {
     }
 }
 
-/// A detached `Signature { algorithm = 1, signature = 2, signer = 3 }`.
 /// A resource a module REQUIRES the deployment to bind. `required` is the
 /// difference between "activation fails without this" and "nice to have".
 #[derive(Clone, Copy)]
@@ -385,6 +394,7 @@ pub struct EntrySpec<'a> {
     pub digest: &'a [u8],
 }
 
+/// A detached `Signature { algorithm = 1, signature = 2, signer = 3 }`.
 /// Detached because the digest it signs excludes signatures — signing must not
 /// perturb identity.
 pub struct SignatureSpec<'a> {
@@ -526,10 +536,13 @@ pub struct OperatorSpec<'a> {
     pub selector_source: &'a [u8],
     pub selector_code: &'a [u8],
     pub selector_cost: u64,
+    /// `Operator.parameter = 6`: TOPK's k, QUANTILE's permille; 0 (omitted)
+    /// for every parameterless operator.
+    pub parameter: u64,
 }
 
-/// An Aggregation's payload. Tumbling windows only — the shape chronicle's
-/// device kernel implements.
+/// An Aggregation's payload. `window_step_ms == 0` is a tumbling window of
+/// `window_size_ms`; non-zero is a sliding one with that step.
 pub struct AggregationSpec<'a> {
     pub input_type: &'a [u8],
     pub state_type: &'a [u8],
@@ -541,6 +554,7 @@ pub struct AggregationSpec<'a> {
     pub time_code: &'a [u8],
     pub time_cost: u64,
     pub window_size_ms: u64,
+    pub window_step_ms: u64,
     pub lateness_ms: u64,
     pub guard_ms: u64,
     pub emit_source: &'a [u8],
@@ -552,7 +566,8 @@ pub struct AggregationSpec<'a> {
 
 /// `Aggregation { header = 1, input = 2, state = 3, output = 4, key = 5,
 /// event_time = 6, window = 7, watermark = 8, operators = 9, emit = 10,
-/// cardinality = 11 }`. `Window` is a oneof; the tumbling arm is field 2.
+/// cardinality = 11 }`. `Window` is a oneof: `sliding = 1 { size_ms = 1,
+/// step_ms = 2 }` or `tumbling = 2 { size_ms = 1 }`.
 pub fn encode_aggregation(
     out: &mut [u8],
     header: &HeaderSpec,
@@ -568,12 +583,19 @@ pub fn encode_aggregation(
     pb_compiled(&mut w, 5, spec.key_source, spec.key_code, spec.key_cost)?;
     pb_compiled(&mut w, 6, spec.time_source, spec.time_code, spec.time_cost)?;
 
-    // Window window = 7 { oneof kind { … tumbling = 2 … }, trigger = 10,
-    //                     allowed_lateness_ms = 11 }
+    // Window window = 7 { oneof kind { sliding = 1, tumbling = 2 },
+    //                     trigger = 10, allowed_lateness_ms = 11 }
     let win = w.open(7)?;
-    let tum = w.open(2)?;
-    w.u64_field(1, spec.window_size_ms)?;
-    w.close(tum)?;
+    if spec.window_step_ms == 0 {
+        let tum = w.open(2)?;
+        w.u64_field(1, spec.window_size_ms)?;
+        w.close(tum)?;
+    } else {
+        let sld = w.open(1)?;
+        w.u64_field(1, spec.window_size_ms)?;
+        w.u64_field(2, spec.window_step_ms)?;
+        w.close(sld)?;
+    }
     // Trigger { on_watermark = 1, fire_on_close = 10, emit_retractions = 11 } —
     // the fixed policy chronicle compiles: fire on watermark, always close a
     // final pane, emit corrections for retractable operators.
@@ -591,7 +613,8 @@ pub fn encode_aggregation(
     w.u64_field(2, spec.guard_ms)?;
     w.close(wm)?;
 
-    // repeated Operator operators = 9 { name = 1, kind = 2, selector = 3 }
+    // repeated Operator operators = 9 { name = 1, kind = 2, selector = 3,
+    //                                   parameter = 6 }
     for op in operators {
         let m = w.open(9)?;
         w.bytes_field(1, op.name)?;
@@ -605,6 +628,7 @@ pub fn encode_aggregation(
                 op.selector_cost,
             )?;
         }
+        w.u64_field(6, op.parameter)?;
         w.close(m)?;
     }
 
@@ -647,6 +671,22 @@ pub struct StageSpec<'a> {
     pub operation: &'a [u8],
     /// Single `Binding { name = 1, value_ref = 2 }`, both set to this value.
     pub argument: &'a [u8],
+    /// A MAP stage: the Call's expression is applied to every element of a
+    /// repeated field (`Stage.map = 7`). `None` for every other stage, whose
+    /// encoding is then unchanged.
+    pub map: Option<MapStageSpec<'a>>,
+}
+
+/// `MapSpec { over = 1, max = 2, count_true = 6, count_false = 7,
+/// count_unknown = 8 }` — the declared, bounded iteration a map stage runs
+/// (field names, and the element cap).
+#[derive(Clone, Copy)]
+pub struct MapStageSpec<'a> {
+    pub over: &'a [u8],
+    pub max: u64,
+    pub count_true: &'a [u8],
+    pub count_false: &'a [u8],
+    pub count_unknown: &'a [u8],
 }
 
 /// `Pipeline { header = 1, inputs = 2, outputs = 3, sources = 4, stages = 5,
@@ -712,6 +752,15 @@ pub fn encode_pipeline(
         w.bytes_field(1, st.argument)?;
         w.bytes_field(2, st.argument)?;
         w.close(b)?;
+        if let Some(mp) = st.map {
+            let ms = w.open(7)?;
+            w.bytes_field(1, mp.over)?;
+            w.u64_field(2, mp.max)?;
+            w.bytes_field(6, mp.count_true)?;
+            w.bytes_field(7, mp.count_false)?;
+            w.bytes_field(8, mp.count_unknown)?;
+            w.close(ms)?;
+        }
         w.close(m)?;
     }
 
@@ -744,7 +793,7 @@ pub fn seal_pipeline(
 /// construct one, and re-implementing descriptor.proto here would be a large
 /// open-ended surface for no gain.
 ///
-/// TWO DIFFERENT BYTE STRINGS, deliberately. The host embeds the closure
+/// TWO DIFFERENT BYTE STRINGS, deliberately. A Schema embeds the closure
 /// VERBATIM as it was given, but computes `descriptor_digest` over a SORTED
 /// copy (files by name, messages within each file by name). So:
 ///
@@ -753,8 +802,8 @@ pub fn seal_pipeline(
 ///   * `descriptor_digest` — over the sorted encoding, which is what makes the
 ///     *descriptor* identity stable across ordering and surrounding metadata.
 ///
-/// This core cannot sort (it does not parse the blob), so a caller that wants
-/// the host's digest must supply both, sorted where the host sorts.
+/// This core cannot sort (it does not parse the blob), so the caller supplies
+/// both: the closure as given, and the digest of its sorted form.
 pub fn encode_schema(
     out: &mut [u8],
     header: &HeaderSpec,

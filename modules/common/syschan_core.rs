@@ -4,9 +4,20 @@
 // (for `Chan`/`POLL_*`). Host tests substitute a scripted fake, so this file needs
 // no host coverage — the `.fmod` E2E gates exercise it against the real runtime.
 //
-// A four-line pass-through: no buffering, no retry, no reordering. Every lifecycle
-// decision lives in io_core against these primitives; confining the `unsafe` here
-// keeps the domain logic safe and mockable.
+// A pass-through: no buffering, no retry, no reordering. Every lifecycle decision
+// lives in io_core against these primitives; confining the `unsafe` here keeps the
+// domain logic safe and mockable.
+//
+// ONE translation: the kernel answers a write to a full ring with `EAGAIN`, where
+// `Chan::write` promises `0` ("retain and retry"). A FIFO write is all-or-nothing,
+// so `POLL_OUT` (some space) followed by a frame larger than that space is exactly
+// this case, and it is transient: the frame must be retained and retried, never
+// counted as a failure that drops it. A frame larger than the whole ring would
+// retain forever; the loader refuses any wiring whose declared `max_record`
+// exceeds the ring, and every module mounting this seam declares one.
+
+/// The kernel's "ring full, nothing written" answer to `channel_write` (`EAGAIN`).
+const WRITE_FULL: i32 = -11;
 
 /// A borrowed `(syscall table, handle)` pair presented as an `io_core::Chan`.
 pub struct SysChan<'a> {
@@ -36,6 +47,11 @@ impl Chan for SysChan<'_> {
     }
     #[inline]
     fn write(&self, data: &[u8]) -> i32 {
-        unsafe { (self.sys.channel_write)(self.handle, data.as_ptr(), data.len()) }
+        let r = unsafe { (self.sys.channel_write)(self.handle, data.as_ptr(), data.len()) };
+        if r == WRITE_FULL {
+            0
+        } else {
+            r
+        }
     }
 }

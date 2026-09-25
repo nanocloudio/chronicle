@@ -1,13 +1,14 @@
 // Pipeline -> module graph lowering, on device.
 //
 // This is the layer that removes judgment from graph construction. Given an
-// ordered plan — each stage either pure COMPUTE, a DECISION, or a connector
+// ordered plan — each stage pure COMPUTE, a MAP, a DECISION, or a connector
 // EFFECT — the graph is a PURE FUNCTION of the stage kinds. No human decides
 // what becomes a node; the policy is fixed:
 //
-//   * a maximal run of consecutive COMPUTE stages collapses into ONE `pipeline`
-//     node whose `ir_stages` param runs them as a bytecode chain, so pure
-//     compute never touches a channel;
+//   * a maximal run of consecutive COMPUTE and MAP stages collapses into ONE
+//     `pipeline` node whose `ir_stages` param runs them as a bytecode chain
+//     (a `stage_kinds` param names the maps), so pure compute never touches a
+//     channel;
 //   * a DECISION becomes its own node (the VM cannot branch), which also breaks
 //     the surrounding compute run;
 //   * each EFFECT becomes a genuine connector node — the provider module its
@@ -23,7 +24,7 @@
 // strings has to be BUILT here (node suffixes, hex params, `node.port` wire
 // endpoints). Handing back a GraphSpec would mean a struct holding both an arena
 // and slices into that same arena — self-referential, and not expressible safely.
-// The cost is that the YAML layout now has two writers, so
+// The cost is that the YAML layout has two writers, so
 // `plan_matches_graph_core_emission` pins them together: it lowers a plan and
 // asserts the result equals what `graph_to_yaml` produces for the equivalent
 // hand-built spec. If the two ever drift, that test fails.
@@ -45,9 +46,8 @@ pub const PROVIDER_VERSION: &[u8] = b"0.1.0";
 /// A connector effect binding: which capability a Resource effect realizes, plus
 /// its endpoint and params.
 ///
-/// Each variant maps to exactly one provider module — the effect -> capability
-/// -> provider choice is DATA, not judgment. An empty `password` on Redis means
-/// no password, matching the host's `Option`.
+/// Every field arrives from the deployment's binding — the effect -> capability
+/// -> provider choice is DATA, not judgment.
 #[derive(Clone, Copy)]
 pub struct Connector<'a> {
     /// The DOCUMENT's word for this effect (`b"kafka"`), used as the base node
@@ -157,6 +157,10 @@ pub enum PlanStage<'a> {
     Compute { stage_ir: &'a [u8] },
     /// A decision's pre-packed container.
     Decision { container: &'a [u8] },
+    /// A map stage's container (`pipeline_core::MAP_HEADER` + its lowered
+    /// predicate). It does not branch, so it joins the surrounding compute
+    /// run in one pipeline node, named by that node's `stage_kinds`.
+    Map { container: &'a [u8] },
     /// A connector effect.
     Effect(Connector<'a>),
 }
@@ -247,7 +251,7 @@ fn set(dst: &mut [u8; NAME_CAP], len: &mut u8, s: &[u8]) -> Result<(), GraphErro
 }
 
 /// `<base>` for the first instance of a kind, `<base><n+1>` after that — the
-/// host's stable-unique naming.
+/// stable-unique naming.
 fn instance_name(base: &[u8], n: usize, out: &mut [u8]) -> Result<usize, GraphError> {
     let p = gput(out, 0, base)?;
     if n == 0 {
@@ -372,8 +376,8 @@ pub fn lower_pipeline_with(
     p = gput_u32(out, p, tick_us)?;
     p = gput(out, p, b"\n")?;
     // `accept_cycles` depends on whether any effect appears, which is not known
-    // until the walk finishes — so the header is emitted last, into a prefix
-    // buffer. Instead the walk runs first and the document is assembled after.
+    // until the walk finishes — so the walk runs first and the rest of the
+    // document is assembled after it, from here.
     let header_end = p;
 
     // ---- pass 1: walk the plan, recording the chain ----
@@ -384,8 +388,15 @@ pub fn lower_pipeline_with(
     // it, the walk records what each node is and pass 2 renders it.
     let mut effects = [None::<Connector>; MAX_CHAIN];
     let mut ir_spans = [(0usize, 0usize); MAX_CHAIN];
-    let mut kinds = [0u8; MAX_CHAIN]; // 0 compute, 1 decision, 2 effect
+    // Per chain NODE (not per stage): 0 pipeline, 1 decision, 2 effect.
+    let mut kinds = [0u8; MAX_CHAIN];
     let mut decisions = [&[] as &[u8]; MAX_CHAIN];
+    // Per pipeline node: its stages' kinds (`STAGE_KIND_COMPUTE` or
+    // `STAGE_KIND_MAP`), and whether any is a map — only then does the node
+    // carry a `stage_kinds` param.
+    let mut run_kinds = [[0u8; MAX_NODE_STAGES]; MAX_CHAIN];
+    let mut run_lens = [0usize; MAX_CHAIN];
+    let mut run_maps = [false; MAX_CHAIN];
 
     // The packed ir_stages containers for each compute run live end to end in
     // `scratch`; `ir_spans` records where each one is.
@@ -397,19 +408,29 @@ pub fn lower_pipeline_with(
             return Err(GraphError::TooLarge);
         }
         match &stages[i] {
-            PlanStage::Compute { .. } => {
-                // Collapse the maximal run of consecutive compute stages into one
-                // pipeline node — the policy that keeps pure compute off the wire.
-                let mut run = [&[] as &[u8]; MAX_CHAIN];
+            PlanStage::Compute { .. } | PlanStage::Map { .. } => {
+                // Collapse the maximal run of consecutive compute (and map)
+                // stages into one pipeline node — the policy that keeps pure
+                // compute off the wire. A map's container rides in its stage
+                // slot verbatim; `stage_kinds` tells the node which it is.
+                let mut run = [&[] as &[u8]; MAX_NODE_STAGES];
                 let mut n_run = 0usize;
-                while let Some(PlanStage::Compute { stage_ir }) = stages.get(i) {
-                    if n_run >= MAX_CHAIN {
-                        return Err(GraphError::TooLarge);
+                loop {
+                    let (bytes, kind) = match stages.get(i) {
+                        Some(PlanStage::Compute { stage_ir }) => (*stage_ir, STAGE_KIND_COMPUTE),
+                        Some(PlanStage::Map { container }) => (*container, STAGE_KIND_MAP),
+                        _ => break,
+                    };
+                    if n_run >= MAX_NODE_STAGES {
+                        return Err(GraphError::RunTooLong);
                     }
-                    run[n_run] = stage_ir;
+                    run[n_run] = bytes;
+                    run_kinds[n_chain][n_run] = kind;
+                    run_maps[n_chain] |= kind == STAGE_KIND_MAP;
                     n_run += 1;
                     i += 1;
                 }
+                run_lens[n_chain] = n_run;
                 let packed = pack_ir_stages(&mut scratch[scratch_used..], &run[..n_run], &[])
                     .map_err(|_| GraphError::TooLarge)?;
                 ir_spans[n_chain] = (scratch_used, packed);
@@ -495,8 +516,8 @@ pub fn lower_pipeline_with(
 
     // An EMPTY section is an explicit empty collection, never a bare key. A bare
     // `platform:` parses as null ("must be a mapping") and `wiring` is required
-    // outright — an embedded compute-only graph has both empty and hit each in
-    // turn, producing a graph fluxor refused to build.
+    // outright — an embedded compute-only graph has both empty, and fluxor
+    // refuses either as a bare key.
     if !profile.host_cli && !needs_net {
         p = gput(out, p, b"\nplatform: {}\n")?;
     } else {
@@ -532,6 +553,11 @@ pub fn lower_pipeline_with(
                 let (off, len) = ir_spans[k];
                 p = put_hex(out, p, &scratch[off..off + len])?;
                 p = gput(out, p, b"\"\n")?;
+                if run_maps[k] {
+                    p = gput(out, p, b"      stage_kinds: \"")?;
+                    p = put_hex(out, p, &run_kinds[k][..run_lens[k]])?;
+                    p = gput(out, p, b"\"\n")?;
+                }
             }
             1 => {
                 // `type:` only when the instance name is NOT the module name —
@@ -545,7 +571,7 @@ pub fn lower_pipeline_with(
                 p = gput(out, p, b"\"\n")?;
             }
             _ => {
-                let c = effects[k].ok_or(GraphError::TooLarge)?;
+                let c = effects[k].ok_or(GraphError::EffectUnbound)?;
                 let mut m = [0u8; NAME_CAP];
                 let ml = c.provider_module(&mut m)?;
                 p = gput(out, p, b"    type: ")?;
@@ -606,7 +632,7 @@ pub fn lower_pipeline_with(
             )?;
         }
     }
-    // Transport edges last, in node order — the canonical order the host emits.
+    // Transport edges last, in node order — the canonical order.
     for k in 0..n_chain {
         if kinds[k] != 2 {
             continue;

@@ -4,11 +4,10 @@
 //
 // The VM has no branching opcode: a single bytecode program constructs exactly
 // one message and cannot SELECT among several. A decision — "first rule whose
-// predicate holds constructs its outcome, else the default" — is therefore not a
-// pipeline bytecode stage; it is its own driver that orchestrates the existing
-// evaluator over several sub-programs. (Same reason aggregation, which needs
-// state, is its own module: the node boundary is where the VM's straight-line
-// model runs out.)
+// predicate holds constructs its outcome, else the default" — is therefore not
+// one VM program; it is a driver that orchestrates the existing evaluator over
+// several sub-programs. The driver runs either in the `decision` node or inline
+// as a `STAGE_KIND_DECISION` pipeline stage.
 //
 // Serialized container (what a config ships, hex-encoded):
 //   [nrules:u8]
@@ -38,6 +37,11 @@ pub enum DecisionError {
     BadArity,
     /// The evaluator faulted (bad opcode, cost ceiling, type error, …).
     Eval(EvalError),
+    /// A `when` predicate read an absent field and nothing absorbed it
+    /// (`false && …`, `true || …`, or `has()`): its outcome is UNKNOWN. The
+    /// decision fails closed — no rule and no default fires, because the rule
+    /// that could not be evaluated may have been a refusal.
+    Absent,
 }
 
 /// Read one `[cost:u32 LE][len:u16 LE][code]` program at `container[*off..]`,
@@ -111,6 +115,7 @@ pub fn run_decision_scratch<'a>(
             .map_err(DecisionError::Eval)?
         {
             Value::Bool(b) => b,
+            Value::Null => return Err(DecisionError::Absent),
             _ => return Err(DecisionError::NotBool),
         };
         if matched {
@@ -143,16 +148,15 @@ pub fn run_decision_scratch_metered<'a>(
         let (when_cost, when_code) = dec_read_prog(container, &mut off)?;
         let (out_cost, out_code) = dec_read_prog(container, &mut off)?;
         let mut w = 0u64;
-        let matched = match eval_scratch_metered(when_code, params, scratch, when_cost, &mut w)
-            .map_err(DecisionError::Eval)?
-        {
-            Value::Bool(b) => b,
-            _ => {
-                *spent += w;
-                return Err(DecisionError::NotBool);
-            }
-        };
+        let r = eval_scratch_metered(when_code, params, scratch, when_cost, &mut w);
+        // Charged before any outcome is inspected: a predicate that faults
+        // (cost ceiling, type error) spent its instructions all the same.
         *spent += w;
+        let matched = match r.map_err(DecisionError::Eval)? {
+            Value::Bool(b) => b,
+            Value::Null => return Err(DecisionError::Absent),
+            _ => return Err(DecisionError::NotBool),
+        };
         if matched {
             construct_metered(out_code, params, builder, scratch, out_cost, spent)?;
             return Ok(Fired::Rule(i as u8));

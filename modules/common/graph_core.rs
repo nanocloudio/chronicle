@@ -21,8 +21,16 @@
 /// Why graph emission failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphError {
-    /// The output buffer cannot hold the rendered graph.
+    /// The graph exceeds a fixed capacity: the output buffer cannot hold it,
+    /// or it needs more than `MAX_CHAIN` nodes.
     TooLarge,
+    /// An effect stage reached lowering with no connector bound to it. The
+    /// resource it names has no binding, so there is no provider to wire.
+    EffectUnbound,
+    /// A run of consecutive compute and map stages is longer than one pipeline
+    /// node runs (`MAX_NODE_STAGES`). The run lowers to a single node, so a
+    /// longer one would build a node that fails every record.
+    RunTooLong,
     /// A stage follows an effect whose provider does not answer with data.
     ///
     /// A non-replying provider's output port carries an acknowledgement or a

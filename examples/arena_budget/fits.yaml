@@ -6,13 +6,14 @@
 # image, and the kernel's resource ledger enforces it as the arena's capacity for
 # that deployment, at or below the compiled `STATE_ARENA_SIZE`.
 #
-# The loader carves 57,520 B for `decision` and 272 B for `sensor_intake`. Those
-# are the module state sizes as the loader sees them; the manifests record 57,536
-# and 320, the same figures rounded up to whole 64-byte units. Checking the pair
-# against the loader is what proves the recorded numbers are the loader's own and
-# not an independent estimate that happens to look right.
+# The loader carves 57,544 B for `decision` and 328 B for `sensor_intake`: each
+# module's state size plus a 4-byte canary, 8-byte aligned. The `.fmod`s record
+# 57,536 and 320, those state sizes rounded up to whole 64-byte units, and
+# tools/e2e/arena-budget.sh holds each recorded figure to the carve the loader
+# reports, so the recorded numbers are the loader's own and not an independent
+# estimate that happens to look right.
 #
-# `fits` is sized at the sum of the two, 57,792. `tight` is one byte under it.
+# `fits` is sized at the sum of the two, 57,872. `tight` is one byte under it.
 # tools/e2e/arena-budget.sh drives both: the first must load and decide, the
 # second must be REFUSED AT MODULE LOAD, and the refusal must name the envelope
 # rather than the compiled arena — two ceilings guard this pool and a diagnostic
@@ -27,7 +28,7 @@
 target: linux
 tick_us: 100
 capacity:
-  state_arena: 57792
+  state_arena: 57872
 platform:
   cli: {}
 modules:

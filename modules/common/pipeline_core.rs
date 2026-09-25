@@ -12,13 +12,15 @@
 // Threading through frames also sidesteps borrow lifetimes: each stage's input
 // borrows only its own decode buffer, never a previous stage's `Builder`.
 //
-// Typed record frame (self-describing, so integer fields survive a round trip —
-// the scalar frame of the Expression module was bytes-only):
+// Typed record frame (self-describing, so integer fields survive a round trip):
 //   [count:u8] then count × [number:u8][type:u8][len:u16 LE][payload]
 //   type 0 = byte string (payload = raw bytes)
 //   type 1 = i64        (payload = 8 bytes little-endian)
+//   type 3 = message    (payload = the nested message's own frame)
 
-/// Maximum fields a pipeline record frame may carry (matches the builder bound).
+/// Maximum fields a pipeline record frame may carry: the builder's bound, so
+/// any record a stage can construct, the next stage can decode. A frame
+/// claiming more is refused with [`PipeError::TooManyFields`].
 pub const MAX_PIPE_FIELDS: usize = MAX_BUILD_FIELDS;
 
 /// The largest compiled artefact container an engine will hold, per arena tier.
@@ -38,11 +40,10 @@ pub const MAX_PIPE_FIELDS: usize = MAX_BUILD_FIELDS;
 /// that a rich table is not deployable there — a fact about that target, not a
 /// budget every other target should be held to.
 ///
-/// The floor was once the only bound, set from an estimate of 32 arms at 74–138
-/// bytes each. Arms cost more than that when they carry a full outcome: a
-/// 29-arm lifecycle table measures 7894 bytes, about 272 bytes an arm, so the
-/// floor cannot hold even 23 arms of that shape. `author_core::BIN_BUF` asserts
-/// it is at least the full tier, so the two cannot cross.
+/// Arms that carry a full outcome cost about 272 bytes each (a 29-arm lifecycle
+/// table measures 7894 bytes), so the tiny tier holds fewer than 23 of them.
+/// `author_core::BIN_BUF` asserts it is at least the full tier, so the two
+/// cannot cross.
 pub const MAX_CONTAINER_BIN_FULL: usize = 16384;
 
 /// The same bound on a 64 KiB-arena target (RP2040 class).
@@ -50,6 +51,8 @@ pub const MAX_CONTAINER_BIN: usize = 6144;
 
 const TY_BYTES: u8 = 0;
 const TY_I64: u8 = 1;
+/// A nested message: its payload is the message's own frame.
+const TY_MSG: u8 = 3;
 
 /// One pipeline stage: an artefact's bytecode and its static cost ceiling.
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +87,32 @@ pub const STAGE_KIND_COMPUTE: u8 = 0;
 /// evaluate, encode the result), so it threads through the same executor
 /// rather than occupying a node of its own.
 pub const STAGE_KIND_DECISION: u8 = 1;
+/// The stage's `code` is a MAP container: a predicate applied to every
+/// element of a repeated field, bounded by a declared maximum, the verdicts
+/// counted into the record. The iteration is the driver's and declarative;
+/// the per-element logic is ordinary expression bytecode (bytecode_policy.md,
+/// "constrained artefact kinds").
+pub const STAGE_KIND_MAP: u8 = 2;
+
+/// Stages one pipeline node runs: the stage table it builds per record holds
+/// this many. The graph lowering refuses a run of compute and map stages
+/// longer than this, and `author` refuses the pipeline that would need one,
+/// so no node is handed more stages than it runs.
+pub const MAX_NODE_STAGES: usize = 8;
+
+/// A map container's fixed header: `[over][max][out_true][out_false][out_unknown]`,
+/// then the predicate program `[cost:u32 LE][len:u16 LE][code]`.
+///
+/// * `over` — the repeated field whose elements (each a nested message) are
+///   mapped; more than `max` of them refuses the stage (`TooMany`). A
+///   container whose `max` and three counts cannot fit this target's field
+///   table is refused at load.
+/// * the predicate runs with params `[element, record]` and answers true,
+///   false or unknown. Whatever an element is judged against travels in the
+///   element itself — a producer that pairs, pairs before the stage.
+/// * the counts land at `out_true`/`out_false`/`out_unknown` (replacing any
+///   the record carried); "every element holds" is `false == 0 && unknown == 0`.
+pub const MAP_HEADER: usize = 5;
 
 /// How one stage is evaluated.
 ///
@@ -113,6 +142,9 @@ impl StageEval for ComputeOnly {
         dst: &mut [u8],
         spent: &mut u64,
     ) -> Result<usize, PipeError> {
+        if stage.kind == STAGE_KIND_MAP {
+            return run_map_stage(stage.code, src, dst, spent);
+        }
         run_stage_metered(stage, src, dst, spent)
     }
 }
@@ -133,6 +165,28 @@ pub enum PipeError {
     BadFrame,
     /// The output buffer was too small, or a field type is not serializable.
     Encode,
+    /// A map stage met more elements than its declared maximum — refused
+    /// whole, never evaluated in part. Routable: the bound is declared by the
+    /// author, so exceeding it is a condition a failure route can answer.
+    TooMany,
+    /// A frame claims more fields than this target's field table holds
+    /// (`MAX_PIPE_FIELDS`). Well formed, but not representable here.
+    TooManyFields,
+}
+
+impl PipeError {
+    /// Whether the record was refused for exceeding a bound — more fields
+    /// than the table holds, read or built, or more elements than a map stage
+    /// declares — as opposed to failing to evaluate or being malformed.
+    /// Engines count these apart.
+    pub fn over_bound(self) -> bool {
+        matches!(
+            self,
+            PipeError::TooMany
+                | PipeError::TooManyFields
+                | PipeError::StageEval(EvalError::BuildOverflow)
+        )
+    }
 }
 
 /// Decode a typed record frame into borrowed fields. Returns the field count.
@@ -145,12 +199,12 @@ pub fn decode_frame<'a>(
         return Ok(0);
     }
     let count = data[0] as usize;
+    if count > MAX_PIPE_FIELDS {
+        return Err(PipeError::TooManyFields);
+    }
     let mut off = 1usize;
     let mut fi = 0usize;
     while fi < count {
-        if fi >= MAX_PIPE_FIELDS {
-            return Err(PipeError::BadFrame);
-        }
         if off + 4 > data.len() {
             return Err(PipeError::BadFrame);
         }
@@ -164,6 +218,7 @@ pub fn decode_frame<'a>(
         let payload = &data[off..off + len];
         let value = match ty {
             TY_BYTES => Value::Bytes(payload),
+            TY_MSG => Value::Frame(payload),
             TY_I64 => {
                 if len != 8 {
                     return Err(PipeError::BadFrame);
@@ -183,8 +238,9 @@ pub fn decode_frame<'a>(
 }
 
 /// A serialized stage table for param-driven pipelines: `[nstages:u8]` then, per
-/// stage, `[max_cost:u32 LE][code_len:u16 LE][code bytes]`. This is what a config
-/// carries (hex-encoded) so one pipeline `.fmod` runs any Pipeline.
+/// stage, `[route:u8][max_cost:u32 LE][code_len:u16 LE][code bytes]` (`route` is
+/// the failure route, `ROUTE_NONE` for none). This is what a config carries
+/// (hex-encoded) so one pipeline `.fmod` runs any Pipeline.
 ///
 /// Number of stages in `container`, or 0 if empty/truncated.
 pub fn stage_count(container: &[u8]) -> usize {
@@ -274,6 +330,20 @@ pub fn frame_len(data: &[u8]) -> Option<usize> {
     }
 }
 
+/// The reserved field a record's CARRIED CONTEXT rides in: a nested message
+/// (its own frame, as bytes) that every connector hands back unchanged, so a
+/// request built before an effect and the reply handled after it share no
+/// state but the record. On the exchange surface it IS the `msg_key`, which is
+/// why it is held to the contract's `KEY_MAX` there. Engine meanings take
+/// `240..=255` (celc's `RESERVED_FIELD_MIN`); data fields are `1..=239`.
+pub const CARRY_FIELD: u32 = 254;
+
+/// The reserved field a reply record carries its EXCHANGE status in: `0`
+/// answered, `1..=15` the contract's typed refusals — what the transport
+/// said, apart from anything the payload says. Only a record made from a
+/// reply carries it.
+pub const EXCHANGE_STATUS_FIELD: u32 = 253;
+
 /// Serialize a constructed message into a typed record frame. Returns its length.
 /// Shared with the aggregation core (`agg_core.rs`).
 pub fn encode_frame(msg: &Message, out: &mut [u8]) -> Result<usize, PipeError> {
@@ -291,7 +361,15 @@ pub fn encode_frame_scratch(
     scratch: &Scratch<'_>,
     out: &mut [u8],
 ) -> Result<usize, PipeError> {
-    let n = msg.fields.len();
+    // An ABSENT field (Null — a stage copied a field its input never carried)
+    // is left out of the frame rather than written as zero-length bytes: the
+    // next stage must see it absent, and fail as absence fails, not read ""
+    // and decide on it. The count is of the fields actually written.
+    let n = msg
+        .fields
+        .iter()
+        .filter(|f| !matches!(f.value, Value::Null))
+        .count();
     if n > u8::MAX as usize || out.is_empty() {
         return Err(PipeError::Encode);
     }
@@ -313,7 +391,10 @@ pub fn encode_frame_scratch(
         if f.number > u8::MAX as u32 {
             return Err(PipeError::Encode);
         }
-        // A builtin's arena-backed result serializes as its bytes.
+        if matches!(f.value, Value::Null) {
+            continue;
+        }
+        // An arena-backed result serializes as what it holds.
         let value = resolve_scratch(f.value, scratch);
         let f = &Field {
             number: f.number,
@@ -321,18 +402,23 @@ pub fn encode_frame_scratch(
         };
         let (ty, payload): (u8, [u8; 8]) = match f.value {
             Value::Int(i) => (TY_I64, i.to_le_bytes()),
-            Value::Uint(u) => (TY_I64, (u as i64).to_le_bytes()),
+            // The frame's integer is an i64: an unsigned value past it is
+            // refused, never written as the negative number it would wrap to.
+            Value::Uint(u) => match i64::try_from(u) {
+                Ok(i) => (TY_I64, i.to_le_bytes()),
+                Err(_) => return Err(PipeError::StageEval(EvalError::Overflow)),
+            },
             Value::Bool(b) => (TY_I64, (b as i64).to_le_bytes()),
+            Value::Frame(_) => (TY_MSG, [0u8; 8]),
             _ => (TY_BYTES, [0u8; 8]),
         };
         // header: number:u8, type:u8, len:u16 LE
         let (len, bytes): (usize, &[u8]) = match f.value {
-            Value::Bytes(b) => (b.len(), b),
+            Value::Bytes(b) | Value::Frame(b) => (b.len(), b),
             Value::Str(s) => (s.len(), s.as_bytes()),
-            Value::Null => (0, &[]),
-            // Msg and Double have no typed frame representation; reject rather
-            // than emit a zero-filled byte string mislabelled as data.
-            Value::Msg(_) | Value::Double(_) => return Err(PipeError::Encode),
+            // A Msg has no typed frame representation; reject rather than emit
+            // a zero-filled byte string mislabelled as data.
+            Value::Msg(_) => return Err(PipeError::Encode),
             _ => (8, &payload[..]),
         };
         if len > u16::MAX as usize {
@@ -353,10 +439,14 @@ pub fn encode_frame_scratch(
 pub const STAGE_SCRATCH_CAP: usize = 512;
 
 /// Run one stage: decode `src`, evaluate, and serialize the constructed message
-/// into `dst`. Returns the encoded length.
-/// [`run_stage`] that adds the stage program's VM instructions to `spent`.
-/// Public so a caller supplying its own [`StageEval`] can delegate the
+/// into `dst`, adding the stage program's VM instructions to `spent`. Returns the
+/// encoded length. Public so a caller supplying its own [`StageEval`] can delegate the
 /// compute case rather than reimplementing it.
+///
+/// Never inlined: a stage runner's field tables belong on the stack only
+/// while that runner runs, not in the frame of whichever caller dispatches
+/// across kinds.
+#[inline(never)]
 pub fn run_stage_metered(
     stage: &Stage,
     src: &[u8],
@@ -391,6 +481,112 @@ pub fn run_stage_metered(
     }
 }
 
+/// Check a map container's shape at load: header, one program the VM
+/// accepts, nothing after it.
+pub fn scan_map_container(c: &[u8]) -> Result<(), PipeError> {
+    let hdr = c.get(..MAP_HEADER).ok_or(PipeError::BadFrame)?;
+    if hdr[0] == 0 {
+        return Err(PipeError::BadFrame);
+    }
+    if hdr[1] as usize + 3 > MAX_PIPE_FIELDS {
+        return Err(PipeError::TooManyFields);
+    }
+    let lb = c
+        .get(MAP_HEADER + 4..MAP_HEADER + 6)
+        .ok_or(PipeError::BadFrame)?;
+    let len = u16::from_le_bytes([lb[0], lb[1]]) as usize;
+    let code = c
+        .get(MAP_HEADER + 6..MAP_HEADER + 6 + len)
+        .ok_or(PipeError::BadFrame)?;
+    if MAP_HEADER + 6 + len != c.len() {
+        return Err(PipeError::BadFrame);
+    }
+    scan_code(code).map_err(PipeError::StageEval)
+}
+
+/// Run one MAP stage over the record `src`, writing the record with its
+/// counts into `dst`. See [`STAGE_KIND_MAP`] and [`MAP_HEADER`]. Never
+/// inlined, for the reason [`run_stage_metered`] gives.
+#[inline(never)]
+pub fn run_map_stage(
+    code: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+    spent: &mut u64,
+) -> Result<usize, PipeError> {
+    let h = code.get(..MAP_HEADER).ok_or(PipeError::BadFrame)?;
+    let (over, max) = (h[0], h[1]);
+    let (o_true, o_false, o_unknown) = (h[2], h[3], h[4]);
+    let cb = code
+        .get(MAP_HEADER..MAP_HEADER + 6)
+        .ok_or(PipeError::BadFrame)?;
+    let cost = u32::from_le_bytes([cb[0], cb[1], cb[2], cb[3]]) as u64;
+    let plen = u16::from_le_bytes([cb[4], cb[5]]) as usize;
+    let prog = code
+        .get(MAP_HEADER + 6..MAP_HEADER + 6 + plen)
+        .ok_or(PipeError::BadFrame)?;
+
+    let mut rf = [Field {
+        number: 0,
+        value: Value::Null,
+    }; MAX_PIPE_FIELDS];
+    let nr = decode_frame(src, &mut rf)?;
+    let rec = &rf[..nr];
+    let elements = rec.iter().filter(|f| f.number == over as u32).count();
+    if elements > max as usize {
+        return Err(PipeError::TooMany);
+    }
+    let (mut n_true, mut n_false, mut n_unknown) = (0i64, 0i64, 0i64);
+    // One field table for the whole stage, reused per element. A table is
+    // `MAX_PIPE_FIELDS` fields and this runs on the step's stack, so a table
+    // per element is a cost worth not paying.
+    let mut efs = [Field {
+        number: 0,
+        value: Value::Null,
+    }; MAX_PIPE_FIELDS];
+    for ef in rec.iter().filter(|f| f.number == over as u32) {
+        let Value::Frame(eb) = ef.value else {
+            return Err(PipeError::BadFrame);
+        };
+        let ne = decode_frame(eb, &mut efs)?;
+        let params = [Message { fields: &efs[..ne] }, Message { fields: rec }];
+        let mut w = 0u64;
+        let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
+        let mut scratch = Scratch::new(&mut sbuf);
+        let v = eval_scratch_metered(prog, &params, &mut scratch, cost, &mut w);
+        *spent += w;
+        match v.map_err(PipeError::StageEval)? {
+            Value::Bool(true) => n_true += 1,
+            Value::Bool(false) => n_false += 1,
+            Value::Null => n_unknown += 1,
+            _ => return Err(PipeError::StageEval(EvalError::TypeError)),
+        }
+    }
+
+    // The record, less any counts it carried, plus the three counts — built in
+    // the element table, which the loop no longer needs.
+    let out = &mut efs;
+    let mut n = 0usize;
+    for f in rec {
+        let num = f.number;
+        if num == o_true as u32 || num == o_false as u32 || num == o_unknown as u32 {
+            continue;
+        }
+        let slot = out.get_mut(n).ok_or(PipeError::Encode)?;
+        *slot = *f;
+        n += 1;
+    }
+    for (num, c) in [(o_true, n_true), (o_false, n_false), (o_unknown, n_unknown)] {
+        let slot = out.get_mut(n).ok_or(PipeError::Encode)?;
+        *slot = Field {
+            number: num as u32,
+            value: Value::Int(c),
+        };
+        n += 1;
+    }
+    encode_frame(&Message { fields: &out[..n] }, dst)
+}
+
 /// Execute a pipeline: thread `input` (a typed record frame) through every stage
 /// in order, serializing each stage's output as the next stage's input, and
 /// write the final frame into `out`. `buf_a`/`buf_b` are caller-provided scratch
@@ -400,8 +596,9 @@ pub fn run_stage_metered(
 /// Stages are also subject to per-stage FAILURE ROUTING, which is deliberately
 /// narrower on device than on the host. Of the spec's four policy knobs:
 ///
-/// * **failure routing** — implemented here. A stage that fails evaluation
-///   continues from its `on_failure` stage instead of aborting, which is
+/// * **failure routing** — implemented here. A stage that fails evaluation, or
+///   a map stage over its declared maximum, continues from its `on_failure`
+///   stage instead of aborting, which is
 ///   deterministic and needs nothing outside this executor.
 /// * **retries** — NOT implemented, because they would be a lie. A stage here is
 ///   pure compute over its input; re-running one that failed yields the same
@@ -505,11 +702,16 @@ pub fn run_stages_with<E: StageEval>(
                 i += 1;
             }
             Err(e) => {
-                // Only an EVALUATION failure is routable. A structural fault
-                // (a truncated frame, an undersized buffer) is a defect in the
-                // deployment, not a condition the pipeline author anticipated,
-                // so it propagates whatever the policy says.
-                let routable = matches!(e, PipeError::StageEval(_) | PipeError::NotConstructed);
+                // Only a failure the author could anticipate is routable: an
+                // evaluation failure, or a map stage exceeding the maximum it
+                // declared. A structural fault (a truncated frame, an
+                // undersized buffer, a record too wide for this target) is a
+                // defect in the deployment, and the stage routed to would read
+                // the same bytes, so it propagates whatever the policy says.
+                let routable = matches!(
+                    e,
+                    PipeError::StageEval(_) | PipeError::NotConstructed | PipeError::TooMany
+                );
                 match stage.on_failure {
                     Some(target) if routable && (target as usize) < stages.len() => {
                         i = target as usize;

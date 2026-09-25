@@ -1,8 +1,9 @@
-//! Pipeline executor — Fluxor `.fmod` app module (spec artefact 6, on device).
+//! Pipeline executor — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the stage table is NOT baked — it arrives as an `ir_stages`
 //! module param (hex-encoded), lowered at load into a serialized
-//! `[nstages][cost:u32][len:u16][code]…` container. So one pipeline binary runs ANY Pipeline: the compiler emits each
+//! `[nstages]` then per stage `[route:u8][cost:u32][len:u16][code]` container. So
+//! one pipeline binary runs ANY Pipeline: the compiler emits each
 //! stage's bytecode, a config packs the container, and this module threads a
 //! record frame through the stages, serializing each stage's constructed message
 //! as the next stage's input.
@@ -40,28 +41,58 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
 mod exchange;
 use exchange::{
-    Ack, Publish, ACK_WIRE_LEN, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX, PUBLISH_OVERHEAD,
-    REFUSE_OVERSIZE, REFUSE_UNROUTABLE, STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
+    Ack, Publish, Reply, ACK_WIRE_LEN, KEY_MAX, MSG_ACK, MSG_PUBLISH, MSG_REPLY, PAYLOAD_MAX,
+    PUBLISH_OVERHEAD, REFUSE_OVERSIZE, REFUSE_UNROUTABLE, REPLY_FRAME_MAX, REPLY_OVERHEAD,
+    STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
 };
 
+/// A decode program's scratch arena (values it builds rather than borrows):
+/// room for three whole-record documents at the full tier, so a decoder can
+/// apply a policy's defaults (`rd::JSONDEF`, each a new copy) to a body of
+/// the record ceiling; keys and hex (`CAT`, `HEX`) at the tiny tier.
+const DEC_SCRATCH: usize = if TINY { 1024 } else { 3 * REC_BUF };
 /// Publishes that may be unacknowledged at once. The window is what applies
 /// BACKPRESSURE: at the limit the pipeline stops admitting records rather than
 /// running ahead of a destination that has not confirmed anything.
-/// A decode program's scratch arena (values it builds rather than borrows).
-const DEC_SCRATCH: usize = 1024;
 const MAX_INFLIGHT: u32 = 8;
 
 /// One framed publish at this module's ceiling: the 3-byte envelope, the
-/// contract's fixed overhead, and a whole result frame (this module sends no
-/// key). What `publish_out` declares as `max_record`.
-const PUB_FRAME_MAX: usize = 3 + PUBLISH_OVERHEAD + REC_BUF;
+/// contract's fixed overhead, the record's carry as the `msg_key` (at most
+/// `KEY_BUF`) and a whole result frame. What `publish_out` declares as
+/// `max_record`.
+const PUB_FRAME_MAX: usize = 3 + PUBLISH_OVERHEAD + KEY_BUF + REC_BUF;
+
+/// The largest carry this module lifts into a publish's `msg_key`. The
+/// contract's `KEY_MAX`; a tiny target carries a short context only.
+const KEY_BUF: usize = if TINY { 64 } else { KEY_MAX };
+/// The reply decoder's program buffers — absent on a tiny target, which
+/// takes replies that are already record frames.
+const RDEC_HEX_BUF: usize = if TINY { 0 } else { HEX_BUF };
+const RDEC_PROG_BUF: usize = if TINY { 0 } else { PROG_BUF };
 /// One framed ack, envelope included.
 const ACK_FRAME_LEN: usize = 3 + ACK_WIRE_LEN;
-/// The intake buffer: a whole contract payload, so this module is a sink for
-/// any producer of the surface (a CDC row image with its envelope exceeds one
-/// typed record). A payload is decoded into a `REC_BUF` record by the
-/// `decode` program; without one it must itself be one typed frame.
-const INGRESS_BUF: usize = PAYLOAD_MAX;
+/// The largest publish payload this module takes as a sink: a whole contract
+/// payload at the full tier, so this module is a sink for any producer of the
+/// surface (a CDC row image with its envelope exceeds one typed record). A
+/// payload is decoded into a `REC_BUF` record by the `decode` program; without
+/// one it must itself be one typed frame. A tiny target takes one record's
+/// worth — the same raw chunk `record_in` hands its decoder — and refuses a
+/// larger payload OVERSIZE.
+const INGRESS_BUF: usize = if TINY { REC_BUF } else { PAYLOAD_MAX };
+/// The largest reply frame this module takes: the contract's fixed overhead,
+/// the carry it echoes (at most the `KEY_BUF` this module sent) and a payload.
+/// At the full tier that is the contract's whole `REPLY_FRAME_MAX`; a tiny
+/// target, which has no reply decoder, takes a payload that is itself one
+/// record.
+const REPLY_BUF: usize = REPLY_OVERHEAD + KEY_BUF + if TINY { REC_BUF } else { PAYLOAD_MAX };
+/// The intake buffer, shared by a publish payload and a reply frame: both are
+/// taken and resolved within one step, so one buffer serves either.
+const IN_BUF: usize = if REPLY_BUF > INGRESS_BUF {
+    REPLY_BUF
+} else {
+    INGRESS_BUF
+};
+const _: () = assert!(TINY || REPLY_BUF == REPLY_FRAME_MAX);
 
 /// Read and discard `n` bytes from a byte channel, in bounded chunks. Used to
 /// step past a frame body that is not wanted once its header is consumed —
@@ -76,6 +107,28 @@ unsafe fn chan_skip(sys: &SyscallTable, chan: i32, n: usize) {
             return;
         }
         left -= r as usize;
+    }
+}
+
+/// `ingress_outcome` values.
+const INGRESS_OPEN: u8 = 0;
+const INGRESS_OK: u8 = 1;
+const INGRESS_FAILED: u8 = 2;
+
+/// The admitted record reached its one defined output. Resolves the
+/// in-flight publish too, when the record came from one.
+fn record_succeeded(s: &mut ModuleState) {
+    s.acct.input_succeeded();
+    if s.ingress_corr != 0 {
+        s.ingress_outcome = INGRESS_OK;
+    }
+}
+
+/// The admitted record reached a terminal failure; see [`record_succeeded`].
+fn record_failed(s: &mut ModuleState) {
+    s.acct.input_failed();
+    if s.ingress_corr != 0 {
+        s.ingress_outcome = INGRESS_FAILED;
     }
 }
 
@@ -107,6 +160,196 @@ unsafe fn ack_write(s: &mut ModuleState, sys: &SyscallTable, ack: Ack) {
     if (sys.channel_write)(s.ack_out_chan, buf.as_ptr(), buf.len()) != buf.len() as i32 {
         s.ack_retry = buf;
         s.ack_retry_len = buf.len() as u8;
+    }
+}
+
+/// The bytes of field `number` in a record frame, if the frame carries it —
+/// a raw scan, so no decode of the whole frame just to read one field.
+fn frame_field_bytes(frame: &[u8], number: u8) -> Option<&[u8]> {
+    let count = *frame.first()? as usize;
+    let mut p = 1usize;
+    for _ in 0..count {
+        let h = frame.get(p..p + 4)?;
+        let len = u16::from_le_bytes([*h.get(2)?, *h.get(3)?]) as usize;
+        let body = frame.get(p + 4..p + 4 + len)?;
+        if *h.first()? == number {
+            return Some(body);
+        }
+        p += 4 + len;
+    }
+    None
+}
+
+/// Take one reply from `reply_in` and deliver it as a record on
+/// `result_out`: the payload decoded (`reply_decode`, or itself one frame),
+/// the echoed `msg_key` restored as the carry (254) and the exchange status
+/// at 253. The reply IS the ack — it releases the in-flight window. A reply
+/// that cannot become a record is counted, never delivered half-made.
+///
+/// Never inlined, like every path here that holds a field table: inlined into
+/// `module_step`, its tables would sit on the stack under every stage run.
+#[inline(never)]
+unsafe fn reply_step(s: &mut ModuleState, sys: &SyscallTable) {
+    // A retained reply record goes first; nothing else is taken meanwhile.
+    if !s.reply_pending.is_empty() {
+        let plen = s.reply_pending.len as u32;
+        let outch = SysChan::new(sys, s.out_chan);
+        match s.reply_pending.drain(&outch, &s.reply_buf) {
+            Staged::Delivered => {
+                s.acct.output_drained(plen);
+                s.acct.input_succeeded();
+            }
+            Staged::Pending => {}
+            Staged::Failed(_) => {
+                s.reply_pending = Pending { off: 0, len: 0 };
+                s.acct.output_failed_pending(plen);
+                s.acct.input_failed();
+            }
+        }
+        return;
+    }
+    let ch = s.reply_chan;
+    let poll = (sys.channel_poll)(ch, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return;
+    }
+    let mut hdr = [0u8; 3];
+    if (sys.channel_read)(ch, hdr.as_mut_ptr(), 3) < 3 {
+        return;
+    }
+    let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+    if hdr[0] != MSG_REPLY {
+        chan_skip(sys, ch, len);
+        s.replies_failed = s.replies_failed.wrapping_add(1);
+        return;
+    }
+    // Answered: every reply taken off the channel answers one publish, so its
+    // window slot is free whatever becomes of the frame — kept, refused as
+    // oversized, or cut short.
+    s.inflight = s.inflight.saturating_sub(1);
+    if !(REPLY_OVERHEAD..=REPLY_BUF).contains(&len) {
+        chan_skip(sys, ch, len);
+        s.replies_failed = s.replies_failed.wrapping_add(1);
+        return;
+    }
+    if ((sys.channel_read)(ch, s.in_buf.as_mut_ptr(), len) as usize) < len {
+        s.replies_failed = s.replies_failed.wrapping_add(1);
+        return;
+    }
+    let wire = core::slice::from_raw_parts(s.in_buf.as_ptr(), len);
+    let Some(reply) = Reply::decode(wire) else {
+        s.replies_failed = s.replies_failed.wrapping_add(1);
+        return;
+    };
+    if reply.status != STATUS_OK {
+        s.refused = s.refused.wrapping_add(1);
+    }
+    s.acct.admit_input(reply.payload.len() as u64);
+
+    // The payload as fields: decoded, or itself one record frame.
+    let mut fields = [Field {
+        number: 0,
+        value: Value::Null,
+    }; MAX_PIPE_FIELDS];
+    let mut b = Builder::new();
+    let nf = if s.rdec_len > 0 {
+        let prog = core::slice::from_raw_parts(s.rdec.as_ptr(), s.rdec_len as usize);
+        let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
+        if let Err(e) = eval_decode_scratch(prog, reply.payload, scr, &mut b, 100_000) {
+            if e == EvalError::BuildOverflow {
+                s.over_bound = s.over_bound.wrapping_add(1);
+            }
+            s.replies_failed = s.replies_failed.wrapping_add(1);
+            s.acct.input_failed();
+            return;
+        }
+        let m = b.message();
+        let mut k = 0usize;
+        for f in m.fields {
+            if let Some(slot) = fields.get_mut(k) {
+                *slot = *f;
+                k += 1;
+            }
+        }
+        k
+    } else if reply.payload.is_empty() {
+        0
+    } else {
+        match decode_frame(reply.payload, &mut fields) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.over_bound() {
+                    s.over_bound = s.over_bound.wrapping_add(1);
+                }
+                s.replies_failed = s.replies_failed.wrapping_add(1);
+                s.acct.input_failed();
+                return;
+            }
+        }
+    };
+    // The carry and the status are the exchange's to say: any the payload
+    // itself carried under those numbers is replaced, not duplicated.
+    let mut n = 0usize;
+    for i in 0..nf {
+        let num = fields.get(i).map(|f| f.number).unwrap_or(0);
+        if num == CARRY_FIELD || num == EXCHANGE_STATUS_FIELD {
+            continue;
+        }
+        if let (Some(src), true) = (fields.get(i).copied(), n < fields.len()) {
+            if let Some(dst) = fields.get_mut(n) {
+                *dst = src;
+            }
+            n += 1;
+        }
+    }
+    if n + 2 > fields.len() {
+        s.replies_failed = s.replies_failed.wrapping_add(1);
+        s.acct.input_failed();
+        return;
+    }
+    if !reply.msg_key.is_empty() {
+        if let Some(dst) = fields.get_mut(n) {
+            *dst = Field {
+                number: CARRY_FIELD,
+                value: Value::Frame(reply.msg_key),
+            };
+            n += 1;
+        }
+    }
+    if let Some(dst) = fields.get_mut(n) {
+        *dst = Field {
+            number: EXCHANGE_STATUS_FIELD,
+            value: Value::Int(reply.status as i64),
+        };
+        n += 1;
+    }
+    let out = core::slice::from_raw_parts_mut(s.reply_buf.as_mut_ptr(), REC_BUF);
+    let rl = match encode_frame(
+        &Message {
+            fields: &fields[..n],
+        },
+        out,
+    ) {
+        Ok(rl) => rl,
+        Err(_) => {
+            s.replies_failed = s.replies_failed.wrapping_add(1);
+            s.acct.input_failed();
+            return;
+        }
+    };
+    s.replies = s.replies.wrapping_add(1);
+    let outch = SysChan::new(sys, s.out_chan);
+    match s.reply_pending.stage(&outch, &s.reply_buf, rl) {
+        Staged::Delivered => {
+            s.acct.output_delivered_now(rl as u32);
+            s.acct.input_succeeded();
+        }
+        Staged::Pending => s.acct.output_staged(rl as u32),
+        Staged::Failed(_) => {
+            s.reply_pending = Pending { off: 0, len: 0 };
+            s.acct.output_failed_now();
+            s.acct.input_failed();
+        }
     }
 }
 
@@ -149,7 +392,7 @@ unsafe fn ingress_admit(s: &mut ModuleState, sys: &SyscallTable) -> Option<usize
     // The key is the producer's ordering unit; this module has one, so the
     // key is not needed.
     chan_skip(sys, ch, klen);
-    if plen > s.in_buf.len() {
+    if plen > INGRESS_BUF {
         chan_skip(sys, ch, plen);
         s.acct.reject_input(plen as u64);
         s.sink_refused = s.sink_refused.wrapping_add(1);
@@ -162,7 +405,7 @@ unsafe fn ingress_admit(s: &mut ModuleState, sys: &SyscallTable) -> Option<usize
         return None;
     }
     s.ingress_corr = corr;
-    s.ingress_succeeded_at = s.acct.inputs_succeeded;
+    s.ingress_outcome = INGRESS_OPEN;
     s.acct.admit_input(plen as u64);
     Some(plen)
 }
@@ -206,8 +449,11 @@ fn scan_kinded_versions(vbin: &[u8], kinds: &[u8]) -> bool {
                 return true;
             };
             let decision = kinds.get(i).is_some_and(|k| *k == STAGE_KIND_DECISION);
+            let map = kinds.get(i).is_some_and(|k| *k == STAGE_KIND_MAP);
             let bad = if decision {
                 scan_decision_container(st.code).is_err()
+            } else if map {
+                scan_map_container(st.code).is_err()
             } else {
                 scan_code(st.code).is_err()
             };
@@ -238,50 +484,69 @@ impl StageEval for KindedEval {
         dst: &mut [u8],
         spent: &mut u64,
     ) -> Result<usize, PipeError> {
+        if stage.kind == STAGE_KIND_MAP {
+            return run_map_stage(stage.code, src, dst, spent);
+        }
         if stage.kind != STAGE_KIND_DECISION {
             return run_stage_metered(stage, src, dst, spent);
         }
-        let mut fields = [Field {
-            number: 0,
-            value: Value::Null,
-        }; MAX_PIPE_FIELDS];
-        let nf = decode_frame(src, &mut fields)?;
-        let params = [Message {
-            fields: &fields[..nf],
-        }];
-        let mut builder = Builder::new();
-        let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
-        let mut scratch = Scratch::new(&mut sbuf);
-        let mut w = 0u64;
-        let fired =
-            run_decision_scratch_metered(stage.code, &params, &mut builder, &mut scratch, &mut w);
-        *spent += w;
-        match fired {
-            // Which branch fired is an audit fact the standalone `decision`
-            // module reports on its own instrument. Inline, the outcome record
-            // IS the report: the next stage sees what a downstream node would.
-            Ok(_) => encode_frame_scratch(&builder.message(), &scratch, dst),
-            Err(_) => Err(PipeError::NotConstructed),
-        }
+        run_decision_stage(stage, src, dst, spent)
     }
 }
+
+/// One DECISION stage: decode, route, encode the fired branch's record.
+#[inline(never)]
+fn run_decision_stage(
+    stage: &Stage,
+    src: &[u8],
+    dst: &mut [u8],
+    spent: &mut u64,
+) -> Result<usize, PipeError> {
+    let mut fields = [Field {
+        number: 0,
+        value: Value::Null,
+    }; MAX_PIPE_FIELDS];
+    let nf = decode_frame(src, &mut fields)?;
+    let params = [Message {
+        fields: &fields[..nf],
+    }];
+    let mut builder = Builder::new();
+    let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
+    let mut scratch = Scratch::new(&mut sbuf);
+    let mut w = 0u64;
+    let fired =
+        run_decision_scratch_metered(stage.code, &params, &mut builder, &mut scratch, &mut w);
+    *spent += w;
+    match fired {
+        // Which branch fired is an audit fact the standalone `decision`
+        // module reports on its own instrument. Inline, the outcome record
+        // IS the report: the next stage sees what a downstream node would.
+        Ok(_) => encode_frame_scratch(&builder.message(), &scratch, dst),
+        Err(_) => Err(PipeError::NotConstructed),
+    }
+}
+
 use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
     eval_decode_scratch, frame_len, hex_decode, lower_stages_kinded, parse_version_table,
-    pipeline_reload, run_decision_scratch_metered, run_stage_metered, run_stages_metered,
-    run_stages_with, scan_code, scan_decision_container, scan_version_table, stage_at, stage_count,
-    version_selector_from_frame, Accounting, Admit, Builder, Field, Message, Mode, Pending,
-    PipeError, Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
-    MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_SCRATCH_CAP,
+    pipeline_reload_kinded, run_decision_scratch_metered, run_map_stage, run_stage_metered,
+    run_stages_metered, run_stages_with, scan_code, scan_decision_container, scan_map_container,
+    scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
+    Builder, EvalError, Field, Message, Mode, Pending, PipeError, Scratch, Stage, StageEval,
+    Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD, EXCHANGE_STATUS_FIELD,
+    MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_KIND_MAP,
+    STAGE_SCRATCH_CAP,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
-const MAX_STAGES: usize = 8;
 const HEX_BUF: usize = 4096;
 const PROG_BUF: usize = 2048;
-const ENC_BUF: usize = 4096;
+/// The trailing encoder's output and the ingress decoder's frame. An encoded
+/// payload is copied into `out_buf` for delivery and a decoded frame is a
+/// stage input, so neither can usefully exceed one record: tiered with it.
+const ENC_BUF: usize = REC_BUF;
 
 /// One record, in bytes: the read buffer, both stage ping-pong buffers and
 /// the write buffer.
@@ -335,7 +600,7 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_chan: i32,
     out_chan: i32,
-    in_buf: [u8; INGRESS_BUF],
+    in_buf: [u8; IN_BUF],
     buf_a: [u8; REC_BUF],
     buf_b: [u8; REC_BUF],
     out_buf: [u8; REC_BUF],
@@ -361,8 +626,8 @@ struct ModuleState {
     // never touches the active generation.
     vbin_cand: [u8; VBIN_BUF],
     /// Declared stage kinds, parallel to the stage container. Empty means
-    /// every stage is compute — the historical meaning of a container alone.
-    stage_kinds: [u8; MAX_STAGES],
+    /// every stage is compute.
+    stage_kinds: [u8; MAX_NODE_STAGES],
     stage_kinds_len: u8,
 
     /// One retained output frame, drained before any new input is admitted.
@@ -389,6 +654,34 @@ struct ModuleState {
     link_downs: u32,
     /// One framed publish, envelope included.
     pub_buf: [u8; PUB_FRAME_MAX],
+    /// The record's carry (field 254), lifted before the encoder reuses
+    /// `out_buf`: it becomes the publish's `msg_key`, which a replying
+    /// destination echoes back unchanged.
+    key: [u8; KEY_BUF],
+    /// Records refused because their carry exceeds `KEY_BUF` — refused,
+    /// never truncated, since a clipped context rejoins the wrong request.
+    carry_refused: u32,
+    /// Records refused for exceeding a bound: more fields than the field
+    /// table holds, or more elements than a map stage declares. A subset of
+    /// `inputs_failed`, counted apart because the remedy is capacity, not a fix.
+    over_bound: u32,
+
+    // ── Replies (`stream.ordered_ack.exchange`) ──────────────────
+    /// in[3]: `reply_in`. A replying destination answers here, and the reply
+    /// IS the ack: it releases the window, and becomes a record — its payload
+    /// decoded (`reply_decode`), its echoed key restored as the carry (254),
+    /// its status at 253 — delivered on `result_out`.
+    reply_chan: i32,
+    rdec_hex: [u8; RDEC_HEX_BUF],
+    rdec_hex_len: u16,
+    rdec: [u8; RDEC_PROG_BUF],
+    rdec_len: u16,
+    /// One retained reply record, drained before another reply is taken.
+    reply_pending: Pending,
+    reply_buf: [u8; REC_BUF],
+    /// Replies turned into records, and replies that could not be.
+    replies: u32,
+    replies_failed: u32,
 
     // ── Ingress (`stream.ordered_ack.sink`) ──────────────────────
     /// in[2]: `publish_in`. `-1` when the graph wired no producer, in which
@@ -404,9 +697,10 @@ struct ModuleState {
     /// when that record resolves: OK once its output is accepted downstream,
     /// a typed refusal if processing fails.
     ingress_corr: u64,
-    /// `inputs_succeeded` when the in-flight publish was admitted; the record's
-    /// resolution reads as OK or a refusal against it.
-    ingress_succeeded_at: u64,
+    /// How the in-flight publish's record resolved (`INGRESS_OPEN` until it
+    /// does). Set where the record resolves and nowhere else, so a reply
+    /// record resolving meanwhile cannot answer for it.
+    ingress_outcome: u8,
     /// An ack the ring would not take, retried before anything else so no
     /// publish goes unanswered.
     ack_retry: [u8; ACK_FRAME_LEN],
@@ -495,29 +789,42 @@ define_params! {
         if i < len { s.param_overflow = true; }
     };
 
-    // A shipped IR-stages container (hex), lowered to a bytecode-stages container
-    // at load (each stage's cost re-derived).
+    // The program that turns a destination's reply payload into a record
+    // (see `reply_in`). Without it a reply payload must be one record frame.
+    7, reply_decode, str_chunked, 0 => |s, d, len| {
+        let mut i = 0usize;
+        while i < len && (s.rdec_hex_len as usize) < RDEC_HEX_BUF {
+            s.rdec_hex[s.rdec_hex_len as usize] = *d.add(i);
+            s.rdec_hex_len += 1;
+            i += 1;
+        }
+        if i < len { s.param_overflow = true; }
+    };
+
     // Which executor runs each stage, one hex byte per stage, parallel to
-    // `ir_stages`. `00` compute, `01` decision. Absent means all compute, which is
-    // what a graph that names no executors is asking for.
+    // `ir_stages`: `00` compute, `01` decision, `02` map. Absent means all
+    // compute, which is what a graph that names no executors is asking for.
+    // One vector serves every version in the table, hot-reloaded ones included.
     //
     // Declared here rather than inside the stage container because that
     // container's bytes are recorded in a frozen corpus and in every emitted
     // graph: changing its shape would invalidate answers that cannot be
     // regenerated.
     6, stage_kinds, str, 0 => |s, d, len| {
-        let mut raw = [0u8; MAX_STAGES * 2];
+        let mut raw = [0u8; MAX_NODE_STAGES * 2];
+        // More kinds than stages this build runs: refused, not cut short.
+        if len > raw.len() { s.param_overflow = true; }
         let n = if len > raw.len() { raw.len() } else { len };
         let mut i = 0usize;
         while i < n {
             raw[i] = *d.add(i);
             i += 1;
         }
-        let mut out = [0u8; MAX_STAGES];
+        let mut out = [0u8; MAX_NODE_STAGES];
         if let Some(nb) = hex_decode(&raw[..n], &mut out) {
-            s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_STAGES];
+            s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_NODE_STAGES];
             let mut k = 0usize;
-            while k < nb && k < MAX_STAGES {
+            while k < nb && k < MAX_NODE_STAGES {
                 s.stage_kinds[k] = out[k];
                 k += 1;
             }
@@ -526,8 +833,10 @@ define_params! {
             s.param_overflow = true;
         }
     };
-    // `str_chunked`: the stage list arrives as TLV entries of at most 255
-    // bytes under the same tag and this handler APPENDS each one.
+    // A shipped IR-stages container (hex), lowered to a bytecode-stages container
+    // at load (each stage's cost re-derived). `str_chunked`: the stage list
+    // arrives as TLV entries of at most 255 bytes under the same tag and this
+    // handler APPENDS each one.
     5, ir_stages, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.hex_len as usize) < HEX_BUF {
@@ -585,7 +894,7 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan;
         s.out_chan = out_chan;
         s.ctrl_chan = ctrl_chan;
-        s.in_buf = [0u8; INGRESS_BUF];
+        s.in_buf = [0u8; IN_BUF];
         s.buf_a = [0u8; REC_BUF];
         s.buf_b = [0u8; REC_BUF];
         s.out_buf = [0u8; REC_BUF];
@@ -598,7 +907,7 @@ pub extern "C" fn module_new(
         s.vbin_len = 0;
         s.vbin_cand = [0u8; VBIN_BUF];
         s.pending = Pending { off: 0, len: 0 };
-        s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_STAGES];
+        s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_NODE_STAGES];
         s.stage_kinds_len = 0;
         s.publish_chan = dev_channel_port(sys, 1, 1);
         s.ack_chan = dev_channel_port(sys, 0, 1);
@@ -607,11 +916,20 @@ pub extern "C" fn module_new(
         s.refused = 0;
         s.invalidated = 0;
         s.link_downs = 0;
+        s.key = [0u8; KEY_BUF];
+        s.carry_refused = 0;
+        s.over_bound = 0;
+        s.reply_chan = dev_channel_port(sys, 0, 3);
+        s.rdec_hex_len = 0;
+        s.rdec_len = 0;
+        s.reply_pending = Pending { off: 0, len: 0 };
+        s.replies = 0;
+        s.replies_failed = 0;
         s.pub_in_chan = dev_channel_port(sys, 0, 2);
         s.ack_out_chan = dev_channel_port(sys, 1, 2);
         s.link_announced = false;
         s.ingress_corr = 0;
-        s.ingress_succeeded_at = 0;
+        s.ingress_outcome = INGRESS_OPEN;
         s.ack_retry = [0u8; ACK_FRAME_LEN];
         s.ack_retry_len = 0;
         s.sink_acked = 0;
@@ -698,6 +1016,15 @@ pub extern "C" fn module_new(
                 s.enc_len = 0;
                 if s.enc_hex_len > 0 {
                     fault = b"[pipeline] FAULT: encode param is not valid hex";
+                }
+            }
+        }
+        match hex_decode(&s.rdec_hex[..s.rdec_hex_len as usize], &mut s.rdec) {
+            Some(n) => s.rdec_len = n as u16,
+            None => {
+                s.rdec_len = 0;
+                if s.rdec_hex_len > 0 {
+                    fault = b"[pipeline] FAULT: reply_decode param is not valid hex";
                 }
             }
         }
@@ -791,6 +1118,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Ingress: what this module did with what reached it as a sink.
             tlm_counter(sys, midx, t, b + 10, s.sink_acked as u64);
             tlm_counter(sys, midx, t, b + 11, s.sink_refused as u64);
+            tlm_counter(sys, midx, t, b + 12, s.replies as u64);
+            tlm_counter(sys, midx, t, b + 13, s.replies_failed as u64);
+            tlm_counter(sys, midx, t, b + 14, s.carry_refused as u64);
+            tlm_counter(sys, midx, t, b + 15, s.over_bound as u64);
         }
 
         // 0. Acks from the destination. Drained FIRST because an ack frees
@@ -843,10 +1174,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 0b. Replies from a replying destination: each one frees the window
+        //     and becomes a record on `result_out`.
+        if s.reply_chan >= 0 {
+            reply_step(s, sys);
+        }
+
         // 1. Hot reload — TRANSACTIONAL. Apply the control op to the candidate
         //    table, validate it, and copy it over the active table ONLY on success. A
-        //    rejected candidate leaves the active generation byte-identical; it can no
-        //    longer fault a healthy node.
+        //    rejected candidate leaves the active generation byte-identical, so it
+        //    cannot fault a healthy node.
         if s.ctrl_chan >= 0 {
             let cp = (sys.channel_poll)(s.ctrl_chan, 0x01);
             if cp > 0 && (cp as u32 & 0x01) != 0 {
@@ -855,16 +1192,33 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let vbin_len = s.vbin_len as usize;
                     let active = core::slice::from_raw_parts(s.vbin.as_ptr(), vbin_len);
                     let msg = core::slice::from_raw_parts(s.ctrl_buf.as_ptr(), cn as usize);
-                    match pipeline_reload(active, &mut s.vbin_cand, VBIN_BUF, msg) {
+                    // The candidate is lowered and validated with the stage
+                    // kinds the running table was loaded with, exactly as at
+                    // init: a decision or map body is neither lowered as
+                    // expression IR nor scanned as VM code.
+                    let kinds = &s.stage_kinds[..s.stage_kinds_len as usize];
+                    let reloaded = pipeline_reload_kinded(
+                        active,
+                        &mut s.vbin_cand,
+                        VBIN_BUF,
+                        msg,
+                        kinds,
+                        |t: &[u8]| {
+                            if kinds.is_empty() {
+                                scan_version_table(t).is_ok()
+                            } else {
+                                !scan_kinded_versions(t, kinds)
+                            }
+                        },
+                    );
+                    match reloaded {
                         Ok(nu) => {
-                            // A raw copy: a slice copy whose lengths the
-                            // compiler cannot prove equal carries a panic
+                            // Element by element: a slice copy whose lengths
+                            // the compiler cannot prove equal carries a panic
                             // path, and a module image links none.
-                            core::ptr::copy_nonoverlapping(
-                                s.vbin_cand.as_ptr(),
-                                s.vbin.as_mut_ptr(),
-                                nu,
-                            );
+                            for (d, x) in s.vbin.iter_mut().zip(s.vbin_cand.iter()).take(nu) {
+                                *d = *x;
+                            }
                             s.vbin_len = nu as u16;
                             s.reloads = s.reloads.wrapping_add(1);
                             dev_log(sys, 3, b"[pipeline] reload".as_ptr(), 17);
@@ -903,18 +1257,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     return 0;
                 }
             }
-            if s.ingress_corr != 0 && s.acct.inputs_in_flight == 0 {
-                let status = if s.acct.inputs_succeeded > s.ingress_succeeded_at {
-                    s.sink_acked = s.sink_acked.wrapping_add(1);
-                    STATUS_OK
-                } else {
-                    s.sink_refused = s.sink_refused.wrapping_add(1);
-                    REFUSE_UNROUTABLE
-                };
+        }
+        if s.ingress_corr != 0 && s.ingress_outcome != INGRESS_OPEN {
+            let status = if s.ingress_outcome == INGRESS_OK {
+                s.sink_acked = s.sink_acked.wrapping_add(1);
+                STATUS_OK
+            } else {
+                s.sink_refused = s.sink_refused.wrapping_add(1);
+                REFUSE_UNROUTABLE
+            };
+            if s.ack_out_chan >= 0 {
                 if let Some(a) = Ack::reply(s.ingress_corr, status) {
                     ack_write(s, sys, a);
                 }
-                s.ingress_corr = 0;
+            }
+            s.ingress_corr = 0;
+            s.ingress_outcome = INGRESS_OPEN;
+            if s.ack_retry_len != 0 {
+                return 0;
             }
         }
 
@@ -937,13 +1297,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // its delivery resolves the record.
                 Staged::Delivered => {
                     s.acct.output_drained(plen);
-                    s.acct.input_succeeded();
+                    record_succeeded(s);
                 }
                 Staged::Pending => return 0,
                 Staged::Failed(_) => {
                     s.pending = Pending { off: 0, len: 0 };
                     s.acct.output_failed_pending(plen);
-                    s.acct.input_failed();
+                    record_failed(s);
                 }
             }
             return 0;
@@ -963,6 +1323,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    message split across reads fails the decode, counted).
         let raw_len: usize;
         if s.pub_in_chan >= 0 {
+            // One publish at a time: a new one is not taken while the last
+            // is unanswered, so no answer is ever lost or given for another.
+            if s.ingress_corr != 0 {
+                return 0;
+            }
             match ingress_admit(s, sys) {
                 Some(n) => raw_len = n,
                 None => return 0,
@@ -1004,23 +1369,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let frame_ptr: *const u8;
         let frame_bytes: usize;
         if s.dec_len > 0 {
-            let mut b = Builder::new();
-            let dec = core::slice::from_raw_parts(s.dec.as_ptr(), s.dec_len as usize);
-            let inp = core::slice::from_raw_parts(s.in_buf.as_ptr(), raw_len);
-            let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
-            match eval_decode_scratch(dec, inp, scr, &mut b, 100_000) {
-                Ok(()) => match encode_frame(&b.message(), &mut s.dec_out) {
-                    Ok(rl) => {
-                        frame_ptr = s.dec_out.as_ptr();
-                        frame_bytes = rl;
-                    }
-                    Err(_) => {
-                        s.acct.input_failed();
-                        return 0;
-                    }
-                },
-                Err(_) => {
-                    s.acct.input_failed();
+            match decode_ingress(s, raw_len) {
+                Some(rl) => {
+                    frame_ptr = s.dec_out.as_ptr();
+                    frame_bytes = rl;
+                }
+                None => {
+                    record_failed(s);
                     return 0;
                 }
             }
@@ -1028,7 +1383,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if s.pub_in_chan >= 0 && frame_len(&s.in_buf[..raw_len]) != Some(raw_len) {
                 // A payload that is not exactly one typed frame is a terminal
                 // failure for this record — refused, never parsed as a prefix.
-                s.acct.input_failed();
+                record_failed(s);
                 return 0;
             }
             frame_ptr = s.in_buf.as_ptr();
@@ -1049,11 +1404,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let out_len = match prog {
             Some(prog) => {
                 let ns = stage_count(prog);
-                if ns > MAX_STAGES {
+                if ns > MAX_NODE_STAGES {
                     // Reject an over-cap stage container rather than silently skipping
                     // the trailing stages: a valid container that declares more
                     // stages than this build runs is an error, not a truncation.
-                    s.acct.input_failed();
+                    record_failed(s);
                     0
                 } else {
                     let mut stages = [Stage {
@@ -1061,7 +1416,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         max_cost: 0,
                         on_failure: None,
                         kind: STAGE_KIND_COMPUTE,
-                    }; MAX_STAGES];
+                    }; MAX_NODE_STAGES];
                     let mut ok = true;
                     for (i, st) in stages.iter_mut().enumerate().take(ns) {
                         match stage_at(prog, i) {
@@ -1077,7 +1432,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     if !ok {
-                        s.acct.input_failed();
+                        record_failed(s);
                         0
                     } else {
                         {
@@ -1092,8 +1447,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 &mut spent,
                             );
                             s.acct.add_work(spent);
-                            r.unwrap_or_else(|_| {
-                                s.acct.input_failed();
+                            r.unwrap_or_else(|e| {
+                                if e.over_bound() {
+                                    s.over_bound = s.over_bound.wrapping_add(1);
+                                }
+                                record_failed(s);
                                 0
                             })
                         }
@@ -1112,28 +1470,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
 
+        // The carry rides out as the publish's `msg_key`: lifted now, before
+        // the encoder reuses `out_buf`. One that does not fit is refused.
+        let mut key_len = 0usize;
+        if s.publish_chan >= 0 {
+            let frame = core::slice::from_raw_parts(s.out_buf.as_ptr(), out_len);
+            if let Some(c) = frame_field_bytes(frame, CARRY_FIELD as u8) {
+                if c.len() > KEY_BUF {
+                    s.carry_refused = s.carry_refused.wrapping_add(1);
+                    record_failed(s);
+                    return 0;
+                }
+                for (d, x) in s.key.iter_mut().zip(c.iter()) {
+                    *d = *x;
+                }
+                key_len = c.len();
+            }
+        }
+
         // 5. Optional trailing encoder → a wire payload, copied into out_buf so
         //    delivery always retries from one stable buffer. Then stage (retained on a
         //    full ring, delivered on a later step — never dropped, never double-sent).
         let final_len = if s.enc_len > 0 {
-            let mut fields = [Field {
-                number: 0,
-                value: Value::Null,
-            }; MAX_PIPE_FIELDS];
-            let enc = core::slice::from_raw_parts(s.enc.as_ptr(), s.enc_len as usize);
-            let frame = core::slice::from_raw_parts(s.out_buf.as_ptr(), out_len);
-            let nf = decode_frame(frame, &mut fields).unwrap_or(0);
-            let params = [Message {
-                fields: &fields[..nf],
-            }];
-            match eval_bytes(enc, &params, &mut s.enc_out, 100_000) {
-                Ok(m) => {
-                    // As above: raw, so no panic path is linked in.
-                    core::ptr::copy_nonoverlapping(s.enc_out.as_ptr(), s.out_buf.as_mut_ptr(), m);
-                    m
-                }
-                Err(_) => {
-                    s.acct.input_failed();
+            match encode_output(s, out_len) {
+                Some(m) => m,
+                None => {
+                    record_failed(s);
                     return 0;
                 }
             }
@@ -1156,9 +1518,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let publish = Publish {
                 corr,
                 flags: 0,
-                // No key: one destination, one ordering unit. This module
-                // takes no key-field param, so every record shares one unit.
-                msg_key: &[],
+                // The record's carry (254), echoed back by a replying
+                // destination so its reply rejoins this request; empty when
+                // the record carries none.
+                msg_key: &s.key[..key_len],
                 payload: &s.out_buf[..final_len],
             };
             if let Some(n) = publish.encode(&mut s.pub_buf[3..]) {
@@ -1169,7 +1532,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     Staged::Delivered => {
                         s.inflight = s.inflight.saturating_add(1);
                         s.acct.output_delivered_now(final_len as u32);
-                        s.acct.input_succeeded();
+                        record_succeeded(s);
                     }
                     Staged::Pending => {
                         s.inflight = s.inflight.saturating_add(1);
@@ -1178,14 +1541,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     Staged::Failed(_) => {
                         s.pending = Pending { off: 0, len: 0 };
                         s.acct.output_failed_now();
-                        s.acct.input_failed();
+                        record_failed(s);
                     }
                 }
             } else {
                 // Larger than the surface admits. Refused here rather than
                 // truncated, which is the contract's rule.
                 s.acct.output_failed_now();
-                s.acct.input_failed();
+                record_failed(s);
             }
             return 0;
         }
@@ -1193,18 +1556,63 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         match s.pending.stage(&outch, &s.out_buf, final_len) {
             Staged::Delivered => {
                 s.acct.output_delivered_now(final_len as u32);
-                s.acct.input_succeeded();
+                record_succeeded(s);
             }
             Staged::Pending => s.acct.output_staged(final_len as u32),
             Staged::Failed(_) => {
                 s.pending = Pending { off: 0, len: 0 };
                 s.acct.output_failed_now();
-                s.acct.input_failed();
+                record_failed(s);
             }
         }
         0
     }
 }
+/// Run the ingress decoder over the payload in `in_buf`, leaving the record
+/// frame in `dec_out`. `None` when it cannot become one record — including a
+/// payload that builds more fields than the table holds, counted `over_bound`.
+#[inline(never)]
+unsafe fn decode_ingress(s: &mut ModuleState, raw_len: usize) -> Option<usize> {
+    let mut b = Builder::new();
+    let dec = core::slice::from_raw_parts(s.dec.as_ptr(), s.dec_len as usize);
+    let inp = core::slice::from_raw_parts(s.in_buf.as_ptr(), raw_len);
+    let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
+    if let Err(e) = eval_decode_scratch(dec, inp, scr, &mut b, 100_000) {
+        if e == EvalError::BuildOverflow {
+            s.over_bound = s.over_bound.wrapping_add(1);
+        }
+        return None;
+    }
+    encode_frame(&b.message(), &mut s.dec_out).ok()
+}
+
+/// Run the trailing encoder over the record in `out_buf`, leaving the wire
+/// payload in its place. `None` when the record does not decode, the encoder
+/// fails, or the payload would not fit `out_buf` — refused, never written past
+/// it or cut short.
+#[inline(never)]
+unsafe fn encode_output(s: &mut ModuleState, out_len: usize) -> Option<usize> {
+    let mut fields = [Field {
+        number: 0,
+        value: Value::Null,
+    }; MAX_PIPE_FIELDS];
+    let enc = core::slice::from_raw_parts(s.enc.as_ptr(), s.enc_len as usize);
+    let frame = core::slice::from_raw_parts(s.out_buf.as_ptr(), out_len);
+    let nf = decode_frame(frame, &mut fields).ok()?;
+    let params = [Message {
+        fields: &fields[..nf],
+    }];
+    let m = eval_bytes(enc, &params, &mut s.enc_out, 100_000).ok()?;
+    if m > s.out_buf.len() {
+        return None;
+    }
+    // Element by element over checked ranges: no raw copy, no panic path.
+    for (d, x) in s.out_buf.iter_mut().zip(s.enc_out.get(..m)?) {
+        *d = *x;
+    }
+    Some(m)
+}
+
 /// Build a fail-closed `{1: "VERSION_UNAVAILABLE"}` record frame into `buf` via the
 /// shared `encode_frame` (no hand-poked offsets — one frame encoder). Encoders
 /// render field 1, so it surfaces as text; raw consumers see a field-1 marker.

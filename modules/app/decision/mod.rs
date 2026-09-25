@@ -7,11 +7,12 @@
 //! module runs a first-hit policy over an input record, emitting the selected
 //! outcome as the next record frame.
 //!
-//! A decision is its OWN node (not a pipeline bytecode stage) because the VM has
-//! no branching opcode — a single program constructs one message and cannot select
-//! among several. The first-hit driver lives in `decision_core.rs`, `include!`d
-//! verbatim from the host harness (tests/harness), so this module and the host tests
-//! run identical logic.
+//! A decision is not a single VM program, because the VM has no branching
+//! opcode — a program constructs one message and cannot select among several.
+//! It is a first-hit driver over several programs, run either as this node or
+//! inline as a `STAGE_KIND_DECISION` pipeline stage. The driver lives in
+//! `decision_core.rs`, `include!`d verbatim from the host harness (tests/harness),
+//! so this module and the host tests run identical logic.
 
 #![no_std]
 #![allow(
@@ -88,16 +89,17 @@ const REC_BUF: usize = if TINY { 512 } else { 4096 };
 /// because a truncated container decodes to a different policy.
 ///
 /// TAKEN from `pipeline_core` rather than restated, and tiered by arena like
-/// `REC_BUF` above. Restating it is what made this buffer wrong once already:
-/// 20,480 bytes chosen independently of the authoring path. Flattening it to the
-/// RP2040 floor was the same mistake pointing the other way — it refuses tables
-/// this target has the arena to hold, and refuses them at LOAD, where the only
-/// evidence is a policy that decides something else.
+/// `REC_BUF` above. A bound chosen here independently of the authoring path
+/// drifts from it in one of two directions, and both are wrong: too large, and
+/// the buffer holds a container no author can produce; too small — the RP2040
+/// floor applied everywhere — and it refuses tables this target has the arena to
+/// hold, at LOAD, where the only evidence is a policy that decides something else.
 ///
 /// On a full-arena target the bound is `author_core::BIN_BUF`, so the engine
 /// loads anything the authoring path can assemble. Both buffers live in module
 /// STATE, so they cost state and not a PIC frame: 48 KiB an instance at the full
-/// tier, against the 256 MiB arena such a target has.
+/// tier — negligible against a 256 MiB (BCM2712) arena, about a fifth of
+/// RP2350's 240 KiB.
 const CONT_BUF: usize = if TINY {
     dec::MAX_CONTAINER_BIN
 } else {
@@ -123,7 +125,8 @@ struct ModuleState {
     /// The common accounting taxonomy: a delivered non-empty outcome is
     /// `inputs_succeeded`, an empty-outcome filter `inputs_policy_dropped`, an
     /// admission refusal `inputs_rejected`, and any terminal processing failure
-    /// `inputs_failed`. The two reason splits below refine `inputs_failed`.
+    /// `inputs_failed`. The reason splits below (frame, encode, absent) refine
+    /// `inputs_failed`.
     acct: Accounting,
     /// Frame-decode failures, split from eval errors so a miswired channel
     /// (malformed frames) is distinguishable from a broken program. A refinement of
@@ -131,6 +134,11 @@ struct ModuleState {
     errors_frame: u32,
     /// Output-frame encode failures (oversized outcome).
     errors_encode: u32,
+    /// Records whose predicate read an absent field that nothing absorbed —
+    /// the decision failed closed (`DecisionError::Absent`). Named apart from
+    /// a broken program: this is usually an upstream stage not carrying a
+    /// field, and it is the count that says so.
+    errors_absent: u32,
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
@@ -223,6 +231,7 @@ pub extern "C" fn module_new(
         s.last_rule = 0xFFFF;
         s.errors_frame = 0;
         s.errors_encode = 0;
+        s.errors_absent = 0;
         s.faulted = 0;
 
         // FAULT DISCIPLINE: a `decision` param that was PROVIDED but is
@@ -281,8 +290,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // ids 0..13: the baseline accounting block.
             acct_emit(sys, midx, t, 0, &s.acct);
             // ids 14..: decision's own instruments. module_mode, the init
-            // fault flag, the two failure-reason splits, and the `Fired`
-            // audit — no_match count and the last rule index (0xFFFF = default).
+            // fault flag, the failure-reason splits (frame, encode, and absent
+            // at the end, as ids are wire positions), and the `Fired` audit —
+            // no_match count and the last rule index (0xFFFF = default).
             let b = ACCT_METRIC_COUNT as u16;
             tlm_gauge(sys, midx, t, b, s.mode as u64);
             tlm_gauge(sys, midx, t, b + 1, s.faulted as u64);
@@ -292,6 +302,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             tlm_gauge(sys, midx, t, b + 5, s.last_rule as u64);
             // work units — VM instructions across predicates + the chosen outcome.
             tlm_counter(sys, midx, t, b + 6, s.acct.work_units);
+            tlm_counter(sys, midx, t, b + 7, s.errors_absent as u64);
         }
 
         if s.in_chan < 0 || s.cont_len == 0 || s.faulted != 0 {
@@ -322,14 +333,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         // The step core has already recorded every disposition into `acct`. The
         // wrapper adds only the failure-reason SPLITS that refine
-        // `inputs_failed`: a frame-decode failure (a miswired channel) apart from an
-        // oversized-outcome encode failure.
+        // `inputs_failed`: a frame-decode failure (a miswired channel), an
+        // oversized-outcome encode failure, and a predicate left unknown by an
+        // absent field (`errors_absent`).
         match r {
             StepResult::Failed(Reason::Malformed) => {
                 s.errors_frame = s.errors_frame.wrapping_add(1)
             }
             StepResult::Failed(Reason::TooLarge) => {
                 s.errors_encode = s.errors_encode.wrapping_add(1)
+            }
+            StepResult::Failed(Reason::NotFound) => {
+                s.errors_absent = s.errors_absent.wrapping_add(1)
             }
             _ => {}
         }
