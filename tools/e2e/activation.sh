@@ -12,11 +12,12 @@
 # The ORDER assertions are the interesting ones. Protobuf serializes these in
 # ascending field number — artefacts(2..8), bindings(9), dependencies(10),
 # capabilities(11) — which is NOT the sequence order. A node that reported
-# failures in wire order would tell the operator a different first cause than the
-# host does, so the last two checks below pin the sequence, not just the refusal.
+# failures in wire order would name a different first cause than the check
+# sequence does, so the last two checks below pin the sequence, not just the
+# refusal.
 #
-# Fixtures are generated:
-#   cargo test -p chronicle-module --test device_activation print_activation_e2e_fixtures -- --nocapture
+# The fixtures are pinned; a change to the Module encoding needs them derived
+# anew from the format, not copied from what the applet now prints.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no activation "fluxor modules build failed"; finish; exit; }
 

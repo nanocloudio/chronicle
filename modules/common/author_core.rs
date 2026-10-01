@@ -1357,7 +1357,7 @@ pub fn author_document(
         let spec = ModuleSpec {
             source_revision: doc.provenance_revision.of(src),
             build_toolchain: if doc.provenance_toolchain.is_empty() {
-                b"chronicle-authoring".as_slice()
+                b"chronicle".as_slice()
             } else {
                 doc.provenance_toolchain.of(src)
             },
@@ -1664,17 +1664,22 @@ pub fn graph_document(
         &mut *st_scratch,
     ) {
         Ok(p) => (p, 0),
-        Err(e) => {
-            let msg: &[u8] = match e {
-                GraphError::RunTooLong => return run_too_long(&mut *st_out),
-                GraphError::TooLarge => b"error: graph too large\n",
-                GraphError::EffectUnbound => b"error: an effect stage has no binding\n",
-                GraphError::EffectNotChainable => {
-                    b"error: a stage follows an effect that answers with no record\n"
-                }
-            };
-            (append(&mut *st_out, 0, msg), 1)
-        }
+        // Appends inside each arm: a match yielding `&'static [u8]` compiles
+        // to a pointer table, which does not relocate in a PIC module.
+        Err(GraphError::RunTooLong) => run_too_long(&mut *st_out),
+        Err(GraphError::TooLarge) => (append(&mut *st_out, 0, b"error: graph too large\n"), 1),
+        Err(GraphError::EffectUnbound) => (
+            append(&mut *st_out, 0, b"error: an effect stage has no binding\n"),
+            1,
+        ),
+        Err(GraphError::EffectNotChainable) => (
+            append(
+                &mut *st_out,
+                0,
+                b"error: a stage follows an effect that answers with no record\n",
+            ),
+            1,
+        ),
     }
 }
 

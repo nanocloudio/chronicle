@@ -21,7 +21,7 @@ platform:
 modules:
   - name: pipeline
     params:
-      # Regenerate: cargo test -p chronicle-authoring --test pack print_composed_ir_params -- --nocapture
+      # Regenerate on device: `chronicle compile` the stage, then `chronicle stages <ir>`.
       ir_stages: "01ff2f000500010100000012010000000500010200000012020000000500010300000001020000000000000011120300000013"
   - name: aggregation
     params:

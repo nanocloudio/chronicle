@@ -1,4 +1,4 @@
-//! Expression evaluator — Fluxor `.fmod` app module (spec artefact 2).
+//! Expression evaluator — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the checked-CEL bytecode is NOT baked into the module — it
 //! arrives as a `program` module param (hex-encoded, since a config carries text)

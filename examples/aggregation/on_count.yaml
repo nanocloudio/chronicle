@@ -1,11 +1,11 @@
 # Aggregation with an EXPLICIT ONCOUNT trigger (count-based firing). The
-# def is the same customer-total IR def as examples/aggregation/ir.yaml, but with
+# def is the same customer-total IR def as examples/aggregation/linux.yaml, but with
 # trailing trigger bytes `02` `02000000` (= OnCount, n=2 LE u32) — lower_def
 # passes them through and build_spec decodes them. Instead of emitting only when
 # the watermark closes a window (default OnClose) or after every event
 # (Continuous), the module emits a window's RUNNING PARTIAL every N events folded
-# into it, resetting a per-pane counter each time. The counter is checkpointed
-# (snapshot ver 2), so count-firing survives a restart. Explicit triggers, not a
+# into it, resetting a per-pane counter each time. The counter is checkpointed,
+# so count-firing survives a restart. Explicit triggers, not a
 # hardcoded policy.
 #
 #   # three alice events, all in window [0,100) (times 10/20/30, amounts

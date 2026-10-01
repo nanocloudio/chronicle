@@ -7,8 +7,8 @@
 // by `registry:2`, zot, or fluxor's own store — no translation step.
 //
 // INTEROP IS THE POINT, and it constrains the parser: `index.json` here may have
-// been written by the host (`chronicle-module/src/oci.rs`, via serde_json's
-// pretty printer) or by a registry. So the reader below is a real JSON scanner —
+// been written by any OCI tool or registry, pretty-printed or not. So the reader
+// below is a real JSON scanner —
 // arbitrary whitespace, nesting, and escapes — not a pattern match against our
 // own writer's output. The writer is deliberately compact and deterministic;
 // the reader assumes nothing about layout.
@@ -53,6 +53,8 @@ pub const MAX_INDEX_ENTRIES: usize = 64;
 pub enum OciError {
     /// The underlying object store rejected the operation.
     Store,
+    /// The store took a write but has not decided it yet.
+    Pending,
     /// A referenced blob, tag, or required member is absent.
     NotFound,
     /// A caller buffer cannot hold the result.
@@ -69,6 +71,7 @@ impl From<BlobError> for OciError {
     fn from(e: BlobError) -> Self {
         match e {
             BlobError::PutFailed => OciError::Store,
+            BlobError::Pending => OciError::Pending,
             BlobError::NotFound => OciError::NotFound,
             BlobError::TooLarge => OciError::TooLarge,
             BlobError::DigestMismatch => OciError::DigestMismatch,

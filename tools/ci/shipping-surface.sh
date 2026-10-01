@@ -5,7 +5,7 @@
 # fluxor SDK. A device running them needs no cargo, no crates, and no Linux build
 # host — that is the whole point of the project.
 #
-# The tree carries no host code at all: the differential oracles live as golden
+# The tree carries no host code at all: reference answers live as golden
 # corpora, each beside the harness that reads it, and there is no crate. This gate
 # keeps it that way — the cheapest way to lose the property is for someone to add
 # a crate "just for a helper" and start including from it.

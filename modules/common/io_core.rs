@@ -1,6 +1,6 @@
 // Bounded, no_std, no-alloc RECORD-LIFECYCLE core — the one framed-admission and
 // pending-delivery discipline every steady-state Chronicle module runs. `include!`d
-// by the host crate (tests) and every streaming `.fmod`.
+// by every streaming `.fmod` and by the test harness.
 //
 // WHY A SEAM. The lifecycle must be driven across `module_step` calls (peek, read,
 // stage, retain), so proving "forced EAGAIN loses nothing" requires driving it in a

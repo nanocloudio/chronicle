@@ -3,16 +3,14 @@
 #
 #   chronicle parse <uproc_hex>
 #
-# The last thing that needed a Linux host. A device could already compile CEL,
-# seal artefacts, store, publish, verify and activate them — but not read a
-# module document, so authoring on device meant assembling artefacts one CLI
-# call at a time.
+# Reading a whole module document is what lets a device author from source
+# rather than assemble artefacts one CLI call at a time.
 #
-# Structural agreement with the host parser is pinned byte-for-byte by
-# `chronicle-canonical/tests/device_uproc.rs`, which compares every declaration
-# of the real example documents. This proves the same parser runs on the device
-# runtime, and that a malformed document fails with a POSITION rather than a
-# crash — a parser that cannot say where it gave up is not usable for authoring.
+# The parser's structure is held to recorded answers by the uproc corpus in
+# `tests/harness/tests/chronicle_cli.rs`. This proves the same parser runs on
+# the device runtime, and that a malformed document fails with a POSITION rather
+# than a crash — a parser that cannot say where it gave up is not usable for
+# authoring.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no uproc "fluxor modules build failed"; finish; exit; }
 

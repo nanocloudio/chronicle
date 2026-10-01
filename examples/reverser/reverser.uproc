@@ -69,5 +69,5 @@ module app.reverser {
   entry ask = ask;
   entry answer = answer;
 
-  provenance revision "reverser-v1" toolchain "chronicle-authoring";
+  provenance revision "reverser-v1" toolchain "chronicle";
 }

@@ -1,5 +1,5 @@
 // Bounded, no_std, no-alloc MULTI-VERSION table for the pipeline module.
-// `include!`d by both the host crate and the on-device module — one source of
+// `include!`d by the pipeline module and the test harness — one source of
 // truth. Lets one pipeline instance hold several versions of its program at once
 // (blue/green, canary) and pick one PER RECORD, so a fleet can run mixed versions
 // without separate deployments: a request pins a version by tag (the
@@ -13,7 +13,7 @@
 // identity for the CONTROL PLANE (the release manifest and its fleet
 // propagation), where "same tag -> same digest -> same bytecode on every
 // instance" is what makes a mixed-version fleet consistent. See
-// `chronicle-authoring::release`.
+// `release_core`.
 
 /// Maximum versions held at once (bounded state).
 pub const MAX_VERSIONS: usize = 8;
@@ -138,9 +138,8 @@ pub fn scan_version_table(bin: &[u8]) -> Result<(), EvalError> {
 
 /// Write one version entry — `[digest:8][tag_len:u8][tag][prog_len:u16 LE][prog]`
 /// — into `dst` at `off`, returning the new offset. THE single writer for the
-/// entry layout `parse_version_table` reads: both `version_apply` (device) and the
-/// host `chronicle-authoring::release` build entries through it, so the format
-/// lives in one place. `None` on overflow or an out-of-range tag/program length.
+/// entry layout `parse_version_table` reads: `version_apply` and `release_core`
+/// both build entries through it, so the format lives in one place. `None` on overflow or an out-of-range tag/program length.
 pub fn write_version_entry(
     dst: &mut [u8],
     off: usize,

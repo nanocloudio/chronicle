@@ -8,9 +8,9 @@
 //! record frame through the stages, serializing each stage's constructed message
 //! as the next stage's input.
 //!
-//! The staged executor + container codec live in `pipeline_core.rs`, `include!`d
-//! verbatim from the host harness (tests/harness), so this module and the host tests
-//! (`tests/harness/tests/pipeline.rs`) run identical logic.
+//! The staged executor + container codec live in `pipeline_core.rs`, which this
+//! module and the test harness (`tests/harness/tests/pipeline.rs`) both
+//! `include!`, so the tests run the code that ships.
 
 #![no_std]
 #![allow(
@@ -514,8 +514,7 @@ fn run_decision_stage(
     let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
     let mut scratch = Scratch::new(&mut sbuf);
     let mut w = 0u64;
-    let fired =
-        run_decision_scratch_metered(stage.code, &params, &mut builder, &mut scratch, &mut w);
+    let fired = run_decision_metered(stage.code, &params, &mut builder, &mut scratch, &mut w);
     *spent += w;
     match fired {
         // Which branch fired is an audit fact the standalone `decision`
@@ -529,7 +528,7 @@ fn run_decision_stage(
 use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
     eval_decode_scratch, frame_len, hex_decode, lower_stages_kinded, parse_version_table,
-    pipeline_reload_kinded, run_decision_scratch_metered, run_map_stage, run_stage_metered,
+    pipeline_reload_kinded, run_decision_metered, run_map_stage, run_stage_metered,
     run_stages_metered, run_stages_with, scan_code, scan_decision_container, scan_map_container,
     scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
     Builder, EvalError, Field, Message, Mode, Pending, PipeError, Scratch, Stage, StageEval,

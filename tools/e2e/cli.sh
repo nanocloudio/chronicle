@@ -22,14 +22,13 @@ REC=03010003006f2d3102000600637573742d3903010800fa00000000000000
 
 # The full ON-DEVICE authoring loop: compile both stages from CEL source with
 # the no-alloc front end, assemble the container, and require it byte-identical
-# to the host toolchain's pack-emitted param (the $IR above) — compiler parity
-# proven end-to-end through the applet, not just in the differential test.
+# to the pinned `ir_stages` param (the $IR above), through the applet end to end.
 SCHEMA='Order{id:str@1,customer_id:str@2,amount:int@3};Norm{id:str@1,amount:int@2};Enr{id:str@1,amount:int@2,doubled:int@3}'
 N=$(cli compile "$SCHEMA" 'order:Order' 'Norm{ id: order.id, amount: order.amount }' 2>/dev/null)
 E=$(cli compile "$SCHEMA" 'n:Norm' 'Enr{ id: n.id, amount: n.amount, doubled: n.amount * 2 }' 2>/dev/null)
 C=$(cli stages "$N" "$E" 2>/dev/null)
 if [ "$C" = "$IR" ]; then
-  ok "cli compile+stages reproduces the host toolchain's container"
+  ok "cli compile+stages reproduces the pinned container"
 else
   no "cli compile" "container='$C'"
 fi
@@ -63,9 +62,9 @@ else
 fi
 
 # Decision authoring on device: compile the predicate, the hit outcome and the
-# default, then assemble the first-hit container `run_decision` consumes. Pinned
-# against the host toolchain's `compile_decision_param` output (regenerate:
-# cargo test -p chronicle-canonical --test plan print_compiled_decision_hex -- --nocapture).
+# default, then assemble the first-hit container `run_decision` consumes, pinned
+# byte for byte. A change to the container format moves this value: derive the
+# new one from the format, never by copying what the applet now prints.
 DS='Order{amount:int@3};Norm{amount:int@2}'
 W=$(cli compile "$DS" 'order:Order' 'order.amount > 1000' 2>/dev/null)
 O=$(cli compile "$DS" 'order:Order' 'Norm{ amount: 1 }' 2>/dev/null)
@@ -73,15 +72,15 @@ D=$(cli compile "$DS" 'order:Order' 'Norm{ amount: 0 }' 2>/dev/null)
 got=$(cli decision "$W" "$O" "$D" 2>/dev/null)
 want=010500000012000100020300000010e8030000000000002400030000000f00100100000000000000400200000041030000000f00100000000000000000400200000041
 if [ "$got" = "$want" ]; then
-  ok "cli decision reproduces the host toolchain's decision container"
+  ok "cli decision reproduces the pinned decision container"
 else
   no "cli decision" "got='$got'"
 fi
 
 # `decide` runs ONE record through that container — the decision module's own
 # decode → run_decision → encode path. A hit, the default, and a record LACKING
-# the field the predicate reads, which must fail closed and say why (on device
-# it bumps inputs_failed and its errors_absent split).
+# the field the predicate reads, which must fail closed and say where and why —
+# the account the decision module logs, alongside `errors_absent`.
 got=$(cli decide "$want" 0103010800dc05000000000000 2>/dev/null)
 if [ "$got" = "rule 0 01020108000100000000000000" ]; then
   ok "cli decide fires the matching rule and prints its outcome frame"
@@ -96,8 +95,8 @@ else
 fi
 if got=$(cli decide "$want" 01040108000100000000000000 2>&1); then
   no "cli decide absent" "exited 0: '$got'"
-elif want "$got" "absent field"; then
-  ok "cli decide fails closed on an absent field and names the failure"
+elif want "$got" "error: decision failed at rule 0: a predicate read an absent field"; then
+  ok "cli decide fails closed on an absent field, naming the rule and the reason"
 else
   no "cli decide absent" "got='$got'"
 fi
@@ -143,30 +142,27 @@ esac
 
 # ARTEFACT IDENTITY ON DEVICE: compile a source and seal it into a canonical
 # Expression artefact, entirely in the applet. The digest is the sha256 of the
-# canonical protobuf encoding with the digest field cleared — and it must equal
-# what the host's `build_expression` produces, or an artefact authored on a
-# device is a DIFFERENT artefact and every pin or signature against it breaks.
-# Pinned equal by `chronicle-canonical/tests/pb_differential.rs`
-# (`device_sealed_expression_matches_the_host_builder`); this asserts the whole
-# chain end to end, through the real .fmod.
+# canonical protobuf encoding with the digest field cleared — and it must not
+# move, or an artefact authored on a device is a DIFFERENT artefact and every pin
+# or signature against it breaks. The encoder is held to prost-produced digests
+# by the corpus suite (`tests/harness/tests/chronicle_cli.rs`); this asserts the
+# whole chain end to end, through the real .fmod.
 got=$(cli seal 'commerce.Order{customer_id:str@2}' 'order:commerce.Order' \
         'order.customer_id' 'commerce' 'customer_key' 'order' 'commerce.Order' 'string' \
         2>/dev/null | head -1)
 want=3897058998c0f47a796e5af68a712ab269345fd39d347b1b098bcf061e349e92
 if [ "$got" = "$want" ]; then
-  ok "cli seal produces the host toolchain's artefact digest"
+  ok "cli seal produces the pinned Expression digest"
 else
   no "cli seal" "digest='$got'"
 fi
 
-# The other two artefact kinds the device can seal. `pinned_e2e_digests_are_current`
-# guards these literals host-side, so a host change that moves a digest fails a
-# fast unit test as well as this run.
+# The other two artefact kinds the device can seal, each pinned the same way.
 got=$(cli seal-tf 'commerce.Order{id:str@1};commerce.Norm{id:str@1}' 'order:commerce.Order' \
         'commerce.Norm{ id: order.id }' 'commerce' 'normalize' 'commerce.Order' 'commerce.Norm' \
         2>/dev/null | head -1)
 if [ "$got" = "98cd1aa6b3c8e9cacc7deef29cd72134c799c58eebcee1ad80f6535c57189f1d" ]; then
-  ok "cli seal-tf produces the host toolchain's Transformation digest"
+  ok "cli seal-tf produces the pinned Transformation digest"
 else
   no "cli seal-tf" "digest='$got'"
 fi
@@ -178,7 +174,7 @@ got=$(cli seal-module 'commerce' 'orders' 'abc123' 'rustc-1.81' \
         expression 'commerce.customer_key' 1111111111111111111111111111111111111111111111111111111111111111 \
         2>/dev/null | head -1)
 if [ "$got" = "4e4efeb1ce545f3c245ee598bdb3505b6d120ea7ee6536299c8164a7f903a84e" ]; then
-  ok "cli seal-module produces the host toolchain's Module digest"
+  ok "cli seal-module produces the pinned Module digest"
 else
   no "cli seal-module" "digest='$got'"
 fi

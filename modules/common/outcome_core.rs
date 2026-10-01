@@ -1,7 +1,7 @@
 // Bounded, no_std, no-alloc OUTCOME vocabulary — the single truthful-disposition
 // taxonomy every steady-state Chronicle module maps its result to. `include!`d by
-// the host crate (tests) and every `.fmod`, so device and host name outcomes
-// identically.
+// every `.fmod` and by the test harness, so the modules and their tests name
+// outcomes identically.
 //
 // This is NOT a human error string and carries no unbounded labels. Each field is
 // a closed `#[repr(u8)]` enum so an outcome is four bytes, cheap to store in module

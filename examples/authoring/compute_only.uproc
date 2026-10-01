@@ -51,5 +51,5 @@ module commerce.compute_only {
 
   entry process = process;
 
-  provenance revision "example" toolchain "chronicle-authoring";
+  provenance revision "example" toolchain "chronicle";
 }

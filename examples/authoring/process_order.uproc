@@ -62,5 +62,5 @@ module commerce.process_order {
 
   entry process = process;
 
-  provenance revision "example" toolchain "chronicle-authoring";
+  provenance revision "example" toolchain "chronicle";
 }

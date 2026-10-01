@@ -12,7 +12,6 @@ the saving — stages serialize between themselves inside a node too.
 | `examples/aggregation/barrier_staged.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/checkpoint.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/continuous.yaml` | 1 | 2 | 0 |
-| `examples/aggregation/ir.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/linux.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/on_count.yaml` | 1 | 2 | 0 |
 | `examples/aggregation/on_processing.yaml` | 1 | 2 | 0 |

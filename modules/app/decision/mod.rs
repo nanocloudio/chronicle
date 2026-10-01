@@ -1,4 +1,4 @@
-//! Decision executor — a Fluxor `.fmod` app module (spec artefact 4, on device).
+//! Decision executor — a Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the decision table is NOT baked — it arrives as a `decision`
 //! module param (hex of the serialized container `[nrules][when,outcome]…[default]`,
@@ -11,8 +11,14 @@
 //! opcode — a program constructs one message and cannot select among several.
 //! It is a first-hit driver over several programs, run either as this node or
 //! inline as a `STAGE_KIND_DECISION` pipeline stage. The driver lives in
-//! `decision_core.rs`, `include!`d verbatim from the host harness (tests/harness),
-//! so this module and the host tests run identical logic.
+//! `decision_core.rs`, which this module and the test harness both `include!`,
+//! so the tests run the code that ships.
+//!
+//! A run that decides nothing — a predicate reads a field the record does not
+//! carry, or a program fails to evaluate — sends nothing on. It is counted in
+//! `inputs_failed` (`errors_absent` for the absent-field case) and logged at
+//! error level on the 1st, 2nd, 4th, … occurrence with the branch it stopped at
+//! and the reason, so a graph that stalls on a missing field says why.
 
 #![no_std]
 #![allow(
@@ -48,8 +54,9 @@ mod dec {
     include!("../../common/decision_step_core.rs");
 }
 use dec::{
-    decision_step, hex_decode, scan_decision_container, Accounting, Mode, Pending, Reason,
-    StepResult, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
+    decision_step, describe_decision_error, hex_decode, scan_decision_container, Accounting,
+    Branch, DecisionError, Mode, Pending, Ran, Reason, StepResult, SysChan, Undecided,
+    ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -139,6 +146,11 @@ struct ModuleState {
     /// a broken program: this is usually an upstream stage not carrying a
     /// field, and it is the count that says so.
     errors_absent: u32,
+    /// Runs that decided nothing (absent field or evaluation error), and the
+    /// count at which the next one is logged: 1, 2, 4, … — the first is always
+    /// seen and a steady failure cannot flood the log.
+    failed_closed: u32,
+    failed_log_at: u32,
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
@@ -313,7 +325,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let cont_len = s.cont_len as usize;
         // The whole record lifecycle lives in `decision_step` over the io_core seam;
         // the shell only adapts the ABI and maps the disposition to counters.
-        let mut fired: i16 = -2; // unchanged if no decision ran this step
+        let mut ran = Ran::Nothing;
         let r = decision_step(
             &inch,
             &outch,
@@ -321,21 +333,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut s.out_buf,
             &mut s.pending,
             &s.cont[..cont_len],
-            &mut fired,
+            &mut ran,
             &mut s.acct,
         );
-        // Record the audit: which branch produced the outcome.
-        if fired >= 0 {
-            s.last_rule = fired as u16;
-        } else if fired == -1 {
-            s.last_rule = 0xFFFF;
-            s.no_match = s.no_match.wrapping_add(1);
+        // The audit: which branch produced the outcome, or where a run that
+        // decided nothing stopped.
+        match ran {
+            Ran::Fired(Branch::Rule(i)) => s.last_rule = u16::from(i),
+            Ran::Fired(Branch::Default) => {
+                s.last_rule = 0xFFFF;
+                s.no_match = s.no_match.wrapping_add(1);
+            }
+            Ran::Undecided(u) => {
+                if u.error == DecisionError::Absent {
+                    s.errors_absent = s.errors_absent.wrapping_add(1);
+                }
+                failed_closed(s, sys, u);
+            }
+            Ran::Nothing => {}
         }
         // The step core has already recorded every disposition into `acct`. The
-        // wrapper adds only the failure-reason SPLITS that refine
-        // `inputs_failed`: a frame-decode failure (a miswired channel), an
-        // oversized-outcome encode failure, and a predicate left unknown by an
-        // absent field (`errors_absent`).
+        // wrapper adds the failure-reason SPLITS that refine `inputs_failed`: a
+        // frame-decode failure (a miswired channel) and an oversized-outcome
+        // encode failure; `errors_absent` is counted from the audit above.
         match r {
             StepResult::Failed(Reason::Malformed) => {
                 s.errors_frame = s.errors_frame.wrapping_add(1)
@@ -343,11 +363,58 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             StepResult::Failed(Reason::TooLarge) => {
                 s.errors_encode = s.errors_encode.wrapping_add(1)
             }
-            StepResult::Failed(Reason::NotFound) => {
-                s.errors_absent = s.errors_absent.wrapping_add(1)
-            }
             _ => {}
         }
         0
     }
+}
+
+/// A run that decided nothing: no rule and no default fired, and nothing was
+/// sent on. Logged at error level on the 1st, 2nd, 4th, … occurrence, naming
+/// the branch it stopped at and why. The count saturates, and logging stops
+/// once the next power of two would pass `u32::MAX`.
+unsafe fn failed_closed(s: &mut ModuleState, sys: &SyscallTable, u: Undecided) {
+    s.failed_closed = s.failed_closed.saturating_add(1);
+    if s.failed_closed != s.failed_log_at.max(1) {
+        return;
+    }
+    s.failed_log_at = s.failed_closed.checked_mul(2).unwrap_or(0);
+    let mut m = [0u8; 160];
+    let mut n = 0usize;
+    let mut put = |b: &[u8]| {
+        let k = b.len().min(m.len() - n);
+        m[n..n + k].copy_from_slice(&b[..k]);
+        n += k;
+    };
+    // One call per arm: a value-yielding branch over the messages could lower
+    // to a table of absolute pointers, which a PIC module cannot hold.
+    match u.at {
+        Branch::Rule(i) => {
+            put(b"[decision] failed closed at rule ");
+            put(dec_str(u32::from(i), &mut [0u8; 10]));
+        }
+        Branch::Default => put(b"[decision] failed closed at the default"),
+    }
+    put(b": ");
+    describe_decision_error(u.error, &mut put);
+    put(b" (");
+    put(dec_str(s.failed_closed, &mut [0u8; 10]));
+    put(b" so far; decision of ");
+    put(dec_str(u32::from(s.cont_len), &mut [0u8; 10]));
+    put(b" bytes)");
+    dev_log(sys, 1, m.as_ptr(), n);
+}
+
+/// `v` in decimal, written into the end of `buf`.
+fn dec_str(mut v: u32, buf: &mut [u8; 10]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &buf[i..]
 }

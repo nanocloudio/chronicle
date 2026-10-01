@@ -97,8 +97,8 @@ case "$out" in
 esac
 
 # A decision splits the compute run, so the graph gets a SECOND pipeline node
-# whose name no longer implies its module type. Emitting `pipeline2` with no
-# `type:` produced a graph fluxor refused to load; this is that regression.
+# whose name does not imply its module type: without `type: pipeline` fluxor
+# would look for a module named `pipeline2` and refuse the graph.
 SPLIT=$(hex_of examples/authoring/split_pipeline.uproc)
 split_yaml=$E2E_GEN/split-$E2E_RUN.yaml
 cli graph "$SPLIT" process linux > "$split_yaml" 2>/dev/null

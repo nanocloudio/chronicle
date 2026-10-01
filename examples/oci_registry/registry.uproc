@@ -76,5 +76,5 @@ module oci.registry {
 
   entry serve = serve;
 
-  provenance revision "oci-v2-read-path" toolchain "chronicle-authoring";
+  provenance revision "oci-v2-read-path" toolchain "chronicle";
 }

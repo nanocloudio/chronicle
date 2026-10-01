@@ -316,37 +316,33 @@ pub enum EmitTrigger {
     OnClose,
     Continuous,
     /// Fire a pane's running partial every `n` events folded into it since its
-    /// last emit (count-based / processing-position firing). `n` is clamped to
-    /// at least 1 so it always makes progress.
+    /// last emit (count-based / processing-position firing). `n` is at least 1.
     OnCount(u32),
     /// Flush ALL live panes every `period` events ingested by the operator — a
     /// deterministic logical processing-time timer (one tick per event, not
     /// wall-clock), bounding emit latency regardless of key distribution.
-    /// `period` is clamped to at least 1.
+    /// `period` is at least 1.
     OnProcessing(u32),
 }
 
 impl EmitTrigger {
-    /// Decode the def container's trailing trigger bytes. Kind byte: `0`/absent =
-    /// OnClose, `1` = Continuous, `2` = OnCount and `3` = OnProcessing, each
-    /// followed by `[count:u32 LE]`. No trailing bytes, any unknown kind, or a
-    /// truncated count is `OnClose`. Panic-free over an arbitrary tail.
-    pub fn decode(tail: &[u8]) -> Self {
-        let u32_at1 = || {
-            tail.get(1..5)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    /// Decode the def container's trailing trigger bytes, which end the
+    /// container. Empty is `OnClose`; otherwise a kind byte — `0` OnClose,
+    /// `1` Continuous, `2` OnCount, `3` OnProcessing — and for the last two a
+    /// `[count:u32 LE]` of at least 1. `None` for anything else: an unknown
+    /// kind, a missing or zero count, or bytes past the trigger. A definition
+    /// whose emit policy cannot be read is refused, never run with another.
+    pub fn decode(tail: &[u8]) -> Option<Self> {
+        let count = |b: &[u8]| -> Option<u32> {
+            let n = u32::from_le_bytes(b.try_into().ok()?);
+            (n >= 1).then_some(n)
         };
-        match tail.first() {
-            Some(1) => EmitTrigger::Continuous,
-            Some(2) => match u32_at1() {
-                Some(n) => EmitTrigger::OnCount(n.max(1)),
-                None => EmitTrigger::OnClose,
-            },
-            Some(3) => match u32_at1() {
-                Some(n) => EmitTrigger::OnProcessing(n.max(1)),
-                None => EmitTrigger::OnClose,
-            },
-            _ => EmitTrigger::OnClose,
+        match tail {
+            [] | [0] => Some(EmitTrigger::OnClose),
+            [1] => Some(EmitTrigger::Continuous),
+            [2, n @ ..] => count(n).map(EmitTrigger::OnCount),
+            [3, n @ ..] => count(n).map(EmitTrigger::OnProcessing),
+            _ => None,
         }
     }
 }
@@ -417,6 +413,9 @@ pub enum AggError {
     /// A negative event time. Windows start at 0, so no window holds it;
     /// refused rather than folded into nothing.
     BadTime,
+    /// An `OnCount` or `OnProcessing` trigger with a count of 0, which would
+    /// never fire.
+    BadTrigger,
 }
 
 /// One monoid accumulator cell; interpreted by the operator's kind.
@@ -1163,6 +1162,12 @@ pub fn ingest<F: FnMut(&[u8])>(
     if spec.ops.iter().filter(|o| o.kind.is_collection()).count() > 1 {
         return Err(AggError::TooManyCollections);
     }
+    if matches!(
+        spec.emit_trigger,
+        EmitTrigger::OnCount(0) | EmitTrigger::OnProcessing(0)
+    ) {
+        return Err(AggError::BadTrigger);
+    }
 
     // Decode the event.
     let mut fields = [Field {
@@ -1312,9 +1317,9 @@ pub fn ingest<F: FnMut(&[u8])>(
     // running partial (deterministic processing-time timer). Runs after this
     // event is folded so the flush includes it.
     if let EmitTrigger::OnProcessing(period) = spec.emit_trigger {
-        // checked_rem avoids the rem-by-zero panic path (period is already
-        // clamped >= 1 by decode, but the compiler can't see that here).
-        if state.processing_clock.checked_rem(period as u64) == Some(0) {
+        // `period` is at least 1 (refused above otherwise); `checked_rem`
+        // keeps the remainder free of a panic path all the same.
+        if state.processing_clock.checked_rem(u64::from(period)) == Some(0) {
             flush_live_panes(state, spec, &mut emit)?;
         }
     }

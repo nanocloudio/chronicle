@@ -3,8 +3,7 @@
 # `checkpoint_every: 1` — emits a raw AggState::snapshot on out[1]
 # (checkpoint_out) after every event, here wired to stdout so you can capture it.
 # A downstream sink would persist these bytes; on restart the last snapshot is
-# fed back via the `state` param (hex) to resume the windowed state. This closes
-# the checkpoint loop with examples/aggregation/ir.yaml's restore-at-load half.
+# fed back via the `state` param (hex) to resume the windowed state.
 #
 #   # feed one event; the snapshot bytes appear on stdout after the build log:
 #   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \

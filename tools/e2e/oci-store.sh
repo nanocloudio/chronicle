@@ -13,12 +13,10 @@
 #
 # NOTE those are KEYS, not necessarily paths. `storage.object` abstracts where
 # bytes live: on Linux with FLUXOR_STORE_DIR the backend is a versioned KV log,
-# so nothing appears as a file on disk, while the host `OciStore` uses a real
-# directory. Both agree on the key namespace, which is what makes them
-# interoperable — pinned byte-for-byte by
-# `chronicle-module/tests/oci_device_interop.rs` (device push -> host fetch and
-# back, over a directory-backed store). This script proves the same code path
-# runs on the real runtime over a real provider.
+# so nothing appears as a file on disk. The key namespace is the OCI image
+# layout's, which is what lets a registry serve the store unchanged
+# (examples/oci_registry). This script proves the code path on the real runtime
+# over a real provider.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no oci "fluxor modules build failed"; finish; exit; }
 

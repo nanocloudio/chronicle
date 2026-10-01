@@ -44,8 +44,7 @@ buffer_size  = { default = 4096, rp2040 = 512 }
 # then decision's own instruments: `module_mode`, the init/reload fault flag,
 # the failure-reason splits that refine `inputs_failed`, and the `Fired` audit
 # — `no_match` count and `last_rule` (0xFFFF = the default). `errors_absent`
-# (appended: ids are wire positions) counts predicates an absent field left
-# unknown.
+# counts runs a predicate left unknown by reading an absent field.
 metrics = [
     "bytes_in", "bytes_out",
     "inputs_observed", "inputs_admitted", "inputs_rejected",

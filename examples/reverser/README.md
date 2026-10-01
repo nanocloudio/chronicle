@@ -104,8 +104,8 @@ Two schema choices carry the whole design:
 
 ## Composition boundaries
 
-The CDC RFC (`lattice/.context/rfc_cdc_egress.md`) forbids lattice depending
-on quantum. The cross-project composition therefore lives HERE, in the
+Lattice does not depend on quantum: its CDC egress is a capability any sink
+can serve. The cross-project composition therefore lives HERE, in the
 application project: `lattice_reverser.yaml` wires lattice's `cdc_pump`
 (capability `stream.ordered_ack`) to quantum's `mqtt_sink`, and
 chronicle's `fluxor.toml` pins both projects (plus `clustor`, the consensus
@@ -181,8 +181,7 @@ name.
 - **The CDC topic is baked into `dec_evt`** (`SKIP 18` = the topic prefix on
   the subscriber frame), so changing the topic name means regenerating that
   one program.
-- **Graph lowering gap**: `chronicle-authoring` lowers the *compute*
-  containers from `reverser.uproc`, but does not yet emit ingress-headed or
+- **Graph lowering scope**: `chronicle graph` lowers the *compute*
+  containers from `reverser.uproc` but emits no ingress-headed or
   subscription-headed chains, so the graph YAMLs (codecs, connectors, wiring)
-  are hand-authored — the same precedent as `examples/oci_registry`. When the
-  lowering grows those ends, these YAMLs become its regression fixtures.
+  are hand-authored, as in `examples/oci_registry`.

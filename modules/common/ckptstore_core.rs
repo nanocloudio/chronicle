@@ -36,6 +36,8 @@ pub const KEY_LATEST: &[u8] = b"state/local/latest";
 pub enum CkptError {
     /// The underlying object store rejected the operation.
     Store,
+    /// The store took a write but has not decided it yet.
+    Pending,
     /// No checkpoint has been saved, or the one referenced is absent.
     NotFound,
     /// The caller's buffer cannot hold the checkpoint.
@@ -50,6 +52,7 @@ impl From<BlobError> for CkptError {
     fn from(e: BlobError) -> Self {
         match e {
             BlobError::PutFailed => CkptError::Store,
+            BlobError::Pending => CkptError::Pending,
             BlobError::NotFound => CkptError::NotFound,
             BlobError::TooLarge => CkptError::TooLarge,
             BlobError::DigestMismatch => CkptError::DigestMismatch,

@@ -1,4 +1,4 @@
-//! Aggregation engine — Fluxor `.fmod` app module (spec artefact 5, on device).
+//! Aggregation engine — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the aggregation definition is NOT baked — it arrives as a `def`
 //! module param (hex-encoded), a serialized container:
@@ -772,9 +772,9 @@ fn build_spec<'a>(
     if collections > 1 {
         return None;
     }
-    // Optional trailing trigger bytes (backward-compatible: absent = OnClose).
-    // Kind byte, plus a u32 count for OnCount.
-    let emit_trigger = EmitTrigger::decode(cont.get(off..).unwrap_or(&[]));
+    // The trailing emit trigger (`EmitTrigger::decode`): none is OnClose, and
+    // one that does not read is refused with the rest of the definition.
+    let emit_trigger = EmitTrigger::decode(cont.get(off..).unwrap_or(&[]))?;
     Some((
         AggSpec {
             window_size,

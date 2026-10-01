@@ -1,5 +1,5 @@
 # Aggregation with an EXPLICIT CONTINUOUS trigger (per-event firing). The
-# def is the same customer-total IR def as examples/aggregation/ir.yaml, but with
+# def is the same customer-total IR def as examples/aggregation/linux.yaml, but with
 # a trailing trigger byte `01` (= Continuous) — lower_def passes it through, and
 # build_spec reads it. Instead of emitting only when the watermark closes a
 # window (the default OnClose), the module ALSO emits a window's RUNNING PARTIAL

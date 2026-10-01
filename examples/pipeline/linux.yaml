@@ -3,7 +3,8 @@
 # pipeline .fmod transcodes it to the bytecode-stages container at load with
 # lower_stages, re-deriving each stage's cost. Two stages: normalize
 # (Norm{id,amount}) then enrich (Enr{id,amount,doubled: amount*2}).
-# Regenerate: cargo test -p chronicle-authoring --test pack print_ir_example_params -- --nocapture
+# Regenerate on device: `chronicle compile` each stage, then `chronicle stages
+# <ir>...`; tools/e2e/cli.sh does exactly that and pins the result to this param.
 #
 # Record frame: [count:u8] then per field [num:u8][type:u8][len:u16 LE][value],
 # type 0=bytes, 1=i64. Input {1:"o-1", 2:"cust-9", 3:250}:

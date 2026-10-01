@@ -1,6 +1,6 @@
 # Aggregation with an EXPLICIT ONPROCESSING trigger (deterministic
 # processing-time timer). The def is the same customer-total IR def as
-# examples/aggregation/ir.yaml, but with trailing trigger bytes `03` `02000000`
+# examples/aggregation/linux.yaml, but with trailing trigger bytes `03` `02000000`
 # (= OnProcessing, period=2 LE u32) — lower_def passes them through and
 # build_spec decodes them.
 #

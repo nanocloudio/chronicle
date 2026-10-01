@@ -613,5 +613,5 @@ module kagi.idp {
 
   entry serve = serve;
 
-  provenance revision "kagi-idp-dispatch" toolchain "chronicle-authoring";
+  provenance revision "kagi-idp-dispatch" toolchain "chronicle";
 }

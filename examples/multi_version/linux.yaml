@@ -2,8 +2,8 @@
 # program at once, and each record picks one — default, or pinned by the
 # X-Module-Version selector (record field 255). An unknown/unloaded version fails
 # CLOSED. Blue-green is a live default flip over the control port (no restart, no
-# separate deployment). Params come from a ReleaseManifest (regenerate:
-#   cargo test -p chronicle-authoring --test release print_multi_version_demo_params -- --nocapture).
+# separate deployment). The `versions` param comes from
+# `chronicle release <default_tag> <tag>:<prog_hex>...` (tools/e2e/release.sh).
 #
 # Two versions are loaded: v1 (default) = pass-through amount, v2 = amount*2. The
 # `encode` renders the result field as text.

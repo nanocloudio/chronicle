@@ -123,7 +123,7 @@ PINNED_PROCESS_D=49b9d6c69a1c6ae6ee4fa3a7b3877c90692bf64fef1bed989ab5199f487aa08
 # resource bindings the deployment must satisfy, and the entry points. Pinning
 # it means one document always seals to one module, so a registry reference to
 # that module stays valid.
-PINNED_MODULE=bfb3115ddcf1a85374b65c7a27b0c8c1a161a6bb6c88a6d0380fb8ae8b5c76f6
+PINNED_MODULE=0cbf93128cbba6727388112f30017ea09b5b7c33ba515374d6b19f4e6733bb06
 dev_module=$(echo "$dev_all" | awk '$1=="MODULE"{print $2}')
 [ "$dev_module" = "$PINNED_MODULE" ] \
   && ok "the sealed MODULE digest matches its pinned digest" \
@@ -131,7 +131,7 @@ dev_module=$(echo "$dev_all" | awk '$1=="MODULE"{print $2}')
 
 # ...and for the aggregation document too, whose module contains an Aggregation
 # ref rather than a pipeline — a different ref field in the sealed encoding.
-PINNED_AGG_MODULE=b348420f32199e77d04c93886abb813cff016f3a6a8346a1e1267f76cb93d385
+PINNED_AGG_MODULE=40c3ac7e38c8023649e3748bc42a95ec3e35358584766caab7eca09f7a8bb4ea
 dev_agg_module=$(cli author "$(hex_of examples/authoring/customer_totals.uproc)" 2>/dev/null | awk '$1=="MODULE"{print $2}')
 [ "$dev_agg_module" = "$PINNED_AGG_MODULE" ] \
   && ok "the aggregation module digest matches its pinned digest" \

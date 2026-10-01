@@ -37,5 +37,5 @@ module t.selector {
     return v;
   }
   entry select = select;
-  provenance revision "example" toolchain "chronicle-authoring";
+  provenance revision "example" toolchain "chronicle";
 }

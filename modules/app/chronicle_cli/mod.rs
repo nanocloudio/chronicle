@@ -160,7 +160,7 @@ use tc::{
     put_prog,
     release_from_argv,
     remove_version_msg,
-    run_decision_scratch,
+    run_decision_metered,
     run_stages,
     scan_decision_container,
     seal_aggregation,
@@ -193,6 +193,7 @@ use tc::{
     BindingParamStore,
     BindingSpec,
     BlobError,
+    Branch,
     Builder,
     CkptError,
     Connector,
@@ -201,7 +202,6 @@ use tc::{
     EntrySpec,
     ExpressionSpec,
     Field,
-    Fired,
     HeaderSpec,
     Layer,
     ManifestRef,
@@ -1261,6 +1261,11 @@ fn ckpt_err(out: &mut [u8], e: CkptError) -> usize {
             0,
             b"error: store write failed (is a storage.object provider wired?)\n",
         ),
+        CkptError::Pending => append(
+            out,
+            0,
+            b"error: the store has not decided the write yet; repeating the command is safe\n",
+        ),
         CkptError::NotFound => append(out, 0, b"error: no checkpoint saved\n"),
         CkptError::TooLarge => append(out, 0, b"error: checkpoint too large for the buffers\n"),
         CkptError::DigestMismatch => append(
@@ -1546,6 +1551,11 @@ fn oci_err(out: &mut [u8], e: OciError) -> usize {
             0,
             b"error: store write failed (is a storage.object provider wired?)\n",
         ),
+        OciError::Pending => append(
+            out,
+            0,
+            b"error: the store has not decided the write yet; repeating the command is safe\n",
+        ),
         OciError::NotFound => append(out, 0, b"error: not found\n"),
         OciError::TooLarge => append(out, 0, b"error: too large for the bounded buffers\n"),
         OciError::Malformed => append(out, 0, b"error: malformed index or manifest json\n"),
@@ -1572,7 +1582,7 @@ fn cmd_put(s: &mut Work, hex: &[u8]) -> (usize, i32) {
     let r = unsafe { blob_put(&*s.syscalls, &s.ir[..blen]) };
     match r {
         Ok(d) => print_digest(&mut s.out, &d),
-        Err(_) => (oci_err(&mut s.out, OciError::Store), 1),
+        Err(e) => (oci_err(&mut s.out, OciError::from(e)), 1),
     }
 }
 
@@ -1722,11 +1732,10 @@ fn cmd_eval(s: &mut Work, ir_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
 
 /// `decide <decision_hex> <record_hex>`: dry-run ONE record through a
 /// first-hit decision container — the decision module's own path (decode the
-/// frame, `run_decision_scratch`, encode against the same arena). Prints which
+/// frame, `run_decision_metered`, encode against the same arena). Prints which
 /// arm fired (`rule <i>` or `default`) and the outcome frame, `drop` for an
-/// empty outcome, or the structured error. On device a failed decision bumps
-/// `inputs_failed` and one reason split (frame, encode, or absent); this names
-/// the exact failure, which the counters alone do not.
+/// empty outcome, or the branch a failed run stopped at and why — the same
+/// account the decision module logs.
 fn cmd_decide(s: &mut Work, dec_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
     let Some(dlen) = hex_decode(dec_hex, &mut s.prog) else {
         return (
@@ -1759,24 +1768,25 @@ fn cmd_decide(s: &mut Work, dec_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
     let mut builder = Builder::new();
     let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
     let mut scratch = Scratch::new(&mut sbuf);
-    let fired = match run_decision_scratch(&s.prog[..dlen], &params, &mut builder, &mut scratch) {
-        Ok(f) => f,
-        Err(e) => {
-            let mut p = append(&mut s.out, 0, b"error: decision failed: ");
-            p = append_decision_err(&mut s.out, p, e);
+    let mut spent = 0u64;
+    let fired = match run_decision_metered(
+        &s.prog[..dlen],
+        &params,
+        &mut builder,
+        &mut scratch,
+        &mut spent,
+    ) {
+        Ok(b) => b,
+        Err(u) => {
+            let mut p = append(&mut s.out, 0, b"error: decision failed at ");
+            p = append_branch(&mut s.out, p, u.at);
+            p = append(&mut s.out, p, b": ");
+            p = append_decision_err(&mut s.out, p, u.error);
             p = append(&mut s.out, p, b"\n");
             return (p, 1);
         }
     };
-    let mut p = match fired {
-        Fired::Rule(i) => {
-            let p = append(&mut s.out, 0, b"rule ");
-            let mut d = [0u8; 4];
-            let dl = dec_u8(i, &mut d);
-            append(&mut s.out, p, &d[..dl])
-        }
-        Fired::Default => append(&mut s.out, 0, b"default"),
-    };
+    let mut p = append_branch(&mut s.out, 0, fired);
     if builder.message().fields.is_empty() {
         p = append(&mut s.out, p, b" drop\n");
         return (p, 0);
@@ -1822,31 +1832,23 @@ fn dec_u8(v: u8, out: &mut [u8; 4]) -> usize {
 /// RETURNS `&[u8]` literals can lower to a table of fat pointers in `.rodata`,
 /// which this PIC build does not relocate — the applet would trap silently on
 /// exactly the path that exists to explain a failure.
-fn append_decision_err(out: &mut [u8], at: usize, e: tc::DecisionError) -> usize {
-    use tc::{DecisionError, EvalError};
-    match e {
-        DecisionError::Truncated => append(out, at, b"truncated container"),
-        DecisionError::NotBool => append(out, at, b"a when predicate was not boolean"),
-        DecisionError::BadArity => append(out, at, b"an outcome did not construct a message"),
-        DecisionError::Absent => append(out, at, b"a predicate read an absent field (unknown)"),
-        DecisionError::Eval(ev) => match ev {
-            EvalError::Truncated => append(out, at, b"truncated program"),
-            EvalError::BadOpcode(_) => append(out, at, b"bad opcode"),
-            EvalError::StackOverflow => append(out, at, b"stack overflow"),
-            EvalError::StackUnderflow => append(out, at, b"stack underflow"),
-            EvalError::BadParam(_) => append(out, at, b"bad parameter index"),
-            EvalError::NotAMessage => append(out, at, b"selected into a non-message"),
-            EvalError::CostExceeded => append(out, at, b"cost ceiling exceeded"),
-            EvalError::BadResultArity => append(out, at, b"bad result arity"),
-            EvalError::TypeError => append(out, at, b"type error"),
-            EvalError::BuildOverflow => append(out, at, b"too many constructed fields"),
-            EvalError::BadBuiltin(_) => append(out, at, b"builtin not in this build"),
-            EvalError::DivByZero => append(out, at, b"division by zero"),
-            EvalError::Overflow => append(out, at, b"integer overflow"),
-            EvalError::ScratchOverflow => append(out, at, b"scratch arena overflow"),
-            EvalError::BadLocal(_) => append(out, at, b"bad cel.bind local slot"),
-        },
+/// `rule <i>` or `default`.
+fn append_branch(out: &mut [u8], at: usize, b: Branch) -> usize {
+    match b {
+        Branch::Rule(i) => {
+            let p = append(out, at, b"rule ");
+            let mut d = [0u8; 4];
+            let dl = dec_u8(i, &mut d);
+            append(out, p, &d[..dl])
+        }
+        Branch::Default => append(out, at, b"default"),
     }
+}
+
+fn append_decision_err(out: &mut [u8], at: usize, e: tc::DecisionError) -> usize {
+    let mut p = at;
+    tc::describe_decision_error(e, &mut |b| p = append(out, p, b));
+    p
 }
 
 /// Append a `PipeError` (and its inner `EvalError`) as a stable diagnostic

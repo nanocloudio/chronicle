@@ -7,6 +7,18 @@
 //
 // Mounted after vm_core, pipeline_core, decision_core, outcome_core and io_core.
 
+/// What a step's decision run did, for the module's audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ran {
+    /// No decision ran this step: it drained output, found no input, or the
+    /// input never reached the policy (refused at admission, or not a frame).
+    Nothing,
+    /// A branch fired and constructed the outcome.
+    Fired(Branch),
+    /// The run decided nothing and sent nothing.
+    Undecided(Undecided),
+}
+
 /// One step of the decision lifecycle. `cont` is the loaded, load-scanned decision
 /// container. Drains pending output first, otherwise admits one whole typed frame,
 /// runs the first-hit policy, and stages the constructed outcome — or records a
@@ -23,13 +35,14 @@ pub fn decision_step(
     out_buf: &mut [u8],
     pending: &mut Pending,
     cont: &[u8],
-    // Audit out-param: set to the matched rule index (0..) when a rule fired,
-    // `-1` when the DEFAULT fired, and left unchanged when no decision ran this step.
-    fired: &mut i16,
+    // Audit out-param: what the decision run did. `Ran::Nothing` unless the
+    // policy ran this step.
+    ran: &mut Ran,
     // Accounting: every observed record classified into one input/output
     // disposition at the point that knows admit-bytes and drain-vs-fresh.
     acct: &mut Accounting,
 ) -> StepResult {
+    *ran = Ran::Nothing;
     // 1. Deliver any retained output before admitting new input.
     if !pending.is_empty() {
         let plen = pending.len as u32;
@@ -88,24 +101,22 @@ pub fn decision_step(
         let mut sbuf = [0u8; STAGE_SCRATCH_CAP];
         let mut scratch = Scratch::new(&mut sbuf);
         // A decision-run failure is a terminal processing failure (counted, not
-        // lost). On success, record WHICH branch produced the outcome for the
-        // audit: a rule index, or -1 for the default.
+        // lost). Either way the audit records which branch the run ended on.
         let mut spent = 0u64;
-        let outcome =
-            run_decision_scratch_metered(cont, &params, &mut builder, &mut scratch, &mut spent);
+        let outcome = run_decision_metered(cont, &params, &mut builder, &mut scratch, &mut spent);
         acct.add_work(spent);
         match outcome {
-            Ok(Fired::Rule(i)) => *fired = i as i16,
-            Ok(Fired::Default) => *fired = -1,
-            // A predicate left UNKNOWN by an absent field: a required item was
-            // not there. Named apart from a broken program so it can be counted.
-            Err(DecisionError::Absent) => {
+            Ok(b) => *ran = Ran::Fired(b),
+            Err(u) => {
+                *ran = Ran::Undecided(u);
                 acct.input_failed();
-                return StepResult::Failed(Reason::NotFound);
-            }
-            Err(_) => {
-                acct.input_failed();
-                return StepResult::Failed(Reason::Internal);
+                // A predicate left UNKNOWN by an absent field: a required item
+                // was not there. Named apart from a broken program.
+                return StepResult::Failed(if u.error == DecisionError::Absent {
+                    Reason::NotFound
+                } else {
+                    Reason::Internal
+                });
             }
         }
         // DROP convention: an empty constructed outcome routes nowhere — a

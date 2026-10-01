@@ -9,9 +9,7 @@
 # not by its tag. That is what makes a mixed-version fleet consistent: the same
 # tag resolves to the same bytecode on every instance, so a canary is the same
 # code everywhere, and an instance that lacks a pinned version fails closed
-# rather than serving the wrong one.
-#
-# Authoring a release used to require a build host. It does not any more.
+# rather than serving the wrong one. No build host is involved.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no release "fluxor modules build failed"; finish; exit; }
 

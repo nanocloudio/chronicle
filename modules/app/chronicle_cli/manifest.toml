@@ -5,7 +5,7 @@ hardware_targets = ["bcm2712"]
 
 timer_class      = "agnostic"
 
-# The chronicle toolchain CLI as a fluxor cli-applet (rfc_cli_execution.md):
+# The chronicle toolchain CLI as a fluxor cli-applet:
 # ONE PIC module dispatches chronicle subcommands over the cli host surface.
 # Run: `fluxor exec chronicle -- <cmd>`.
 #
@@ -19,10 +19,10 @@ timer_class      = "agnostic"
 #
 # The seal commands are what make a node SELF-HOSTING: an artefact's identity is
 # the sha256 of its canonical protobuf encoding, produced here by
-# `modules/common/{pb_core,artefact_core}.rs` with no allocator and no `prost`,
-# and proven equal to the host toolchain's digest
-# (`tests/harness/tests/chronicle_cli.rs (corpus suite)`). A device can therefore
-# author, identify and publish work without a Linux build host.
+# `modules/common/{pb_core,artefact_core}.rs` with no allocator, and held to
+# digests prost produced (the corpus suite in `tests/harness/tests/chronicle_cli.rs`).
+# A device can therefore author, identify and publish work without a Linux build
+# host.
 #
 # Everything runs the SAME include!'d cores the on-device engines run
 # (modules/common/), so a `check` here proves exactly what a device proves at

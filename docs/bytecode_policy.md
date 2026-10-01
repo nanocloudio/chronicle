@@ -151,7 +151,9 @@ carry), and absence is never a value:
 - A decision's **`when` left unknown** fails the whole decision
   (`DecisionError::Absent`): no rule and no default fires, since the rule
   that could not be evaluated may have been a refusal. The decision module
-  counts it as `errors_absent`, a split of `inputs_failed`.
+  counts it as `errors_absent`, a split of `inputs_failed`, and logs it at
+  error level on the 1st, 2nd, 4th, … occurrence with the rule it stopped at
+  and why; `chronicle decide` reports the same for one record.
 - A **frame never carries a `Null`**: a stage that sets a field from an
   absent value leaves the field out, so the next stage sees it absent too.
 

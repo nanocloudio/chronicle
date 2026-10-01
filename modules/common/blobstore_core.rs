@@ -10,14 +10,23 @@
 // tampered store would otherwise return plausible bytes under a digest that no
 // longer describes them.
 //
-// Requires `pb_core`-style buffer discipline (caller-provided, no alloc) plus
-// the fluxor SDK `sha256` and a `SyscallTable`.
+// A write is single-shot. A provider may answer `EINPROGRESS` — taken, not yet
+// decided — and this core reports that as `Pending` rather than as a failure:
+// the write may still land. Repeating a blob put is safe, because its key is the
+// hash of its body: it can only write the same object again. A store that
+// decides inside the call never answers pending.
+//
+// Requires `pb_core`-style buffer discipline (caller-provided, no alloc), the
+// fluxor SDK `sha256`, and the SDK `abi` mounted at the crate root (for
+// `SyscallTable` and the `storage.object` write answer).
 
 /// `storage.object` opcodes (fluxor contract vocabulary).
 pub const OBJ_PUT: u32 = 0x1420;
 pub const OBJ_GET: u32 = 0x1421;
 pub const OBJ_RANGE_GET: u32 = 0x1423;
 pub const OBJ_CLOSE: u32 = 0x1425;
+
+use crate::abi::contracts::storage::object::{write_answer, WriteAnswer};
 
 /// Longest key this core builds: the prefix plus 64 hex characters.
 pub const BLOB_KEY_MAX: usize = 96;
@@ -27,6 +36,9 @@ pub const BLOB_KEY_MAX: usize = 96;
 pub enum BlobError {
     /// The provider rejected the write.
     PutFailed,
+    /// The provider took the write but has not decided it (`EINPROGRESS`).
+    /// Not a failure: the write may still land, and repeating it is safe.
+    Pending,
     /// No object at that digest.
     NotFound,
     /// The caller's buffer cannot hold the object.
@@ -138,10 +150,10 @@ unsafe fn put_raw(
     arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
     p += 2;
 
-    if (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p) == 0 {
-        Ok(())
-    } else {
-        Err(BlobError::PutFailed)
+    match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
+        WriteAnswer::Decided(0) => Ok(()),
+        WriteAnswer::Decided(_) => Err(BlobError::PutFailed),
+        WriteAnswer::Pending => Err(BlobError::Pending),
     }
 }
 

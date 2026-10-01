@@ -13,8 +13,9 @@
 # little; refusing a tampered body and an untrusted signer is the whole point,
 # so each is checked to fail for its own distinct reason.
 #
-# Fixtures are generated (they depend on the encoder and the signing key):
-#   cargo test -p chronicle-module --test device_verify print_verify_e2e_fixtures -- --nocapture
+# The fixtures are pinned: a signed Module and its key. They depend on the
+# encoder and the signing key, so a change to either needs them derived anew
+# from the format, not copied from what the applet now prints.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no verify "fluxor modules build failed"; finish; exit; }
 
