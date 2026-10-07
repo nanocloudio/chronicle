@@ -331,17 +331,18 @@ pub fn frame_len(data: &[u8]) -> Option<usize> {
 }
 
 /// The reserved field a record's CARRIED CONTEXT rides in: a nested message
-/// (its own frame, as bytes) that every connector hands back unchanged, so a
-/// request built before an effect and the reply handled after it share no
-/// state but the record. On the exchange surface it IS the `msg_key`, which is
-/// why it is held to the contract's `KEY_MAX` there. Engine meanings take
-/// `240..=255` (celc's `RESERVED_FIELD_MIN`); data fields are `1..=239`.
+/// (its own frame, as bytes) that comes back unchanged on the record made from
+/// an effect's answer, so a request built before an effect and the answer
+/// handled after it share no state but the record. A requester keeps it beside
+/// the open exchange, held to the contract's `KEY_MAX`; it never reaches the
+/// provider. Engine meanings take `240..=255` (celc's `RESERVED_FIELD_MIN`);
+/// data fields are `1..=239`.
 pub const CARRY_FIELD: u32 = 254;
 
-/// The reserved field a reply record carries its EXCHANGE status in: `0`
-/// answered, `1..=15` the contract's typed refusals — what the transport
-/// said, apart from anything the payload says. Only a record made from a
-/// reply carries it.
+/// The reserved field a record made from an exchange answer carries its
+/// status in: the HTTP status code the provider answered with — what the
+/// provider said, apart from anything the body says. Only a record made from
+/// an answer carries it.
 pub const EXCHANGE_STATUS_FIELD: u32 = 253;
 
 /// Serialize a constructed message into a typed record frame. Returns its length.

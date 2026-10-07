@@ -1,18 +1,93 @@
 // The reverser's dispatch and compute; README.md explains.
-// Must stay under `chronicle author`'s 2048-byte doc buffer.
 module app.reverser {
 
-  message rev.Insert { conn_id: int = 1; msg: string = 2; }
+  // What an intake node maps from a request: the exchange id wave's `http`
+  // chose, and the target (path and query).
+  message rev.Req { xid: bytes = 1; path: string = 3; }
+
+  // The carry: the HTTP exchange a store request answers, and which of the
+  // two routes asked. It stays beside the open store exchange and comes back
+  // on its answer.
+  message rev.Ctx { xid: bytes = 1; route: int = 2; }
+
+  // A store request: the SQL text — or, refusing the request at the intake,
+  // the status to answer it with.
+  message rev.Ask { xid: bytes = 1; sql: string = 2; status: int = 4; ctx: rev.Ctx = 254; }
+
+  // A store answer: the rows `pg_client` returned (C only), the exchange
+  // status it answered with, and the carry.
+  message rev.Done { rows: string = 2; status: int = 253; ctx: rev.Ctx = 254; }
+
+  // The HTTP answer, by the exchange its id names.
+  message rev.Reply { xid: bytes = 1; body: string = 2; status: int = 4; ctype: string = 5; }
 
   message rev.Evt { ts: int = 1; msg: string = 2; kind: int = 3; }
 
   message rev.Change { ts: int = 1; msg: string = 2; }
 
-  message rev.Query { conn_id: int = 1; max: int = 2; }
-
-  message rev.Rows { conn_id: int = 1; body: string = 2; }
-
   enum PUT = 1; // lattice cdc_wire envelope kind
+  enum OK = 200;
+  enum NOT_FOUND = 404;
+  enum INGEST = 1;
+  enum QUERY = 2;
+
+  // A: `/reverse?msg=<m>` stores <m> — INSERT OR REPLACE, so a resubmitted
+  // message is a fresh MVCC put (new commit_ts, new CDC event). Any other
+  // target is answered 404 at the intake, never asked of the store. No
+  // SQL-quoting of <m>: a deliberate example simplification (README).
+  decision admit_reverse(r: rev.Req) -> rev.Ask {
+    when r.path.startsWith("/reverse?msg=") ->
+      rev.Ask {
+        xid: r.xid,
+        sql: "INSERT OR REPLACE INTO inbound (msg) VALUES ('" + r.path.substring(13, r.path.size()) + "')",
+        ctx: rev.Ctx { xid: r.xid, route: INGEST }
+      };
+    default -> rev.Ask { xid: r.xid, status: NOT_FOUND };
+  }
+
+  // C: `/messages?max=<n>` lists the newest <n>, replay order over the
+  // store-minted commit timestamps.
+  decision admit_messages(r: rev.Req) -> rev.Ask {
+    when r.path.startsWith("/messages?max=") ->
+      rev.Ask {
+        xid: r.xid,
+        sql: "SELECT msg FROM reversed ORDER BY ts DESC LIMIT " + r.path.substring(14, r.path.size()),
+        ctx: rev.Ctx { xid: r.xid, route: QUERY }
+      };
+    default -> rev.Ask { xid: r.xid, status: NOT_FOUND };
+  }
+
+  // One board, one `http`: both routes through one intake.
+  decision admit_either(r: rev.Req) -> rev.Ask {
+    when r.path.startsWith("/reverse?msg=") ->
+      rev.Ask {
+        xid: r.xid,
+        sql: "INSERT OR REPLACE INTO inbound (msg) VALUES ('" + r.path.substring(13, r.path.size()) + "')",
+        ctx: rev.Ctx { xid: r.xid, route: INGEST }
+      };
+    when r.path.startsWith("/messages?max=") ->
+      rev.Ask {
+        xid: r.xid,
+        sql: "SELECT msg FROM reversed ORDER BY ts DESC LIMIT " + r.path.substring(14, r.path.size()),
+        ctx: rev.Ctx { xid: r.xid, route: QUERY }
+      };
+    default -> rev.Ask { xid: r.xid, status: NOT_FOUND };
+  }
+
+  // The answer, by route: "ok" once the INSERT committed, the rows as HTML
+  // for a query, and otherwise the store's own status with no body.
+  decision respond(d: rev.Done) -> rev.Reply {
+    when d.status == OK && d.ctx.route == INGEST ->
+      rev.Reply { xid: d.ctx.xid, body: "ok", status: OK, ctype: "text/plain" };
+    when d.status == OK ->
+      rev.Reply {
+        xid: d.ctx.xid,
+        body: "<html><body><pre>" + d.rows + "</pre></body></html>",
+        status: OK,
+        ctype: "text/html"
+      };
+    default -> rev.Reply { xid: d.ctx.xid, body: "", status: d.status, ctype: "" };
+  }
 
   // Non-puts construct the EMPTY message = counted drop. msg is
   // the raw row key [ks:4][table:4][present:1]<pk>[term:2].
@@ -30,20 +105,23 @@ module app.reverser {
     rev.Evt { ts: e.ts, msg: e.msg, kind: e.kind }
   }
 
-  transformation pass_ins(i: rev.Insert) -> rev.Insert {
-    rev.Insert { conn_id: i.conn_id, msg: i.msg }
+  pipeline ingest(r: rev.Req) -> rev.Ask {
+    call a = admit_reverse(r);
+    return a;
   }
 
-  transformation pass_query(q: rev.Query) -> rev.Query {
-    rev.Query { conn_id: q.conn_id, max: q.max }
+  pipeline ask(r: rev.Req) -> rev.Ask {
+    call a = admit_messages(r);
+    return a;
   }
 
-  transformation pass_rows(r: rev.Rows) -> rev.Rows {
-    rev.Rows { conn_id: r.conn_id, body: r.body }
+  pipeline admit(r: rev.Req) -> rev.Ask {
+    call a = admit_either(r);
+    return a;
   }
 
-  pipeline ingest(i: rev.Insert) -> rev.Insert {
-    call a = pass_ins(i);
+  pipeline reply(d: rev.Done) -> rev.Reply {
+    call a = respond(d);
     return a;
   }
 
@@ -54,20 +132,11 @@ module app.reverser {
     return flipped;
   }
 
-  pipeline ask(q: rev.Query) -> rev.Query {
-    call a = pass_query(q);
-    return a;
-  }
-
-  pipeline answer(r: rev.Rows) -> rev.Rows {
-    call a = pass_rows(r);
-    return a;
-  }
-
   entry ingest = ingest;
-  entry reverse = reverse;
   entry ask = ask;
-  entry answer = answer;
+  entry admit = admit;
+  entry reply = reply;
+  entry reverse = reverse;
 
   provenance revision "reverser-v1" toolchain "chronicle";
 }

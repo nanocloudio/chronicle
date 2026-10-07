@@ -3,8 +3,8 @@
 #
 # `examples/oci_registry/run.sh --verify` asserts the whole chain: discovery
 # served from a seeded object, a blob PUT into tier 1 and read back THROUGH the
-# registry (HTTP → engines → SigV4 → storage and back), and a missing object
-# carried as the store's own 404.
+# registry (HTTP → engines → SigV4 → storage and back), a missing object
+# carried as the store's own 404, and tier 1 refusing an unsigned request.
 #
 # It runs here because an example only stays correct while something checks it:
 # these graphs name params and ports owned by sibling projects, and a rename
@@ -22,13 +22,13 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 log=$(mktemp)
-if timeout 240 bash examples/oci_registry/run.sh --verify >"$log" 2>&1; then
+if timeout 600 bash examples/oci_registry/run.sh --verify >"$log" 2>&1; then
   # Report what the runner checked, so a pass names its evidence.
   n=$(grep -c '^  ok   ' "$log" 2>/dev/null || echo 0)
-  ok "oci-registry (both tiers, $n checks: discovery, blob round trip, 404 passthrough)"
+  ok "oci-registry (both tiers, $n checks: discovery, blob round trip, streamed blob, 404 passthrough, signed access)"
 else
   no oci-registry "run.sh --verify failed:
-$(grep -E '^  FAIL|^error|died|never' "$log" 2>/dev/null | head -4)"
+$(grep -E '^FAIL|^  FAIL|^error|never' "$log" 2>/dev/null | head -4)"
 fi
 rm -f "$log"
 

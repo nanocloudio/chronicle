@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# HTTP AS A REPLYING PROVIDER — the exchange surface, end to end, live.
+# AN HTTP CLIENT AS AN ANSWERING PROVIDER — the exchange contract, end to end,
+# live.
 #
-# The mirror of `pipeline-egress.sh`. There the surface carried records to a
-# destination that only accepts them; here the SAME frames, correlation and
+# The mirror of `pipeline-egress.sh`. There the contract carried records to a
+# destination that only accepts them; here the SAME requester, records and
 # ports carry a request to one that answers. This is the test that makes
 # `stream.ordered_ack.exchange` a fact rather than a manifest claim.
 #
 # Two assertions, because either alone is weak:
-#   * the ORIGIN saw the request the graph built (path included) — proving the
-#     request record was decoded and issued, not merely accepted;
-#   * the REPLY carries the response body AND echoes the request's `msg_key` —
-#     proving the answer was correlated back, which is what lets a downstream
-#     stage rejoin it without holding state.
+#   * the ORIGIN saw the request the record named (method and path) — proving
+#     the field map built the request HEAD, not merely that a record went out;
+#   * the ANSWER RECORD is exactly the body, the exchange status and the mapped
+#     status and content type — built independently here from the documented
+#     frame layout and compared byte for byte.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no exchange "fluxor modules build failed"; finish; exit; }
 
@@ -41,20 +42,24 @@ if [ -n "${HTTP_PORT:-}" ]; then
   disown "$!" 2>/dev/null || true
 fi
 
-# Publish carrying a GET for /hello, msg_key "job-42", corr 7.
-#   [0xED][len][corr:u64][flags][klen][plen][key][method][path_len][body_len][path]
-REQ_HEX=$(python3 - <<'PY'
+# frame(fields) -> hex; a field is (number, int | bytes).
+read -r REQ_HEX WANT_HEX < <(python3 - <<'PY2'
 import struct
-# METHOD_GET = 1 (wave/modules/foundation/http/wire/method.rs). 0 is
-# METHOD_NONE and is refused UNROUTABLE — the provider validates the verb
-# rather than defaulting one, which is why this names the code explicitly.
+def frame(fs):
+    out = bytes([len(fs)])
+    for n, v in fs:
+        if isinstance(v, int):
+            out += struct.pack('<BBH', n, 1, 8) + struct.pack('<q', v)
+        else:
+            out += struct.pack('<BBH', n, 0, len(v)) + v
+    return out
+# METHOD_GET = 1, the exchange contract's code (fluxor
+# modules/sdk/contracts/exchange.rs).
 METHOD_GET = 1
-path = b"/hello"
-rec  = bytes([METHOD_GET]) + struct.pack('<HH', len(path), 0) + path
-key  = b"job-42"
-pub  = struct.pack('<QBHH', 7, 0, len(key), len(rec)) + key + rec
-print((bytes([0xED]) + struct.pack('<H', len(pub)) + pub).hex())
-PY
+req = frame([(2, METHOD_GET), (3, b"/hello"), (4, b"")])
+want = frame([(5, b"echo:/hello"), (253, 200), (6, 200), (7, b"text/plain")])
+print(req.hex(), want.hex())
+PY2
 )
 
 if [ -z "${HTTP_PORT:-}" ]; then
@@ -74,20 +79,12 @@ elif build_graph examples/http_exchange/linux.yaml \
     *)             no exchange "origin saw '$saw'" ;;
   esac
 
-  # The reply frame: MSG_REPLY (0xEF), then corr=7, status=0, the echoed key,
-  # and the body the origin returned ("echo:/hello").
-  key_hex=$(printf 'job-42' | xxd -p)
-  body_hex=$(printf 'echo:/hello' | xxd -p)
-  if [ -z "$got" ]; then
-    no exchange "no reply frame emitted"
-  elif [ "${got:0:2}" != "ef" ]; then
-    no exchange "reply is not MSG_REPLY: ${got:0:2}"
-  elif ! printf '%s' "$got" | grep -q "$key_hex"; then
-    no exchange "reply did not echo msg_key"
-  elif ! printf '%s' "$got" | grep -q "$body_hex"; then
-    no exchange "reply body missing: $got"
+  if [ "$got" = "$WANT_HEX" ]; then
+    ok "exchange answer   (body, status 200 and content type, as mapped fields)"
+  elif [ -z "$got" ]; then
+    no exchange "no answer record emitted"
   else
-    ok "exchange reply    (status 0, msg_key echoed, origin body returned)"
+    no exchange "answer record: want $WANT_HEX, got '$got'"
   fi
 else
   no exchange "graph build failed"

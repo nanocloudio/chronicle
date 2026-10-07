@@ -30,27 +30,27 @@ the saving — stages serialize between themselves inside a node too.
 | `examples/grpc_h2/linux.yaml` | 1 | 3 | 0 |
 | `examples/http_bench/baseline.yaml` | 3 | 4 | 0 |
 | `examples/http_bench/one_node.yaml` | 4 | 6 | 0 |
-| `examples/http_bench/two_node.yaml` | 5 | 7 | 1 |
-| `examples/http_exchange/linux.yaml` | 1 | 4 | 0 |
-| `examples/identity_provider/chronicle_authorize.yaml` | 12 | 23 | 4 |
-| `examples/identity_provider/chronicle_exchange.yaml` | 12 | 23 | 4 |
-| `examples/identity_provider/chronicle_idp.yaml` | 10 | 15 | 4 |
-| `examples/identity_provider/chronicle_token.yaml` | 12 | 23 | 4 |
+| `examples/http_bench/two_node.yaml` | 5 | 8 | 2 |
+| `examples/http_exchange/linux.yaml` | 2 | 6 | 0 |
+| `examples/identity_provider/chronicle_authorize.yaml` | 9 | 23 | 3 |
+| `examples/identity_provider/chronicle_exchange.yaml` | 9 | 23 | 3 |
+| `examples/identity_provider/chronicle_idp.yaml` | 7 | 15 | 3 |
+| `examples/identity_provider/chronicle_token.yaml` | 9 | 23 | 3 |
 | `examples/inline_decision/linux.yaml` | 1 | 2 | 0 |
 | `examples/multi_version/linux.yaml` | 1 | 3 | 0 |
-| `examples/oci_registry/chronicle_registry.yaml` | 7 | 11 | 3 |
+| `examples/oci_registry/chronicle_registry.yaml` | 3 | 8 | 0 |
 | `examples/pipeline/linux.yaml` | 1 | 2 | 0 |
 | `examples/pipeline_chain/linux.yaml` | 2 | 4 | 2 |
-| `examples/pipeline_egress/linux.yaml` | 2 | 5 | 0 |
+| `examples/pipeline_egress/linux.yaml` | 2 | 6 | 0 |
 | `examples/reverser/lattice_reverser.yaml` | 18 | 49 | 0 |
-| `examples/reverser/reverser_a.yaml` | 6 | 10 | 2 |
-| `examples/reverser/reverser_b.yaml` | 6 | 9 | 3 |
-| `examples/reverser/reverser_c.yaml` | 6 | 10 | 2 |
-| `examples/reverser/reverser_pi5.yaml` | 31 | 59 | 7 |
+| `examples/reverser/reverser_a.yaml` | 5 | 11 | 3 |
+| `examples/reverser/reverser_b.yaml` | 6 | 10 | 3 |
+| `examples/reverser/reverser_c.yaml` | 5 | 11 | 3 |
+| `examples/reverser/reverser_pi5.yaml` | 25 | 53 | 6 |
 | `examples/sensor_rules/linux.yaml` | 2 | 3 | 0 |
 | `examples/sensor_rules/pico.yaml` | 3 | 2 | 0 |
 | `examples/sensor_rules/pico_windowed.yaml` | 3 | 2 | 0 |
 | `examples/smtp_sink/linux.yaml` | 1 | 3 | 0 |
 | `examples/telemetry_probe/linux.yaml` | 2 | 2 | 0 |
 
-**Total engine->engine hops: 37**
+**Total engine->engine hops: 32**

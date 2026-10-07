@@ -1672,14 +1672,6 @@ pub fn graph_document(
             append(&mut *st_out, 0, b"error: an effect stage has no binding\n"),
             1,
         ),
-        Err(GraphError::EffectNotChainable) => (
-            append(
-                &mut *st_out,
-                0,
-                b"error: a stage follows an effect that answers with no record\n",
-            ),
-            1,
-        ),
     }
 }
 
@@ -1971,20 +1963,22 @@ pub fn release_from_argv(
 //
 // Grammar, one binding per `|`:
 //
-//   <resource>,<kind>,<provider>,<version>,<in_port>,<out_port>,<r|n>,<params>
+//   <resource>,<kind>,<provider>,<version>,<method>,<params>
 //
-// where `<params>` is `k=v` pairs joined by `;` (so neither `,` nor `;` nor
-// `=` can appear inside a value), and a value led by `#` is NUMERIC — emitted
-// unquoted, because a provider's `u32` decoder rejects a quoted number. `r`/`n`
-// says whether the provider answers with data a next stage could read: `r` for
-// a `stream.ordered_ack.exchange` or request/reply provider, `n` for a sink.
+// where `<method>` is the exchange method each request asks — an HTTP method
+// token, or `PUBLISH` for a durable destination — and `<params>` is `k=v`
+// pairs joined by `;` (so neither `,` nor `;` nor `=` can appear inside a
+// value), a value led by `#` being NUMERIC: emitted unquoted, because a
+// provider's `u32` decoder rejects a quoted number.
 //
-//   orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;cid_len=#4
-//   feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,authority=10.0.0.1:9092;topic=orders
+//   orders_store,pg,pg_client,0.1.0,POST,authority=127.0.0.1:5432;user=app
+//   feed,kafka,kafka_sink,0.1.0,PUBLISH,authority=10.0.0.1:9092;topic=orders
 //
-// Every field is the PROVIDER's, not chronicle's: the param names, the port
-// names and the module name all arrive from the deployment, which is what
-// lets a new destination be a config change rather than a code change.
+// Every provider takes requests on `request_in` and answers on
+// `response_out`, so the ports need no naming. The rest is the PROVIDER's,
+// not chronicle's: the param names and the module name arrive from the
+// deployment, which is what lets a new destination be a config change rather
+// than a code change.
 
 /// Bindings a single `chronicle graph` invocation may carry.
 pub const MAX_BINDINGS: usize = 8;
@@ -2021,6 +2015,18 @@ fn split_on<'a>(src: &'a [u8], sep: u8, out: &mut [&'a [u8]]) -> usize {
 /// Two passes, deliberately: the params are filled first, and only then are
 /// the bindings built pointing INTO them. One pass cannot borrow the buffer
 /// it is still writing to.
+/// The exchange method code a binding names: an HTTP method token or
+/// `PUBLISH`, resolved by the exchange contract's own table. `None` for any
+/// other word.
+fn binding_method(tok: &[u8]) -> Option<u8> {
+    use crate::abi::contracts::exchange::{method_from_token, METHOD_NONE, METHOD_PUBLISH};
+    if tok == b"PUBLISH" {
+        return Some(METHOD_PUBLISH);
+    }
+    let m = method_from_token(tok);
+    (m != METHOD_NONE).then_some(m)
+}
+
 pub fn parse_bindings<'a>(
     src: &'a [u8],
     params: &'a mut BindingParamStore<'a>,
@@ -2036,24 +2042,20 @@ pub fn parse_bindings<'a>(
     }
 
     // Fields per binding, held until the params are in place.
-    let mut fields = [[b"".as_slice(); 8]; MAX_BINDINGS];
-    let mut replies = [false; MAX_BINDINGS];
+    let mut fields = [[b"".as_slice(); 6]; MAX_BINDINGS];
+    let mut methods = [0u8; MAX_BINDINGS];
     let mut lens = [0usize; MAX_BINDINGS];
 
     for (b, spec) in specs.iter().take(n).enumerate() {
-        let mut f = [b"".as_slice(); 8];
-        if split_on(spec, b',', &mut f) != 8 {
+        let mut f = [b"".as_slice(); 6];
+        if split_on(spec, b',', &mut f) != 6 {
             return None;
         }
-        replies[b] = match f[6] {
-            b"r" => true,
-            b"n" => false,
-            _ => return None,
-        };
+        methods[b] = binding_method(f[4])?;
         fields[b] = f;
 
         let mut kvs = [b"".as_slice(); MAX_BINDING_PARAMS];
-        let np = split_on(f[7], b';', &mut kvs);
+        let np = split_on(f[5], b';', &mut kvs);
         if np > MAX_BINDING_PARAMS {
             return None;
         }
@@ -2087,9 +2089,7 @@ pub fn parse_bindings<'a>(
                 kind: fields[b][1],
                 provider: fields[b][2],
                 version: fields[b][3],
-                in_port: fields[b][4],
-                out_port: fields[b][5],
-                replies: replies[b],
+                method: methods[b],
                 params: &params[b][..lens[b]],
             },
         };

@@ -60,14 +60,11 @@ pub struct Connector<'a> {
     /// siblings release independently and one shared constant mispins the
     /// moment two of them diverge.
     pub version: &'a [u8],
-    /// The port pair the graph wires: records in, answer out.
-    pub in_port: &'a [u8],
-    pub out_port: &'a [u8],
-    /// Whether the provider ANSWERS WITH DATA — the `reply` capability fact.
-    /// A provider that does not reply terminates its chain: its output port
-    /// carries an acknowledgement or a status line, not a record a next stage
-    /// could read.
-    pub replies: bool,
+    /// The exchange method each request asks the provider: the exchange
+    /// contract's code (`METHOD_PUBLISH` for a durable destination). Every
+    /// provider takes requests on `request_in` and answers on `response_out`,
+    /// so the method is the one thing about the call a binding chooses.
+    pub method: u8,
     /// The node's params, in the provider manifest's order: `(name, value,
     /// quoted)`. `quoted = false` emits the value bare, which a numeric param
     /// requires — a provider's `u32` decoder rejects `"167772161"`.
@@ -97,11 +94,6 @@ impl Connector<'_> {
         gput(out, 0, self.provider)
     }
 
-    /// Whether a stage may follow this effect. See [`Connector::replies`].
-    pub fn replies(&self) -> bool {
-        self.replies
-    }
-
     /// The store pin to record so the build composes this capability's
     /// provider from the OCI store, scoped to `silicon`:
     /// `<silicon>/<module>:<version>`.
@@ -111,11 +103,6 @@ impl Connector<'_> {
         p = gput(out, p, self.provider)?;
         p = gput(out, p, b":")?;
         gput(out, p, self.version)
-    }
-
-    /// This connector's `(data_in, data_out)` port names.
-    fn ports(&self, inp: &mut [u8], outp: &mut [u8]) -> Result<(usize, usize), GraphError> {
-        Ok((gput(inp, 0, self.in_port)?, gput(outp, 0, self.out_port)?))
     }
 }
 
@@ -387,6 +374,8 @@ pub fn lower_pipeline_with(
     // before the modules. Rather than buffer the module text somewhere and move
     // it, the walk records what each node is and pass 2 renders it.
     let mut effects = [None::<Connector>; MAX_CHAIN];
+    // Per pipeline node: the provider node it asks, when it carries an effect.
+    let mut requester_of = [None::<usize>; MAX_CHAIN];
     let mut ir_spans = [(0usize, 0usize); MAX_CHAIN];
     // Per chain NODE (not per stage): 0 pipeline, 1 decision, 2 effect.
     let mut kinds = [0u8; MAX_CHAIN];
@@ -461,12 +450,34 @@ pub fn lower_pipeline_with(
             }
             PlanStage::Effect(binding) => {
                 needs_net = true;
-                // A provider that does not answer with data terminates the
-                // chain. Checked BEFORE the node is emitted, so a bad plan
-                // fails to lower rather than lowering to a bad graph.
-                if !binding.replies() && i + 1 < stages.len() {
-                    return Err(GraphError::EffectNotChainable);
+                // The effect is a request the pipeline node before it asks:
+                // that node becomes the requester, and the answer continues
+                // the chain from its `result_out`. With no pipeline node to
+                // carry it — the plan starts with the effect, follows a
+                // decision, or follows another effect — a node with no stages
+                // is placed to carry it.
+                let carrier_free =
+                    n_chain > 0 && kinds[n_chain - 1] == 0 && requester_of[n_chain - 1].is_none();
+                if !carrier_free {
+                    if n_chain >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
+                    let mut name = [0u8; NAME_CAP];
+                    let nl = instance_name(b"pipeline", pipe_n, &mut name)?;
+                    pipe_n += 1;
+                    kinds[n_chain] = 0;
+                    run_lens[n_chain] = 0;
+                    let c = &mut chain[n_chain];
+                    set(&mut c.name, &mut c.name_len, &name[..nl])?;
+                    set(&mut c.in_port, &mut c.in_len, b"record_in")?;
+                    set(&mut c.out_port, &mut c.out_len, b"result_out")?;
+                    n_chain += 1;
+                    if n_chain >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
                 }
+                let carrier = n_chain - 1;
+
                 let mut base = [0u8; NAME_CAP];
                 let bl = binding.kind(&mut base)?;
 
@@ -493,15 +504,15 @@ pub fn lower_pipeline_with(
                 let nl = instance_name(&base[..bl], kind_counts[slot], &mut name)?;
                 kind_counts[slot] += 1;
 
-                let (mut ip, mut op) = ([0u8; NAME_CAP], [0u8; NAME_CAP]);
-                let (il, ol) = binding.ports(&mut ip, &mut op)?;
-
+                // The provider is a side node: it answers its requester and is
+                // not a link in the record chain.
                 kinds[n_chain] = 2;
                 effects[n_chain] = Some(*binding);
+                requester_of[carrier] = Some(n_chain);
                 let c = &mut chain[n_chain];
                 set(&mut c.name, &mut c.name_len, &name[..nl])?;
-                set(&mut c.in_port, &mut c.in_len, &ip[..il])?;
-                set(&mut c.out_port, &mut c.out_len, &op[..ol])?;
+                set(&mut c.in_port, &mut c.in_len, b"request_in")?;
+                set(&mut c.out_port, &mut c.out_len, b"response_out")?;
                 n_chain += 1;
                 i += 1;
             }
@@ -549,10 +560,19 @@ pub fn lower_pipeline_with(
                 if chain[k].name() != b"pipeline" {
                     p = gput(out, p, b"    type: pipeline\n")?;
                 }
-                p = gput(out, p, b"    params:\n      ir_stages: \"")?;
-                let (off, len) = ir_spans[k];
-                p = put_hex(out, p, &scratch[off..off + len])?;
-                p = gput(out, p, b"\"\n")?;
+                p = gput(out, p, b"    params:\n")?;
+                if run_lens[k] > 0 {
+                    p = gput(out, p, b"      ir_stages: \"")?;
+                    let (off, len) = ir_spans[k];
+                    p = put_hex(out, p, &scratch[off..off + len])?;
+                    p = gput(out, p, b"\"\n")?;
+                }
+                if let Some(e) = requester_of[k] {
+                    let c = effects[e].ok_or(GraphError::EffectUnbound)?;
+                    p = gput(out, p, b"      method: ")?;
+                    p = gput_u32(out, p, c.method as u32)?;
+                    p = gput(out, p, b"\n")?;
+                }
                 if run_maps[k] {
                     p = gput(out, p, b"      stage_kinds: \"")?;
                     p = put_hex(out, p, &run_kinds[k][..run_lens[k]])?;
@@ -581,47 +601,53 @@ pub fn lower_pipeline_with(
             }
         }
     }
-    // ---- wiring: source edge, inter-stage edges, sink edge, transport edges ----
+    // ---- wiring: source edge, inter-stage edges, sink edge, exchange edges,
+    //      transport edges ----
     //
-    // A single node on an embedded profile has NO edges at all: the ends are
-    // left open for the surrounding graph. Emitting a bare `wiring:` key there
-    // would be refused ("wiring must be a list"), so the section is counted
-    // first and only opened if something goes in it.
-    let mut n_wires = 0usize;
-    if n_chain > 0 {
+    // The record chain is every node but the providers, which hang off their
+    // requesters. A single node on an embedded profile has NO edges at all: the
+    // ends are left open for the surrounding graph. Emitting a bare `wiring:`
+    // key there would be refused ("wiring must be a list"), so the section is
+    // counted first and only opened if something goes in it.
+    let mut links = [0usize; MAX_CHAIN];
+    let mut n_links = 0usize;
+    for (k, kind) in kinds.iter().enumerate().take(n_chain) {
+        if *kind != 2 {
+            links[n_links] = k;
+            n_links += 1;
+        }
+    }
+    let n_effects = n_chain - n_links;
+    let mut n_wires = 4 * n_effects;
+    if n_links > 0 {
         if profile.host_cli {
             n_wires += 2;
         }
-        n_wires += n_chain - 1;
-    }
-    for kind in kinds.iter().take(n_chain) {
-        // Each effect adds a transport edge in each direction.
-        if *kind == 2 {
-            n_wires += 2;
-        }
+        n_wires += n_links - 1;
     }
     if n_wires == 0 {
         p = gput(out, p, b"\nwiring: []\n")?;
     } else {
         p = gput(out, p, b"\nwiring:\n")?;
     }
-    if n_chain > 0 {
+    if n_links > 0 {
+        let first = chain[links[0]];
+        let last = chain[links[n_links - 1]];
         if profile.host_cli {
             p = emit_wire(
                 out,
                 p,
                 b"cli_in",
                 b"stdin_out",
-                chain[0].name(),
-                chain[0].in_port(),
+                first.name(),
+                first.in_port(),
             )?;
         }
-        for k in 0..n_chain.saturating_sub(1) {
-            let (a, b) = (chain[k], chain[k + 1]);
+        for w in 0..n_links - 1 {
+            let (a, b) = (chain[links[w]], chain[links[w + 1]]);
             p = emit_wire(out, p, a.name(), a.out_port(), b.name(), b.in_port())?;
         }
         if profile.host_cli {
-            let last = chain[n_chain - 1];
             p = emit_wire(
                 out,
                 p,
@@ -631,6 +657,15 @@ pub fn lower_pipeline_with(
                 b"bytes_in",
             )?;
         }
+    }
+    // Each requester's exchange with its provider, in node order.
+    for k in 0..n_chain {
+        let Some(e) = requester_of[k] else {
+            continue;
+        };
+        let (r, v) = (chain[k].name(), chain[e].name());
+        p = emit_wire(out, p, r, b"request_out", v, b"request_in")?;
+        p = emit_wire(out, p, v, b"response_out", r, b"response_in")?;
     }
     // Transport edges last, in node order — the canonical order.
     for k in 0..n_chain {

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Run the identity provider from this directory alone.
 #
-# Everything it needs is here: the dispatch document, the graph, the operator
-# client, and the verification. Nothing outside `examples/identity_provider/`
+# Everything it needs is here: the dispatch document, the graphs, the operator
+# clients, and the verification. Nothing outside `examples/identity_provider/`
 # is edited to run it; the modules come from the Fluxor OCI store by pin,
 # which is what makes the IdP a COMPOSITION rather than a build.
 #
-#   ./run.sh            author, start, provision, and stay up (Ctrl-C to stop)
-#   ./run.sh --verify   start, assert every arm of the chain, tear down
-#   ./run.sh --stop     kill anything this script left running
+#   ./run.sh              author, start, provision, and stay up (Ctrl-C to stop)
+#   ./run.sh --verify     introspect: assert every arm of the chain, tear down
+#   ./run.sh --token      the /oauth/token device grant, end to end
+#   ./run.sh --authorize  the OIDC authorization-code /authorize leg
+#   ./run.sh --exchange   the OIDC authorization-code exchange leg
+#   ./run.sh --stop       kill anything this script left running
 #
 # The port is overridable so two copies can run side by side:
 #   IDP_PORT=15100 ./run.sh
@@ -19,16 +22,38 @@ PROJECT="$(cd "$HERE/../.." && pwd)"
 
 IDP_PORT="${IDP_PORT:-15100}"
 PIDFILE="/tmp/chronicle-idp.pid"
-CLIENT="/tmp/chronicle-idp-client.$$.py"
 
 export IDP_PORT
 
+port_open() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$IDP_PORT") 2>/dev/null
+}
+
+# A stopped graph drains before it exits, and it keeps its listener while it
+# does — so `stop` waits for the port to close. Without that, the next mode
+# on the same port finds the OLD graph listening and talks to it.
 stop() {
   if [ -f "$PIDFILE" ]; then
     kill "$(cat "$PIDFILE")" 2>/dev/null || true
     rm -f "$PIDFILE"
+    for _ in $(seq 1 100); do port_open || break; sleep 0.2; done
   fi
-  rm -f "$CLIENT"
+}
+
+# Start a graph and wait for its listener rather than sleeping a guess: a
+# fixed sleep is either too short on a loaded machine or wasted on an idle
+# one. A port something else already holds is refused, not shared.
+start_graph() { # <graph.yaml>
+  if port_open; then
+    echo "port $IDP_PORT is already in use"; exit 1
+  fi
+  ( cd "$PROJECT" && exec fluxor run "$1" ) &
+  echo $! > "$PIDFILE"
+  for _ in $(seq 1 150); do
+    port_open && return 0
+    sleep 0.2
+  done
+  echo "the graph never listened on :$IDP_PORT"; exit 1
 }
 
 case "${1:-}" in
@@ -39,7 +64,7 @@ trap stop EXIT
 # ── the /oauth/token slice ──────────────────────────────────────────────────
 #
 # A SECOND graph in this example (chronicle_token.yaml) serving POST
-# /oauth/token through mint_admission's grant mode. It needs the full grant
+# /oauth/token through mint_admission's GRANT operation. It needs the full grant
 # substrate — a durable ledger, a vault signing key, an enrolled device — so
 # `--token` stands it up with a store and a seal key and drives the ceremony
 # in token_client.py: deliver the keys, seed a device, present a certificate +
@@ -58,12 +83,7 @@ if [ "${1:-}" = "--token" ]; then
   mkdir -p "$FLUXOR_STORE_DIR" "$FLUXOR_VAULT_DIR"
 
   echo "== starting the token endpoint on :$IDP_PORT =="
-  ( cd "$PROJECT" && exec fluxor run "$HERE/chronicle_token.yaml" ) &
-  echo $! > "$PIDFILE"
-  for _ in $(seq 1 40); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$IDP_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
-    sleep 0.25
-  done
+  start_graph "$HERE/chronicle_token.yaml"
 
   echo "== granting a token =="
   OUT="$(python3 "$HERE/token_client.py" "$IDP_PORT")"
@@ -118,12 +138,7 @@ if [ "${1:-}" = "--authorize" ]; then
   mkdir -p "$FLUXOR_STORE_DIR" "$FLUXOR_VAULT_DIR"
 
   echo "== starting the authorize endpoint on :$IDP_PORT =="
-  ( cd "$PROJECT" && exec fluxor run "$HERE/chronicle_authorize.yaml" ) &
-  echo $! > "$PIDFILE"
-  for _ in $(seq 1 40); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$IDP_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
-    sleep 0.25
-  done
+  start_graph "$HERE/chronicle_authorize.yaml"
 
   echo "== authorizing a device =="
   OUT="$(python3 "$HERE/authorize_client.py" "$IDP_PORT")"
@@ -167,12 +182,7 @@ if [ "${1:-}" = "--exchange" ]; then
   mkdir -p "$FLUXOR_STORE_DIR" "$FLUXOR_VAULT_DIR"
 
   echo "== starting the token endpoint (exchange) on :$IDP_PORT =="
-  ( cd "$PROJECT" && exec fluxor run "$HERE/chronicle_exchange.yaml" ) &
-  echo $! > "$PIDFILE"
-  for _ in $(seq 1 40); do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$IDP_PORT") 2>/dev/null; then exec 3>&- 3<&-; break; fi
-    sleep 0.25
-  done
+  start_graph "$HERE/chronicle_exchange.yaml"
 
   echo "== redeeming a code =="
   OUT="$(python3 "$HERE/exchange_client.py" "$IDP_PORT")"
@@ -213,141 +223,12 @@ fi
 
 # ── the operator client ────────────────────────────────────────────────────
 #
-# Written out rather than shipped as a fifth file, because it is not part of
-# the application: it is a KEY CEREMONY and a client, and both belong outside
-# the graph. It provisions `token_verify`'s keyset over the websocket and
-# mints one credential to introspect. The private half never reaches the
-# graph — a verifier holds public keys only, which is the whole reason the
-# keyset arrives as `MSG_KEY_ADD` carrying a public point.
-cat > "$CLIENT" <<'PYEOF'
-#!/usr/bin/env python3
-"""Provision the IdP's verifying keyset and mint a credential to introspect.
-
-This is the OPERATOR side of the example, and it is a host script on purpose:
-it is what a deployment's key ceremony would do, and keeping it outside the
-graph is the point — nothing on the serving path can reach `verify_key`.
-
-It does three things, all with `openssl` and the standard library:
-  1. generate a P-256 key pair,
-  2. push the PUBLIC half to `token_verify` as a kagi `MSG_KEY_ADD` frame,
-     over the websocket, on mux channel 0,
-  3. sign a short-lived ES256 JWS with the PRIVATE half and print it.
-
-The private key never leaves this script and never reaches the graph. That is
-the shape a real issuer has: the verifier holds public keys only.
-"""
-import base64, hashlib, os, socket, struct, subprocess, sys, tempfile, time
-
-MSG_KEY_ADD = 0x22
-SUITE_ES256 = 1
-PROFILE_ACCESS_TOKEN = 1
-KEY_STATE_ACTIVE = 1
-KEY_USE_VERIFY = 0x01
-MUX_MAGIC = 0xFC
-
-def b64u(b):     return base64.urlsafe_b64encode(b).rstrip(b"=")
-def f8(b):       return bytes([len(b)]) + b
-def f16(b):      return struct.pack("<H", len(b)) + b
-def envelope(t, p): return bytes([t]) + struct.pack("<H", len(p)) + p
-
-def openssl(args, **kw):
-    return subprocess.run(["openssl", *args], check=True, capture_output=True, **kw).stdout
-
-def keypair(path):
-    """A P-256 key pair; returns the uncompressed SEC1 public point."""
-    openssl(["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", path])
-    txt = openssl(["ec", "-in", path, "-text", "-noout"]).decode()
-    # The `pub:` block is the uncompressed point, hex, one byte per group.
-    take, hexes = False, []
-    for line in txt.splitlines():
-        if line.strip().startswith("pub:"):
-            take = True; continue
-        if take:
-            if ":" not in line: break
-            hexes += [x for x in line.strip().split(":") if x]
-            if len(bytes.fromhex("".join(hexes))) >= 65: break
-    pub = bytes.fromhex("".join(hexes))[:65]
-    if len(pub) != 65 or pub[0] != 0x04:
-        sys.exit("could not read an uncompressed P-256 public point")
-    return pub
-
-def key_add(issuer, kid, pub):
-    """kagi `MSG_KEY_ADD` — a `KeyRecord` carrying the PUBLIC half only."""
-    body = (f8(issuer) + struct.pack("<H", PROFILE_ACCESS_TOKEN) + f8(kid)
-            + struct.pack("<H", SUITE_ES256)
-            + bytes([KEY_STATE_ACTIVE, KEY_USE_VERIFY])
-            + struct.pack("<I", 1)            # generation
-            + struct.pack("<Q", 0)            # activate_after: immediately
-            + struct.pack("<Q", 0)            # remove_after: no deadline
-            + f16(pub))
-    return envelope(MSG_KEY_ADD, body)
-
-def der_to_raw(der):
-    """DER SEQUENCE{INTEGER r, INTEGER s} -> the 64-byte r||s JOSE form."""
-    assert der[0] == 0x30
-    i = 2 if der[1] < 0x80 else 3 + (der[1] & 0x7F) - 1
-    out = b""
-    for _ in range(2):
-        assert der[i] == 0x02
-        n = der[i + 1]; v = der[i + 2:i + 2 + n]; i += 2 + n
-        out += v.lstrip(b"\x00").rjust(32, b"\x00")
-    return out
-
-def sign_jws(key_path, kid, claims):
-    hdr = b'{"alg":"ES256","typ":"JWT","kid":"' + kid + b'"}'
-    payload = b"{" + b",".join(claims) + b"}"
-    signing_input = b64u(hdr) + b"." + b64u(payload)
-    with tempfile.NamedTemporaryFile(delete=False) as f:
-        f.write(signing_input); tmp = f.name
-    try:
-        der = openssl(["dgst", "-sha256", "-sign", key_path, tmp])
-    finally:
-        os.unlink(tmp)
-    return signing_input + b"." + b64u(der_to_raw(der))
-
-def ws_push(host, port, path, payload, channel=0):
-    """Open a websocket and send ONE mux frame. No library: the handshake is
-    thirteen lines and a dependency here would be a dependency the example
-    made someone install to read it."""
-    key = base64.b64encode(os.urandom(16))
-    s = socket.create_connection((host, port), timeout=5)
-    s.sendall(b"GET " + path.encode() + b" HTTP/1.1\r\nHost: " + host.encode()
-              + b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-              + b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
-    head = b""
-    while b"\r\n\r\n" not in head:
-        chunk = s.recv(4096)
-        if not chunk: sys.exit("the server closed during the websocket handshake")
-        head += chunk
-    if b"101" not in head.split(b"\r\n")[0]:
-        sys.exit("websocket upgrade refused: " + head.split(b"\r\n")[0].decode())
-    frame = bytes([MUX_MAGIC, channel]) + struct.pack("<H", len(payload)) + payload
-    mask = os.urandom(4)
-    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(frame))
-    hdr = bytes([0x82])                      # FIN + binary
-    n = len(frame)
-    hdr += bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)
-    s.sendall(hdr + mask + masked)
-    time.sleep(0.5)                          # let the frame reach the module
-    return s                                 # held open by the caller
-
-if __name__ == "__main__":
-    port = int(sys.argv[1])
-    issuer, kid, sub = b"https://idp.example", b"k1", b"spiffe://example/workload/demo"
-    with tempfile.TemporaryDirectory() as d:
-        kp = os.path.join(d, "k.pem")
-        pub = keypair(kp)
-        sock = ws_push("127.0.0.1", port, "/ws", key_add(issuer, kid, pub))
-        now = int(time.time())
-        jws = sign_jws(kp, kid, [
-            b'"iss":"' + issuer + b'"', b'"sub":"' + sub + b'"',
-            b'"aud":"https://rs.example"', b'"scope":"read"',
-            b'"jti":"demo-1"',
-            b'"iat":' + str(now).encode(), b'"exp":' + str(now + 3600).encode(),
-        ])
-        print(jws.decode())
-        sock.close()
-PYEOF
+# `introspect_client.py` is the KEY CEREMONY, and it is a host script because
+# a ceremony belongs outside the graph. It provisions `token_verify`'s keyset
+# over the control carrier (`control.py`) and mints one credential to
+# introspect. The private half never reaches the graph — a verifier holds
+# public keys only, which is the whole reason the keyset arrives as
+# `MSG_KEY_ADD` carrying a public point.
 
 # Author the document on device, which is also the check that it still
 # compiles: every artefact digest below is one `chronicle author` sealed with
@@ -358,7 +239,7 @@ PYEOF
 # generated from is a graph that does something the document does not say.
 echo "== authoring idp.uproc =="
 
-# The document must fit `chronicle_cli`'s `UPROC_BUF` (32768 bytes of SOURCE
+# The document must fit `chronicle_cli`'s `UPROC_BUF` (65536 bytes of SOURCE
 # text, hex-decoded into it), and it is checked HERE because exceeding it
 # does not fail — it HANGS. The hex of the document is one `fluxor exec`
 # argument, so an over-long document is an over-long argument record: it
@@ -369,7 +250,7 @@ echo "== authoring idp.uproc =="
 # A person who has just added a paragraph of comments and watched authoring
 # hang has no way to guess that. Measured against the source, before the
 # hang, with the number that matters in the message.
-UPROC_MAX=32768
+UPROC_MAX=65536
 size="$(wc -c < "$HERE/idp.uproc")"
 if [ "$size" -gt "$UPROC_MAX" ]; then
   echo "idp.uproc is $size bytes, over chronicle's $UPROC_MAX-byte document bound."
@@ -385,33 +266,22 @@ H="$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$HERE/i
   || { echo "authoring failed — the document does not compile"; exit 1; }
 
 echo "== starting the identity provider on :$IDP_PORT =="
-( cd "$PROJECT" && exec fluxor run "$HERE/chronicle_idp.yaml" ) &
-echo $! > "$PIDFILE"
-
-# Wait for the listener rather than sleeping a guess: a fixed sleep is either
-# too short on a loaded machine or wasted on an idle one.
-for _ in $(seq 1 150); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$IDP_PORT") 2>/dev/null; then
-    exec 3<&- 2>/dev/null || true
-    break
-  fi
-  sleep 0.2
-done
+start_graph "$HERE/chronicle_idp.yaml"
 
 # ── provision the keyset, and mint one credential ──────────────────────────
 echo "== provisioning the verifying keyset =="
-TOKEN="$(python3 "$CLIENT" "$IDP_PORT" | tail -1)"
+TOKEN="$(python3 "$HERE/introspect_client.py" "$IDP_PORT" | tail -1)"
 [ -n "$TOKEN" ] || { echo "the key ceremony produced no credential"; exit 1; }
 
 introspect() {
   post_to /oauth/introspect "$1"
 }
 
-# The same request against any path, so a route can be tested rather than
-# assumed.
-post_to() {
+# The same request against any path and with any method, so a route and a
+# method can be tested rather than assumed.
+post_to() { # <path> <body> [method]
   curl -s -o /tmp/chronicle-idp-body.$$ -w '%{http_code}' --max-time 10 \
-       -X POST --data-binary "$2" "http://127.0.0.1:$IDP_PORT$1"
+       -X "${3:-POST}" --data-binary "$2" "http://127.0.0.1:$IDP_PORT$1"
 }
 
 if [ "${1:-}" = "--verify" ]; then
@@ -421,11 +291,10 @@ if [ "${1:-}" = "--verify" ]; then
   # whole thing the check tests — including the refusals, because a chain
   # that only ever answers 200 has not shown that it can say no.
   #
-  # An early draft of this script asserted only that the graph stayed up,
-  # with `|| echo 000` appended to curl's own `000` — producing `000000`,
-  # which did not match the `000` guard, so it REPORTED SUCCESS ON A TOTAL
-  # FAILURE. Hence: capture the status, compare it exactly, and let a
-  # non-zero exit be a failure.
+  # Each status is captured and compared exactly, and a mismatch is a
+  # non-zero exit. A check that only asserted the graph stayed up — or that
+  # folded curl's own `000` into some other string — would report success on
+  # a total failure.
   fail=0
   check() { # <label> <expected> <body>
     got="$(introspect "$3")"
@@ -440,6 +309,17 @@ if [ "${1:-}" = "--verify" ]; then
   check "a bad signature"           401 "aaa.bbb.ccc"
   check "an empty credential"       400 ""
   check "a credential kagi refuses" 400 "not-a-jws"
+
+  # The wrong method on the served path is NOT refused by the graph: `to_kagi`
+  # forwards it with an empty credential, and kagi's MALFORMED is the 400.
+  got="$(post_to /oauth/introspect "$TOKEN" GET)"
+  if [ "$got" = "400" ]; then
+    echo "  ok   a GET with a valid credential -> 400, kagi's MALFORMED"
+  else
+    echo "  FAIL a GET answered $got"
+    fail=1
+  fi
+  rm -f /tmp/chronicle-idp-body.$$
 
   # 200 must carry the subject kagi extracted, and nothing else. A status
   # alone would pass even if the body were empty or somebody else's.
@@ -459,7 +339,7 @@ if [ "${1:-}" = "--verify" ]; then
   # pipeline at all. Asserted anyway, because it is the property a reader
   # will assume and the one that would break silently — adding a second
   # `app: true` route is all it takes for requests to a new path to start
-  # arriving at `to_kagi`, which is why that decision now tests the path as
+  # arriving at `to_kagi`, which is why that decision tests the target as
   # well as the method rather than trusting the route table to stay narrow.
   got="$(post_to /not-a-route "$TOKEN")"
   if [ "$got" = "404" ]; then

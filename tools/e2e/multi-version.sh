@@ -29,4 +29,16 @@ got=$(run_text 01020108000a00000000000000 4 -- $'\x02\x02v2')
 [ "$got" = "20" ] && ok "blue-green control flip: default now v2" \
   || no "mv blue-green" "got='$got'"
 
+# The same node with no version table is a node of codecs alone: a record that
+# names no version runs zero stages and reaches the encoder unchanged, while one
+# that names a version fails closed — this instance holds none.
+build_graph examples/multi_version/linux.yaml '/^      versions:/d' \
+  || { no multi-version "codec-only build"; finish; exit; }
+got=$(run_text 01010108000a00000000000000 4)
+[ "$got" = "10" ] && ok "a codec-only node passes a record through its encoder" \
+  || no "mv codec-only" "got='$got'"
+got=$(run_text 02010108000a00000000000000ff0002007631 4)
+[ "$got" = "VERSION_UNAVAILABLE" ] && ok "a codec-only node refuses a record that names a version" \
+  || no "mv codec-only pin" "got='$got'"
+
 finish

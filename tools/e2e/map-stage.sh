@@ -58,7 +58,7 @@ read -r ALL ABSENT MISS ATMAX TOOMANY <<<"$records"
 want0=$(python3 -c 'import struct;print((bytes([1])+struct.pack("<BBH",1,1,8)+struct.pack("<q",0)).hex())')
 want1=$(python3 -c 'import struct;print((bytes([1])+struct.pack("<BBH",1,1,8)+struct.pack("<q",1)).hex())')
 
-# over_bound is pipeline metric id 29 (modules/app/pipeline/manifest.toml),
+# over_bound is pipeline metric id 30 (modules/app/pipeline/manifest.toml),
 # the count of records refused for exceeding the field table or a map stage's
 # maximum. `observe` drains the telemetry ring to stderr as MON_METRIC lines,
 # naming a module by its instance index, which the runtime's own load log gives
@@ -72,7 +72,7 @@ over_bound() { # <stderr file> -> the highest over_bound value reported
   local m
   m=$(mod_index "$1" pipeline)
   [ -n "$m" ] || return 0
-  grep -oE "MON_METRIC mod=$m id=29 kind=1 val=[0-9]+" "$1" 2>/dev/null \
+  grep -oE "MON_METRIC mod=$m id=30 kind=1 val=[0-9]+" "$1" 2>/dev/null \
     | grep -oE '[0-9]+$' | sort -n | tail -1
 }
 # run_counted <input_hex> <stderr file>: long enough for the second telemetry

@@ -1,9 +1,9 @@
 # OCI registry — two tiers, all config
 
 An OCI-compatible registry built the way chronicle builds everything: **generic
-engines carrying params**, composed with connectors owned by other projects.
-There is no registry module, and there should not be one — `/v2/` is a `.uproc`
-that compiles to params, not a `.fmod`.
+engines carrying params**, composed with connectors and services owned by other
+projects. There is no registry module, and there should not be one — `/v2/` is a
+`.uproc` that compiles to params, not a `.fmod`.
 
 ```sh
 ./run.sh --verify     # start both tiers, assert, tear down
@@ -17,21 +17,21 @@ Ports and state are one knob each, so two registries can run side by side:
 S3_PORT=19222 REGISTRY_PORT=15333 STATE=/tmp/oci-alt ./run.sh --verify
 ```
 
-The graph reads `${REGISTRY_PORT}` and `${S3_HOST}` — fluxor
-substitutes `${VAR:-default}` before parsing the YAML, so a bare
-`fluxor build` still works on the defaults. `s3_client`'s `endpoint` is
-`[ip:4][port:2 LE]` packed as hex, which a decimal port cannot be interpolated
-into, so `run.sh` DERIVES it from `S3_PORT` rather than carrying a second
-literal that would drift the first time someone moved the port.
+The graph reads `${REGISTRY_PORT}`, `${S3_HOST}`, `${S3_ACCESS_KEY}` and
+`${S3_SECRET}`, which fluxor substitutes before parsing the YAML; `run.sh` sets
+all four. The credentials default to empty, so the graph builds on its own,
+and tier 1 refuses every request signed with them.
 
 ```
   ok   GET /v2/ is 200
   ok   GET /v2/ returns the body
   ok   a stored blob is served
+  ok   a 256 KiB blob streams through whole
   ok   a missing blob is 404
   ok   an unrouted path is 404
+  ok   tier 1 refuses an unsigned read
 
-PASS oci registry — discovery, blob fetch and miss, over two tiers
+PASS oci registry — discovery, blob fetch, streaming and miss, over two tiers
 ```
 
 Four files, and they are the whole registry:
@@ -43,9 +43,9 @@ Four files, and they are the whole registry:
 | `chronicle_registry.yaml` | the graph: which engines, which params, which wires |
 | `README.md` | this |
 
-Nothing outside this directory is edited to run it. The one project-level change
-is a dependency line (`loam = "0.0.1"` in `../../fluxor.toml`) so the storage
-connector resolves from the store — the same pin every other connector uses.
+Both tiers run under `fluxor run` from this project, so the runtime, every
+module and the `loam-s3` bundle resolve from the Fluxor OCI store through the
+pins in `../../fluxor.lock`. Nothing is built from another project's tree.
 
 ---
 
@@ -57,47 +57,49 @@ connector resolves from the store — the same pin every other connector uses.
              ▼
   ┌──────────────────────┐   tier 2 — the registry PROTOCOL
   │ chronicle graph      │   stateless; scale by adding replicas
-  │  http (wave)         │   terminates HTTP, hands requests to graph nodes
-  │  dec_http  pipeline  │   rd bytecode: envelope → Request
-  │  route     decision  │   registry.uproc's `to_s3`
-  │  enc_s3    pipeline  │   ser bytecode: S3Call → S3Request
-  │  s3_client (loam)    │   SigV4-signs and performs it
-  │  dec_s3    pipeline  │   rd bytecode: S3Response → S3Reply
-  │  enc_http  pipeline  │   ser bytecode: S3Reply → HttpResponse
+  │  http      (wave)    │   terminates HTTP; each request is an exchange
+  │  registry  pipeline  │   relay: registry.uproc's `to_s3` rewrites the
+  │                      │   request HEAD; every other record passes through
+  │  s3        (wave)    │   SigV4-signs and performs it
   └──────────┬───────────┘
-             │  S3 over TCP  ← the only thing crossing the tier boundary
+             │  S3 over TCP, SigV4-signed  ← the only thing crossing the boundary
              ▼
-  ┌──────────────────────┐   tier 1 — the STORAGE
-  │ loam-server          │   stateful; scale by adding body nodes
-  │  --s3-listen         │   S3 gateway: PUT/GET/HEAD/DELETE per object
+  ┌──────────────────────┐   tier 1 — the STORAGE: loam's `loam-s3` bundle
+  │  http, s3_serve      │   wave: terminates S3 and verifies SigV4
+  │  object_provider     │   loam: each access key acts under its capability
+  │  admin_gate/_router  │   loam: the capability-gated admin plane
   │  namespace_router    │   ┐
-  │  object_index        │   │ ordinary loam PICs behind the gateway
-  │  placement_router    │   │
-  │  body_store (fleet)  │   ┘
+  │  object_index        │   │ loam's storage node
+  │  body_store          │   ┘
   └──────────────────────┘
 ```
 
 Splitting on the S3 API rather than on a channel is the point: tier 1 can become
-a replicated fleet (`--fleet tcp:a:7100,tcp:b:7100 --replica-count 2`) and tier 2
-does not change, because the S3 surface is identical either way.
+loam's replicated shape (remote body members, `replicas: 2` — see loam's
+`docs/running.md`) and tier 2 does not change, because the S3 surface is the same
+either way.
+
+**Access is a capability, not a password.** `run.sh` makes a mesh root for the
+run and mints from it a capability whose scope is the `registry/` bucket. Tier
+1's credentials bind the registry's access key to that capability, so every
+request tier 2 signs acts under it and reaches nothing outside the bucket. An
+unsigned request is refused `403`.
 
 ---
 
 ## Every resource this needs
 
-| # | Resource | Where it lives | Status |
-|---|---|---|---|
-| 1 | `fluxor` runtime, CLI, OCI store | `../../../fluxor` | ✅ |
-| 2 | `HttpRequest` / `HttpResponse` content types | fluxor `contracts/src/lib.rs` | ✅ |
-| 3 | `app: true` route key → `HANDLER_APP` | fluxor `tools/src/schema.rs` | ✅ |
-| 4 | `http` — methods, bounded bodies, app fan-out, h1+h2 | wave, pinned | ✅ |
-| 5 | `loam-server --s3-listen` — the S3 gateway | loam `tools/loam-cli/` | ✅ |
-| 6 | `namespace_router`, `object_index`, `body_store`, … | loam PICs, hosted by tier 1 | ✅ |
-| 7 | `pipeline`, `decision` engines | chronicle `modules/app/` | ✅ |
-| 8 | `s3_client` driveable per request | loam, pinned | ✅ |
-| 9 | `registry.uproc` → `ir_stages` / decision params | this directory | ✅ |
+| # | Resource | Where it lives |
+|---|---|---|
+| 1 | `fluxor` runtime, CLI, OCI store | fluxor |
+| 2 | the exchange contract, `ExchangeRequest` / `ExchangeResponse` | fluxor SDK |
+| 3 | `http` — methods, streamed bodies, application routes, h1+h2 | wave, pinned |
+| 4 | `s3` — a SigV4-signing S3 client, one exchange per request | wave, pinned |
+| 5 | `loam-s3` — the S3 storage service | loam, a pinned bundle |
+| 6 | `pipeline`, `decision` engines | chronicle `modules/app/` |
+| 7 | `registry.uproc` → the relay's `ir_stages` | this directory |
 
-Nothing on that list is a new chronicle module.
+Nothing on that list is a registry module.
 
 ---
 
@@ -113,73 +115,35 @@ expression VM has arithmetic and comparison but **no conditional** — branching
 is the `decision` construct, and a fork in the *dataflow* would need a second
 graph. Making discovery data instead of logic keeps the chain a straight line.
 
-**Correlation survives the storage round trip** because `conn_id` rides in the
-connector's `cid` field and returns in the reply — the same trick
-`(conn_id, stream_id)` plays across the HTTP fan-out.
+**One exchange, end to end.** `http` opens an exchange for each request under
+an id it chooses. The `registry` node is a RELAY: it maps the request HEAD's
+id, method and target to fields (`id_field`, `method_field`, `target_field`),
+runs `to_s3` over them as an inline decision stage, and sends the rewritten
+HEAD to `s3` under the SAME id. `s3` answers that id, and its answer records
+pass back through the relay to `http` untouched — so the answer reaches the
+client that asked, and no node holds a table of who asked what.
+
+**Bodies stream.** Only the HEAD is rewritten. A blob's body arrives from `s3`
+as a HEAD and as many BODY records as it takes, each forwarded as it comes and
+paced by the client's own credit, so a blob of any size is served without
+being assembled anywhere.
 
 **The status is the store's, verbatim.** A 404 for a missing blob is loam's 404.
 The registry never learns whether an object exists, so it cannot disagree with
-the store about it.
-
----
-
-## What the code changes were
-
-Two, both genuine, both in loam — chronicle gained no code at all:
-
-**`s3_client` driveable per request** (a missing feature). It signed one
-`GET /` at boot and reported the status; there was no way to ask for a different
-object. It now takes an `S3Request` per graph message on `request_in` and answers
-on `response_out` — the client-side mirror of wave's `HANDLER_APP`. 17 host
-vectors, plus `loam/tools/e2e/s3_driven.sh` driving PUT/GET/HEAD/DELETE against a
-real gateway.
-
-**`s3_object_path` doubled a leading slash** (a bug). Given the key `/v2/x` it
-produced `/registry//v2/x`, which addresses a *different* object — verified
-against loam's own gateway, where `/registry/v2/x` returns 200 and
-`/registry//v2/x` returns 404. It silently 404s instead of failing, which is the
-failure mode that function's own doc warns about. Fixed, with two tests.
-
-A registry whose client passes a URL path straight through as a key hits that
-immediately, which is how it was found.
-
----
-
-## What it does not do yet
-
-**Authentication.** Tier 1 runs anonymous — no `--s3-credentials` — so the
-SigV4 signature tier 2 computes is never verified. Fine on loopback, wrong for
-anything else: making it real is passing `--s3-credentials` to `loam-server` and
-matching keys in the graph. The credentials in the YAML today
-(`minioadmin`/`minioadmin`) are the MinIO defaults and mean nothing to an
-anonymous gateway.
-
-**Writes.** `docker push` needs the upload session — `POST /v2/<name>/blobs/uploads/`,
-`PATCH` chunks, `PUT ?digest=` — which is more than a key lookup: the session id
-must persist across requests, and the digest must be verified before the blob is
-committed. The read path here is the half that is pure lookup.
-
-Large blobs are bounded at 16 KiB per object by the connector's fixed staging
-buffers. Beyond that needs the chunked form the HTTP fan-out already uses (a
-`MORE_BODY` flag across several records).
-
----
-
-## Three things this taught
-
-**A `.uproc` is bounded at 2 KB.** `chronicle author` decodes a document into a
-2048-byte buffer, so the source has a hard size limit — which is why the
-rationale lives here and `registry.uproc` carries only logic.
-
-**A pipeline node with no program fails CLOSED — silently, from outside.** With
-only a codec param and no `ir_stages`, the engine emits a
-`{1:"VERSION_UNAVAILABLE"}` record rather than the decoded one. Correct
-behaviour (a record pinned to a version the instance does not hold must never get
-the wrong version), but downstream it looks like an ordinary record, so the
-failure surfaces two hops away as a decision that will not fire. Every codec node
-here therefore carries one of the document's identity stages.
+the store about it. A request the relay cannot pass on is still answered — 500
+— so a client is never left waiting.
 
 **A bound port is not a serving graph.** `run.sh --verify` polls the discovery
 endpoint until it answers rather than sleeping a fixed interval — the chain has
 to reach the point where a request crosses HTTP → engines → SigV4 → storage and
-back, and a magic sleep is how a gate becomes flaky on a slower machine.
+back.
+
+---
+
+## Bounds
+
+**Reads only.** `docker push` needs the upload session —
+`POST /v2/<name>/blobs/uploads/`, `PATCH` chunks, `PUT ?digest=` — which is more
+than a key lookup: the session id must persist across requests, and the digest
+must be verified before the blob is committed. The read path here is the half
+that is pure lookup.

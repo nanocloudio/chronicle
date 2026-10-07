@@ -30,14 +30,13 @@ buffer behind it are one number on every target rather than two that can disagre
 | decision | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 22 |
 | expression | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
 | expression | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
-| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | publish_out | output | 4624 (rp2040 592) | 18496 (rp2040 2368) | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | ack_in | input | 12 | 512 | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | publish_in | input | 8720 (rp2040 1040) | 34880 (rp2040 4160) | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | ack_out | output | 12 | 512 | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | reply_in | input | 8720 (rp2040 592) | 17440 (rp2040 1184) | 30 |
-| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 30 |
+| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | request_out | output | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | response_in | input | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | request_in | input | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | response_out | output | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 31 |
 | sensor_intake | bcm2712,rp2350,rp2040 | sample | input | 24 | 240 |  |
 | sensor_intake | bcm2712,rp2350,rp2040 | record_out | output | 96 | 960 |  |
 
@@ -62,7 +61,7 @@ does not declare that target.
 | chronicle_cli | 397888 | n/a | n/a |
 | decision | 57536 | 57536 | 19648 |
 | expression | 10432 | 10432 | 3264 |
-| pipeline | 102272 | 102272 | 40512 |
+| pipeline | 300288 | 166080 | 46016 |
 | sensor_intake | 320 | 256 | 256 |
 
 State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB.

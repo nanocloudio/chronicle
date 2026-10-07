@@ -26,9 +26,11 @@ There is no template language. `encode` / `decode` programs are assembled from
 the opcode constants below and hex-encoded into the param — see
 [`tests/harness/tests/pipeline_suites/ser.rs`](../../tests/harness/tests/pipeline_suites/ser.rs)
 and [`deser.rs`](../../tests/harness/tests/pipeline_suites/deser.rs) for worked
-programs, and `examples/identity_provider/chronicle_authorize.yaml` for one in
-service: it renders an HTTP `POST /oauth/authorize` request, length-framed body
-included, for the IdP's authorize endpoint.
+programs, and `examples/identity_provider/chronicle_authorize.yaml` for both in
+service: its `encode` renders kagi's `MSG_AUTHORIZE_REQ` envelope — length
+prefixes and a length-framed payload region — as the body of an exchange
+request, and its `decode` and `reply_decode` read a newline-separated HTTP
+body and kagi's answer envelope back into fields.
 
 ## `ser` — record → bytes
 

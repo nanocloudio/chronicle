@@ -31,13 +31,6 @@ pub enum GraphError {
     /// node runs (`MAX_NODE_STAGES`). The run lowers to a single node, so a
     /// longer one would build a node that fails every record.
     RunTooLong,
-    /// A stage follows an effect whose provider does not answer with data.
-    ///
-    /// A non-replying provider's output port carries an acknowledgement or a
-    /// status line, not a record. Wiring it into the next node's `record_in`
-    /// builds a graph that runs and then feeds a record parser bytes that are
-    /// not a record, so the plan is refused here instead.
-    EffectNotChainable,
 }
 
 /// One module instance in the graph: an instance name, an optional module type

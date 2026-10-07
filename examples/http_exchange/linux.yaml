@@ -1,22 +1,21 @@
-# HTTP AS AN EXCHANGE PROVIDER — a request in, a response back, correlated.
+# AN HTTP CLIENT AS AN EXCHANGE PROVIDER — a request in, a response back.
 #
-# The mirror of `examples/pipeline_egress/`. There the surface carried records
-# to a destination that only accepts them (`stream.ordered_ack.sink`); here the
-# same frames, the same correlation and the same ports carry a request to one
-# that ANSWERS (`stream.ordered_ack.exchange`). Nothing about the producer
-# changes — which is the claim the exchange surface makes, tested rather than
-# asserted.
+# The mirror of `examples/pipeline_egress/`. There a requester asked a
+# destination that only accepts records (`stream.ordered_ack.sink`); here the
+# same requester, the same records and the same ports ask one that ANSWERS
+# (`stream.ordered_ack.exchange`). Nothing about the requester changes — which
+# is the claim the exchange contract makes, tested rather than asserted.
 #
-# A `Publish` on `publish_in` carries the request record:
+# The pipeline runs no stages: it carries each record to the client as a
+# request and each answer back as a record. The parts of the exchange that are
+# not its body are data fields, named by the field map:
 #
-#   [method:u8][path_len:u16][body_len:u16][path…][body…]
+#   request record   {2: method, 3: target, 4: body}
+#   answer record    {5: body, 253: status, 6: status, 7: content type}
 #
-# and the answer comes back on `reply_out` as a `Reply` carrying the response
-# body and ECHOING the request's `msg_key` — so a stage handling the reply can
-# rejoin it to whatever produced the request without holding state.
-#
-# The `exchange` variant is what carries the client's graph-driven mode; the
-# default variant is the one-shot param client and has neither port.
+# Field 253 is the exchange status every answer record carries; `status_field`
+# and `content_type_field` place the response's own parts where a stage after
+# this one would read them.
 #
 #   python3 tools/support/http_echo.py /tmp/req.txt   # prints its port
 #   fluxor run examples/http_exchange/linux.yaml < request.bin
@@ -30,7 +29,18 @@ platform:
   net: {}
 
 modules:
+  - name: pipeline
+    params:
+      method_field: 2
+      target_field: 3
+      status_field: 6
+      content_type_field: 7
+      # The request body: field 4's bytes.
+      encode: "01000204000000616a"
+      # The answer body whole, as field 5.
+      reply_decode: "78400500000041"
   - name: http
+    # The client's provider ports live in its `exchange` variant.
     variant: exchange
     params:
       mode: 1              # client
@@ -39,8 +49,12 @@ modules:
 
 wiring:
   - from: cli_in.stdin_out
-    to: http.publish_in
-  - from: http.reply_out
+    to: pipeline.record_in
+  - from: pipeline.request_out
+    to: http.request_in
+  - from: http.response_out
+    to: pipeline.response_in
+  - from: pipeline.result_out
     to: cli_out.bytes_in
   - from: http.net_out
     to: linux_net.net_in

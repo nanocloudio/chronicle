@@ -1139,9 +1139,7 @@ fn cmd_graph(
             kind: b"",
             provider: b"",
             version: b"",
-            in_port: b"",
-            out_port: b"",
-            replies: false,
+            method: 0,
             params: &[],
         },
     }; MAX_BINDINGS];

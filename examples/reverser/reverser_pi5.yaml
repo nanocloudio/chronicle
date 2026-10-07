@@ -1,21 +1,22 @@
 # THE WHOLE REVERSER ON ONE BOARD — bare-metal Pi 5, one graph, port 80.
 #
-#   browser ─HTTP:80─▶ wave http ─┬▶ A: dec → enc_sql → pg_client ┐
-#                          ▲      └▶ C: dec → enc_sql → pg_client ┤ 127.0.0.1
-#                          │  (tee; each dec LIT-asserts its path) │  :5432
-#            enc_http ◀── dec_pg ◀──────── reply (cid echo) ◀─────┤
-#                                                                  ▼
+#   browser ─HTTP:80─▶ wave http ──▶ intake → store ⇄ pg_client ──┐ 127.0.0.1
+#                          ▲          (both routes)                 │  :5432
+#                          └─────────── reply ◀── store             │
+#                                                                   ▼
 #     lattice: pg_edge_anchor → executor → router → consensus → WAL/NVMe
 #                                             │ committed puts (table 1)
 #                                             ▼
-#                     cdc_pump ──publish──▶ B: dec_evt → keep_puts → flip
-#                              ◀── ack ───     → enc_sql → pg_client ──┘
+#                     cdc_pump ──request──▶ B: dec_evt → keep_puts → flip
+#                              ◀── 200 ────    → enc_sql ⇄ pg_client ──┘
 #
-# The SAME application as run.sh's distributed shape — identical uproc
-# containers, identical codec programs where the wire is identical — with
-# two deployment substitutions and zero logic changes:
+# The SAME application as run.sh's distributed shape — the same uproc, the
+# same codec programs where the wire is the same — with three deployment
+# substitutions and zero logic changes:
+#   - one `http` serves both routes, so A and C share one intake → store →
+#     reply chain, routed by `admit_either` and answered by `respond`,
 #   - the MQTT broker leg becomes pipeline B itself: dec_evt is the pump's
-#     ordered-ack sink (`publish_in`/`ack_out`), so every CDC event is
+#     ordered-ack sink (`request_in` with `ack`), so every CDC event is
 #     acknowledged by the pipeline that consumed it, and the pump's
 #     in-flight window is the backpressure between store and app, and
 #   - the pg_client connections ride the ip module's LOCAL-DELIVERY
@@ -185,21 +186,13 @@ modules:
       stall_grace_ms: 15000
 
 
-  # ═══ THE APPLICATION — wave http + the three chronicle pipelines ═══
-  # NOTE (2026-08-18): the four wave-facing codecs read/echo
-  # [conn:u16][stream:u16] as ONE opaque u32 in field 1 — wave now mints a
-  # per-request stream GENERATION and drops (silently, uncounted) any
-  # response that does not echo it, so a literal stream=0 answered only the
-  # first request since boot. The token doubles as the 4-byte pg cid, so
-  # nothing between wave and wave changed. Annotated fully in
-  # reverser_a.yaml / reverser_c.yaml, whose programs these mirror.
-  # Containers compiled from reverser.uproc; codecs annotated in the
-  # linux graphs (reverser_a/b/c.yaml) — identical bytes where the wire
-  # is identical. The one new codec is dec_evt's: it reads the pump's
-  # publish PAYLOAD (the cdc_wire envelope) instead of MQTT subscriber
-  # frames — the pipeline's ingress strips the publish framing itself.
+  # ═══ THE APPLICATION — wave http + the chronicle pipelines ═══
+  # Containers compiled from reverser.uproc; codecs annotated in the linux
+  # graphs (reverser_a/b/c.yaml) — identical bytes where the wire is
+  # identical. The one new codec is dec_evt's: it reads the pump's request
+  # BODY (the cdc_wire envelope) instead of MQTT subscriber frames.
   - name: http
-    # The `app` variant: h1 + the HANDLER_APP fan-out and nothing else
+    # The `app` variant: h1 + the application routes and nothing else
     # (−84 KB vs full). The netboot path has an empirical ~3.6 MB image
     # ceiling — images crossing it boot silent-dead with the payload
     # unreadable — and this image lives just under it. See also the
@@ -208,55 +201,54 @@ modules:
     port: 80
     routes:
       # EXACT static routes first: a browser fires /favicon.ico (and bare /)
-      # on the SAME keep-alive connection as the app requests, and a path
-      # neither pipeline claims would otherwise ride the app fan-out into a
-      # counted drop — holding the connection for wave's full 30 s app
-      # timeout and hanging every queued request behind it ("died after
-      # 3 messages" in a browser, while curl one-shots never noticed).
-      # Exact matches dispatch before the catch-all, so the noise answers
-      # instantly and never reaches the pipelines.
+      # on the SAME keep-alive connection as the app requests. Exact matches
+      # dispatch before the catch-all, so the noise answers instantly and
+      # never reaches the pipelines.
       - path: "/favicon.ico"
         content_type: "image/x-icon"
         body: " "
       - path: "/"
         content_type: "text/html"
         body: "<html><body><h1>reverser</h1><p><a href=\"/messages?max=10\">/messages?max=10</a> — newest reversed messages</p><p>/reverse?msg=hello — insert</p></body></html>"
-      # The HANDLER_APP catch-all: the path (query included) forwards
-      # verbatim; each pipeline's dec LIT-asserts its own prefix, so the
-      # tee below is the router and an unclaimed path is a counted decode
-      # drop (30 s timeout — only reachable for paths beyond the two the
-      # app serves and the static noise above).
+      # The application catch-all: the target (query included) arrives
+      # verbatim, and `admit_either` routes it or answers 404.
       - path: "/"
         app: true
 
-  # ── A: GET /reverse?msg=… → INSERT INTO inbound ─────────────────
-  - name: dec_http_a
+  # ── A + C: GET /reverse?msg=… → INSERT; GET /messages?max=… → SELECT ──
+  - name: intake
     type: pipeline
     params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      decode: "7504014001000000700200750201100d0000000000000051700400710d002f726576657273653f6d73673d74400200000041"
-  - name: enc_sql_a
+      id_field: 1
+      target_field: 3
+      status_field: 4
+      ir_stages: "01ff730102070000001b0001000203000000120d002f726576657273653f6d73673d530300001f0000008400010002010000004001000000122e00494e53455254204f52205245504c41434520494e544f20696e626f756e6420286d7367292056414c55455320282701000203000000100d0000000000000001000203000000530100530900531f001202002729531f004002000000010002010000001001000000000000004202010240fe00000041070000001c0001000203000000120e002f6d657373616765733f6d61783d530300001b0000007e0001000201000000400100000012300053454c454354206d73672046524f4d207265766572736564204f524445522042592074732044455343204c494d49542001000203000000100e0000000000000001000203000000530100530900531f004002000000010002010000001002000000000000004202010240fe00000041060000001b00010002010000004001000000109401000000000000400400000041"
+      stage_kinds: "01"
+  - name: store
     type: pipeline
     params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      encode: "01000201000000620401602e00494e53455254204f52205245504c41434520494e544f20696e626f756e6420286d7367292056414c554553202827010002020000006160020027296a"
-  - name: pg_a
+      method: 3            # POST: a query, the SQL in the body
+      # The body: the SQL text the intake built, field 2.
+      encode: "01000202000000616a"
+      # The answer body whole — the rows — as field 2.
+      reply_decode: "78400200000041"
+  - name: pg_ac
     type: pg_client
     params:
       authority: "127.0.0.1:5432" # the ip loopback fastpath
       user: "lattice"
       database: "lattice"
-      cid_len: 4
-  - name: dec_pg_a
+  - name: reply
     type: pipeline
     params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      decode: "750401400100000078400200000041"
-  - name: enc_http_a
-    type: pipeline
-    params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      encode: "01000201000000620401600800c800000a00000300600a00746578742f706c61696e6003006f6b0a6a"
+      id_field: 1
+      status_field: 4
+      content_type_field: 5
+      answer: 1
+      ir_stages: "01ff3201020b0000002900010002fd00000010c80000000000000020010002fe00000002020000001001000000000000002030000b0000003c00010002fe000000020100000040010000001202006f6b400200000010c8000000000000004004000000120a00746578742f706c61696e400500000041050000001200010002fd00000010c8000000000000002000140000006e00010002fe000000020100000040010000001211003c68746d6c3e3c626f64793e3c7072653e01000202000000531f001214003c2f7072653e3c2f626f64793e3c2f68746d6c3e531f00400200000010c8000000000000004004000000120900746578742f68746d6c4005000000410c0000002e00010002fe000000020100000040010000001200004002000000010002fd0000004004000000120000400500000041"
+      stage_kinds: "01"
+      # The body: field 2.
+      encode: "01000202000000616a"
 
   # ── B: CDC put → keep_puts → reverse() → INSERT INTO reversed ───
   - name: dec_evt
@@ -267,6 +259,8 @@ modules:
       # [len:u16][key] → f2, [commit_ts:u64] → f1. Every kind decodes
       # cleanly; keep_puts filters.
       decode: "71020001007501014003000000700d00750201744002000000750801400100000041"
+      # Answer each event 200 once its record is accepted downstream.
+      ack: 1
   - name: keep_puts
     type: decision
     params:
@@ -279,6 +273,7 @@ modules:
     type: pipeline
     params:
       ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      method: 3            # POST: a query, the SQL in the body
       encode: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"
   - name: pg_b
     type: pg_client
@@ -286,35 +281,6 @@ modules:
       authority: "127.0.0.1:5432"
       user: "lattice"
       database: "lattice"
-
-  # ── C: GET /messages?max=… → SELECT → HTML ──────────────────────
-  - name: dec_http_c
-    type: pipeline
-    params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      decode: "7504014001000000700800710e002f6d657373616765733f6d61783d76400200000041"
-  - name: enc_sql_c
-    type: pipeline
-    params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      encode: "0100020100000062040160300053454c454354206d73672046524f4d207265766572736564204f524445522042592074732044455343204c494d49542001000202000000616a"
-  - name: pg_c
-    type: pg_client
-    params:
-      authority: "127.0.0.1:5432"
-      user: "lattice"
-      database: "lattice"
-      cid_len: 4
-  - name: dec_pg_c
-    type: pipeline
-    params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      decode: "750401400100000078400200000041"
-  - name: enc_http_c
-    type: pipeline
-    params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
-      encode: "01000201000000620401600600c80000090000010002020000006410250000000000000050620201600900746578742f68746d6c6011003c68746d6c3e3c626f64793e3c7072653e01000202000000616014003c2f7072653e3c2f626f64793e3c2f68746d6c3e6a"
 
   # (Observability fan-in trimmed: the netboot image ceiling is ~3.6 MB
   # and operations/adapter_metrics/compaction_coordinator bought the room.
@@ -409,13 +375,13 @@ wiring:
     to: kv_request_router.etcd_in
   - from: kv_request_router.etcd_out
     to: cdc_pump.kv_in
-  # Pipeline B is the pump's ordered-ack sink: it acks each event once the
-  # INSERT it produced is accepted downstream, and the pump's in-flight
+  # Pipeline B is the pump's ordered-ack sink: it answers each event once the
+  # record it produced is accepted downstream, and the pump's in-flight
   # window bounds how far the store can run ahead of the app.
-  - from: cdc_pump.publish_out
-    to: dec_evt.publish_in
-  - from: dec_evt.ack_out
-    to: cdc_pump.ack_in
+  - from: cdc_pump.request_out
+    to: dec_evt.request_in
+  - from: dec_evt.response_out
+    to: cdc_pump.response_in
 
   # ── Observability fan-in → operations → HTTP /metrics ───────────
 
@@ -425,63 +391,40 @@ wiring:
   - from: http.net_out
     to: ip.net_in
 
-  # One req_out, TWO consumers (tee): each dec asserts its own path.
-  - from: http.req_out
-    to: dec_http_a.record_in
-    buffer_group: 10
-  - from: http.req_out
-    to: dec_http_c.record_in
-    buffer_group: 11
-
-  # A
-  - from: dec_http_a.result_out
-    to: enc_sql_a.record_in
-  - from: enc_sql_a.result_out
-    to: pg_a.request_in
-    buffer_group: 12
-  - from: pg_a.net_out
+  # A + C
+  - from: http.request_out
+    to: intake.request_in
+  - from: intake.result_out
+    to: store.record_in
+  - from: store.request_out
+    to: pg_ac.request_in
+  - from: pg_ac.response_out
+    to: store.response_in
+  - from: store.result_out
+    to: reply.record_in
+  # The intake's grants and refusals reach `http` through `reply`, whose
+  # `response_out` is the one producer `http.response_in` takes.
+  - from: intake.response_out
+    to: reply.response_in
+  - from: reply.response_out
+    to: http.response_in
+  - from: pg_ac.net_out
     to: ip.net_in
   - from: ip.net_out
-    to: pg_a.net_in
-  - from: pg_a.reply_out
-    to: dec_pg_a.record_in
-    buffer_group: 13
-  - from: dec_pg_a.result_out
-    to: enc_http_a.record_in
-  - from: enc_http_a.result_out
-    to: http.resp_in
-    buffer_group: 14
+    to: pg_ac.net_in
 
-  # B (dec_evt.publish_in is fed by the pump above)
+  # B (dec_evt.request_in is fed by the pump above)
   - from: dec_evt.result_out
     to: keep_puts.record_in
   - from: keep_puts.result_out
     to: flip.record_in
   - from: flip.result_out
     to: enc_sql_b.record_in
-  - from: enc_sql_b.result_out
+  - from: enc_sql_b.request_out
     to: pg_b.request_in
-    buffer_group: 15
+  - from: pg_b.response_out
+    to: enc_sql_b.response_in
   - from: pg_b.net_out
     to: ip.net_in
   - from: ip.net_out
     to: pg_b.net_in
-
-  # C
-  - from: dec_http_c.result_out
-    to: enc_sql_c.record_in
-  - from: enc_sql_c.result_out
-    to: pg_c.request_in
-    buffer_group: 16
-  - from: pg_c.net_out
-    to: ip.net_in
-  - from: ip.net_out
-    to: pg_c.net_in
-  - from: pg_c.reply_out
-    to: dec_pg_c.record_in
-    buffer_group: 17
-  - from: dec_pg_c.result_out
-    to: enc_http_c.record_in
-  - from: enc_http_c.result_out
-    to: http.resp_in
-    buffer_group: 18

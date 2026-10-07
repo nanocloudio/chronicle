@@ -71,25 +71,27 @@ esac
 
 # ...and the other half: SUPPLY the binding and the same document lowers. This
 # is the deployment's answer to the document's question, and the whole reason
-# `resource` is a declaration rather than an endpoint literal. Every field here
-# is the PROVIDER's — module name, port names, param names — so binding a
-# different destination is this string changing, not chronicle changing.
-BIND='orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;database=orders'
+# `resource` is a declaration rather than an endpoint literal. The module and
+# param names are the PROVIDER's and the method the exchange contract's, so
+# binding a different destination is this string changing, not chronicle
+# changing.
+BIND='orders_store,pg,pg_client,0.1.0,POST,authority=127.0.0.1:5432;user=app;database=orders'
 out=$(cli graph "$eff" process bcm2712 "$BIND" 2>/dev/null)
 case "$out" in
   *"type: pg_client"*)
     if printf '%s' "$out" | grep -q 'authority: "127.0.0.1:5432"' &&
-       printf '%s' "$out" | grep -q 'to: pg.request_in'; then
-      ok "a bound resource lowers to its provider, ports and params"
+       printf '%s' "$out" | grep -q 'to: pg.request_in' &&
+       printf '%s' "$out" | grep -q 'method: 3'; then
+      ok "a bound resource lowers to its provider, its exchange and its params"
     else
-      no graph "bound effect lowered without the provider's params/ports: $(printf '%s' "$out" | head -3)"
+      no graph "bound effect lowered without the provider's params/exchange: $(printf '%s' "$out" | head -3)"
     fi ;;
   *) no graph "expected a lowered pg_client node, got: '$(printf '%s' "$out" | head -2)'" ;;
 esac
 
 # A numeric param is emitted UNQUOTED: a provider's u32 decoder rejects
 # `"250"`, and which params are numeric is the provider's fact.
-BIND_NUM='orders_store,mqtt,mqtt_sink,0.1.0,publish_in,ack_out,n,keepalive_s=#250;topic=orders'
+BIND_NUM='orders_store,mqtt,mqtt_sink,0.1.0,PUBLISH,keepalive_s=#250;topic=orders'
 out=$(cli graph "$eff" process bcm2712 "$BIND_NUM" 2>/dev/null)
 case "$out" in
   *"keepalive_s: 250"*) ok "a numeric param is emitted unquoted" ;;

@@ -9,34 +9,33 @@
 # fields authcode needs and transports them opaquely; it establishes no subject
 # and mints no code.
 #
-#   client ─HTTP→ http (wave)
-#            │ req_out (HttpRequest)  — body is
-#            │   <credential>\n<proof>\n<client_id>\n<redirect_uri>\n
-#            │   <scope>\n<state>\n<code_challenge>\n<nonce>
+#   client ─HTTP→ http (wave)             body is
+#            │ request_out                 <credential>\n<proof>\n<client_id>\n
+#            │                             <redirect_uri>\n<scope>\n<state>\n
+#            ↓                             <code_challenge>\n<nonce>
+#          intake     pipeline            provider: id, method and target as
+#            ↓                            fields; the body split on '\n' into
+#            │                            eight; `to_authorize`
+#          authorize  pipeline            requester: MSG_AUTHORIZE_REQ as the
+#            ⇅ request_out / response_in  body
+#          authcode (kagi)                authenticates the device, establishes
+#            ↓                            the subject, mints a single-use code
+#          reply      pipeline            `to_authz_answer`; carries the
+#            │ response_out               intake's own refusals too
 #            ↓
-#          dec_http       pipeline   rd bytecode: envelope → AuthzRequest
-#            ↓                        (splits the body on '\n' into 8 fields)
-#          route_authorize decision  idp.uproc's `to_authorize`
-#            ↓
-#          enc_authz      pipeline   ser bytecode: AuthzCall → AUTHORIZE_REQ
-#            ↓
-#          authcode (kagi)           authenticates the device, establishes the
-#            ↓                       subject, mints a single-use code
-#          dec_authz      pipeline   rd bytecode: AUTHORIZE_RESP → AuthzReply
-#            ↓
-#          route_ans      decision   idp.uproc's `to_authz_answer`
-#            ↓
-#          enc_http       pipeline   ser bytecode: Answer → HttpResponse
-#            ↓ resp_in
 #          http ─HTTP→ client
 #
-# TWO DECISION NODES, ONE PER JUNCTION, and the second matches KAGI'S authz
+# TWO DECISIONS, ONE PER JUNCTION, and the second matches KAGI'S authz
 # verdict. The code in the 200 body is kagi's, copied verbatim — the pipeline
 # builds no code and no redirect. That is C14 for /authorize.
 #
-# Run it with ./run.sh --authorize. See README.md.
+# `ir_stages` are `idp.uproc` compiled (`serve_authorize` and
+# `answer_authorize`; see chronicle_idp.yaml for the command). Run it with
+# ./run.sh --authorize. See README.md.
 target: linux
-tick_us: 100
+# Ten modules: a 100 µs tick is under what one pass of them can take, so the
+# tick is kagi's own e2e graphs' 500 µs.
+tick_us: 500
 
 scheduler:
   accept_cycles: true
@@ -48,7 +47,6 @@ modules:
   - name: http
     port: ${IDP_PORT:-15100}
     host_tcp: 1
-    max_body_kib: 64
     routes:
       - path: "/ws"
         websocket_fanout: true
@@ -59,39 +57,41 @@ modules:
         app: true
 
   # ── the request half ─────────────────────────────────────────────────────
-  - name: dec_http
+  - name: intake
     type: pipeline
     params:
-      # pass_azreq — the 12-field AuthzRequest identity.
-      ir_stages: "01ff91000500010100000012010000000500010200000012020000000500010300000012030000000500010400000012040000000500010500000012050000000500010600000012060000000500010700000012070000000500010800000012080000000500010900000012090000000500010a000000120a0000000500010b000000120b0000000500010c000000120c00000013"
-      # rd: [conn u16][stream u16][method u8]; skip flags; path_len+hdr_len,
-      # skip body_len, TAKEN → head; then UNTIL '\n' ×7 (credential, proof,
-      # client_id, redirect_uri, scope, state, code_challenge) and REST → nonce.
-      decode: "7502014001000000750201400200000075010140030000007001007502017502015070020074400c000000720a4004000000720a4005000000720a4006000000720a4007000000720a4008000000720a4009000000720a400a00000078400b00000041"
+      id_field: 1
+      method_field: 2
+      target_field: 3
+      # rd: UNTIL_OPT '\n' ×7 (credential, proof, client_id, redirect_uri,
+      # scope, state, code_challenge), REST → nonce. A short body pads with
+      # empty values rather than failing, and kagi says what they are worth.
+      decode: "7b0a40040000007b0a40050000007b0a40060000007b0a40070000007b0a40080000007b0a40090000007b0a400a00000078400b00000041"
+      # idp.uproc's `to_authorize`: POST /oauth/authorize → AuthzCall{…8
+      # fields}; anything else → an empty credential, which kagi refuses. The
+      # HTTP exchange id rides in `ctx`.
+      ir_stages: "01ff0301010c00000030000100020200000010030000000000000020010002030000001210002f6f617574682f617574686f72697a6553030030001e00000070000100020400000040040000000100020500000040050000000100020600000040060000000100020700000040070000000100020800000040080000000100020900000040090000000100020a000000400a0000000100020b000000400b0000000100020100000042010140fe00000041160000005000120000400400000012000040050000001200004006000000120000400700000012000040080000001200004009000000120000400a000000120000400b0000000100020100000042010140fe00000041"
+      stage_kinds: "01"
 
-  - name: route_authorize
-    type: decision
-    params:
-      # idp.uproc's `to_authorize`: POST /oauth/authorize → AuthzCall{…8 fields};
-      # anything else → empty credential, which kagi refuses.
-      decision: "010c000000300001000203000000100300000000000000200100020c0000001210002f6f617574682f617574686f72697a6553030030001f00000079000100020100000040010000000100020200000040020000000100020400000040030000000100020500000040040000000100020600000040050000000100020700000040060000000100020800000040070000000100020900000040080000000100020a00000040090000000100020b000000400a000000411700000059000100020100000040010000000100020200000040020000001200004003000000120000400400000012000040050000001200004006000000120000400700000012000040080000001200004009000000120000400a00000041"
-
-  - name: enc_authz
+  - name: authorize
     type: pipeline
     params:
-      # pass_azcall — the 10-field AuthzCall identity.
-      ir_stages: "01ff79000500010100000012010000000500010200000012020000000500010300000012030000000500010400000012040000000500010500000012050000000500010600000012060000000500010700000012070000000500010800000012080000000500010900000012090000000500010a000000120a00000013"
-      # ser: AUTHORIZE_REQ (0x39) [corr=conn|stream][method="POST"]
-      # [uri="/oauth/authorize"][credential f16][proof f16][client_id f8]
-      # [redirect_uri f16][scope f16][state f16][code_challenge f8][nonce f16].
-      encode: "6001003965010002010000006202010100020200000062020160050004504f535460120010002f6f617574682f617574686f72697a65010002030000006462020101000203000000610100020400000064620201010002040000006101000205000000646201010100020500000061010002060000006462020101000206000000610100020700000064620201010002070000006101000208000000646202010100020800000061010002090000006462010101000209000000610100020a000000646202010100020a00000061670201006a"
+      method: 3            # POST: a typed operation's request
+      # ser: MSG_AUTHORIZE_REQ (0x39) [method="POST"][uri="/oauth/authorize"]
+      # [credential f16][proof f16][client_id f8][redirect_uri f16]
+      # [scope f16][state f16][code_challenge f8][nonce f16] — the method and
+      # URI are the ones the DPoP proof is bound to.
+      encode: "600100396560050004504f535460120010002f6f617574682f617574686f72697a650100020400000064620201010002040000006101000205000000646202010100020500000061010002060000006462010101000206000000610100020700000064620201010002070000006101000208000000646202010100020800000061010002090000006462020101000209000000610100020a000000646201010100020a000000610100020b000000646202010100020b00000061670201006a"
+      # rd: MSG_AUTHORIZE_RESP (0x3A) — skip the envelope; [status u8] → 3,
+      # [code f16] → 4, [redirect_uri f16] → 5, [state f16] → 6.
+      reply_decode: "700300750101400300000075020174400400000075020174400500000075020174400600000041"
 
   # ── kagi: authenticate the device and mint a code ─────────────────────────
   #
   # authcode holds the device-cert keyset (verify_key), the client registry and
   # the code store (in security_state). It establishes the subject from the
-  # certificate; the client names none. The mint ports are wired because
-  # authcode refuses to construct without them, though /authorize does not mint.
+  # certificate; the client names none. The mint exchange is wired because
+  # authcode refuses to construct without it, though /authorize does not mint.
   - name: authcode
     iss: "https://issuer.authcode.test"
     aud: "https://rs.authcode.test"
@@ -114,37 +114,30 @@ modules:
       # not declare its authority refuses every request.
       authority: "single-node"
 
+  # The control carrier (see chronicle_idp.yaml): three channels of
+  # `auth_wire` envelopes.
   - name: ws
-    type: ws_stream
+    type: ws_net
   - name: mux
     type: remote_channel
+    channels: "OctetStream:tlv16:4096;OctetStream:tlv16:4096;OctetStream:tlv16:4096"
+    require_peer: 0
 
   # ── the reply half ────────────────────────────────────────────────────────
-  - name: dec_authz
+  - name: reply
     type: pipeline
     params:
-      # pass_azreply — the 6-field AuthzReply identity.
-      ir_stages: "01ff490005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000005000105000000120500000005000106000000120600000013"
-      # rd: skip the 3-byte envelope; [conn u16][stream u16][status u8]
-      # [code f16][redirect_uri f16][state f16].
-      decode: "70030075020140010000007502014002000000750101400300000075020174400400000075020174400500000075020174400600000041"
-
-  - name: route_ans
-    type: decision
-    params:
+      id_field: 1
+      status_field: 4
+      answer: 1
+      content_type: "text/plain"
       # idp.uproc's `to_authz_answer`: OK → 200 + the code; UNAUTHENTICATED →
       # 401; unknown-client / bad-redirect / no-PKCE → 400; every 5xx reason and
       # any unrecognised verdict → 503 (the default, the safe direction).
-      decision: "050500000012000100020300000010000000000000000020000c000000330001000201000000400100000001000202000000400200000010c8000000000000004003000000010002040000004004000000410500000012000100020300000010010000000000000020000b0000002f0001000201000000400100000001000202000000400200000010910100000000000040030000001200004004000000410500000012000100020300000010020000000000000020000b0000002f0001000201000000400100000001000202000000400200000010900100000000000040030000001200004004000000410500000012000100020300000010030000000000000020000b0000002f0001000201000000400100000001000202000000400200000010900100000000000040030000001200004004000000410500000012000100020300000010040000000000000020000b0000002f0001000201000000400100000001000202000000400200000010900100000000000040030000001200004004000000410b0000002f0001000201000000400100000001000202000000400200000010f7010000000000004003000000120000400400000041"
-
-  - name: enc_http
-    type: pipeline
-    params:
-      # pass_ans — the 4-field Answer identity.
-      ir_stages: "01ff310005000101000000120100000005000102000000120200000005000103000000120300000005000104000000120400000013"
-      # ser: HttpResponse [conn][stream][status][flags=0][ct_len=10][hdr_len=0]
-      # [body_len][content-type "text/plain"][body]. Reused verbatim.
-      encode: "010002010000006202010100020200000062020101000203000000620201600100006001000a60020000000100020400000064620201600a00746578742f706c61696e01000204000000616a"
+      ir_stages: "01ff9101050500000012000100020300000010000000000000000020000a0000002c00010002fe0000000201000000400100000010c800000000000000400400000001000204000000400200000041050000001200010002030000001001000000000000002000090000002800010002fe000000020100000040010000001091010000000000004004000000120000400200000041050000001200010002030000001002000000000000002000090000002800010002fe000000020100000040010000001090010000000000004004000000120000400200000041050000001200010002030000001003000000000000002000090000002800010002fe000000020100000040010000001090010000000000004004000000120000400200000041050000001200010002030000001004000000000000002000090000002800010002fe000000020100000040010000001090010000000000004004000000120000400200000041090000002800010002fe0000000201000000400100000010f7010000000000004004000000120000400200000041"
+      stage_kinds: "01"
+      # The body: field 2 — the code on 200, empty on every refusal.
+      encode: "01000202000000616a"
 
 wiring:
   - from: linux_net.net_out
@@ -152,45 +145,35 @@ wiring:
   - from: http.net_out
     to: linux_net.net_in
 
-  # The serving pipeline.
-  - from: http.req_out
-    to: dec_http.record_in
-    buffer_group: 1
-    buffer_bytes: 8192
-  - from: dec_http.result_out
-    to: route_authorize.record_in
-    buffer_bytes: 8192
-  - from: route_authorize.result_out
-    to: enc_authz.record_in
-    buffer_bytes: 8192
-  - from: enc_authz.result_out
-    to: authcode.requests
-    buffer_bytes: 8192
-  - from: authcode.replies
-    to: dec_authz.record_in
-    buffer_bytes: 8192
-  - from: dec_authz.result_out
-    to: route_ans.record_in
-    buffer_bytes: 8192
-  - from: route_ans.result_out
-    to: enc_http.record_in
-    buffer_bytes: 8192
-  - from: enc_http.result_out
-    to: http.resp_in
-    buffer_group: 2
-    buffer_bytes: 8192
+  # The serving chain.
+  - from: http.request_out
+    to: intake.request_in
+  - from: intake.result_out
+    to: authorize.record_in
+  - from: authorize.request_out
+    to: authcode.request_in
+  - from: authcode.response_out
+    to: authorize.response_in
+  - from: authorize.result_out
+    to: reply.record_in
+  - from: intake.response_out
+    to: reply.response_in
+  - from: reply.response_out
+    to: http.response_in
 
-  # Websocket key/record chain.
+  # The control carrier.
   - from: ws.tx_out
     to: http.ws_in
     buffer_group: 3
   - from: http.ws_out
     to: ws.rx_in
     buffer_group: 4
-  - from: ws.rx_out
-    to: mux.transport_rx
-  - from: mux.transport_tx
-    to: ws.tx_in
+  - from: http.ws_event_out
+    to: ws.event_in
+  - from: ws.net_out
+    to: mux.transport_in
+  - from: mux.transport_out
+    to: ws.net_in
 
   # ch0: the mint's signing keys in, announced public halves back (authcode
   # refuses to construct without the mint wired; /authorize does not mint).
@@ -207,12 +190,13 @@ wiring:
   - from: security_state.replies
     to: mux.ch2
 
-  # authcode ↔ ledger, and ↔ mint (internal).
+  # authcode ↔ ledger, and authcode as the requester of the mint's exchange
+  # (internal).
   - from: authcode.state_requests
     to: security_state.requests
   - from: security_state.replies
     to: authcode.state_replies
   - from: authcode.mint_out
-    to: token_mint.mint_requests
-  - from: token_mint.tokens
+    to: token_mint.request_in
+  - from: token_mint.response_out
     to: authcode.mint_in

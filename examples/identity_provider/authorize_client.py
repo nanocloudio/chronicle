@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Operator + client for the OIDC /authorize leg, end to end over HTTP.
 
-The OPERATOR half provisions the graph over the websocket mux, off the serving
-path:
+The OPERATOR half provisions the graph over the control carrier
+(`control.py`), off the serving path:
   ch1  the device-certificate VERIFY key (so authcode can authenticate the cert)
   ch2  the client registry record (redirect_uri + registered scope)
 
@@ -16,7 +16,11 @@ than the client is registered for, to show authcode clamps it.
 Ed25519 throughout, via openssl. The issuer-dc and device private keys never
 leave this script; authcode never mints here — /authorize only issues a code.
 """
-import base64, hashlib, json, os, socket, struct, subprocess, sys, tempfile, time
+import base64, hashlib, json, os, struct, subprocess, sys, tempfile, time
+
+sys.dont_write_bytecode = True   # leave no __pycache__ in the example
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from control import Control, envelope, http_post  # noqa: E402
 
 MSG_KEY_ADD = 0x22
 MSG_STATE_PUT_ABS = 0x61
@@ -26,7 +30,6 @@ STATE_ACTIVE = 1
 KEY_USE_VERIFY = 0x01
 NS_OAUTH_CLIENT = 8
 CLIENT_ID_BYTE = 9
-MUX_MAGIC = 0xFC
 
 ISSUER = b"https://issuer.authcode.test"
 DEVICE_ID = b"dev_authcode_alice"
@@ -40,7 +43,7 @@ VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 def b64u(b):  return base64.urlsafe_b64encode(b).rstrip(b"=")
 def f8(b):    return bytes([len(b)]) + b
 def f16(b):   return struct.pack("<H", len(b)) + b
-def env(t, p): return bytes([t]) + struct.pack("<H", len(p)) + p
+env = envelope
 
 def openssl(args, inp=None):
     return subprocess.run(["openssl", *args], check=True, capture_output=True,
@@ -91,45 +94,6 @@ def put_abs(namespace, key, value):
         struct.pack("<I", 1) + bytes([CLIENT_ID_BYTE, namespace]) + f8(key)
         + f16(value) + struct.pack("<Q", 0))
 
-class Ws:
-    def __init__(self, host, port, path="/ws"):
-        key = base64.b64encode(os.urandom(16))
-        self.s = socket.create_connection((host, port), timeout=5)
-        self.s.sendall(b"GET " + path.encode() + b" HTTP/1.1\r\nHost: " + host.encode()
-            + b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            + b"Sec-WebSocket-Key: " + key + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
-        head = b""
-        while b"\r\n\r\n" not in head:
-            head += self.s.recv(4096)
-        if b"101" not in head.split(b"\r\n")[0]:
-            sys.exit("ws upgrade refused: " + head.split(b"\r\n")[0].decode())
-    def send(self, ch, payload):
-        frame = bytes([MUX_MAGIC, ch]) + struct.pack("<H", len(payload)) + payload
-        mask = os.urandom(4)
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(frame))
-        n = len(frame)
-        hdr = bytes([0x82]) + (bytes([0x80 | n]) if n < 126
-              else bytes([0x80 | 126]) + struct.pack(">H", n))
-        self.s.sendall(hdr + mask + masked)
-        time.sleep(0.2)
-    def close(self):
-        self.s.close()
-
-def http_post(port, path, body):
-    s = socket.create_connection(("127.0.0.1", port), timeout=10)
-    req = (f"POST {path} HTTP/1.1\r\nHost: idp\r\nContent-Type: text/plain\r\n"
-           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
-    s.sendall(req)
-    resp = b""
-    while True:
-        c = s.recv(4096)
-        if not c: break
-        resp += c
-    s.close()
-    head, _, payload = resp.partition(b"\r\n\r\n")
-    status = int(head.split()[1])
-    return status, payload
-
 if __name__ == "__main__":
     port = int(sys.argv[1])
     with tempfile.TemporaryDirectory() as d:
@@ -138,16 +102,18 @@ if __name__ == "__main__":
         dc_pub = ed25519_keypair(dc_key)
         dev_pub = ed25519_keypair(dev_key)
 
-        ws = Ws("127.0.0.1", port)
+        ctl = Control(port)
         # ch1: the device-cert verify key.
-        ws.send(1, key_record(PROFILE_DEVICE_CERT, b"dc-k1", SUITE_ED25519,
+        ctl.send(1, key_record(PROFILE_DEVICE_CERT, b"dc-k1", SUITE_ED25519,
                               STATE_ACTIVE, KEY_USE_VERIFY, dc_pub))
         # ch2: the client registry (redirect_uri + registered scope).
         client_rec = (b'{"redirect_uri":"' + REDIRECT_URI + b'","scope":"'
                       + REG_SCOPE + b'"}')
-        ws.send(2, put_abs(NS_OAUTH_CLIENT, CLIENT, client_rec))
-        time.sleep(1.0)
-        ws.close()
+        ctl.send(2, put_abs(NS_OAUTH_CLIENT, CLIENT, client_rec))
+        # Ready once the ledger has acknowledged the client record. The
+        # session stays open: the ledger's replies to authcode fan out to
+        # ch2 as well.
+        ctl.wait_records(2, 1)
 
         # The device certificate (dc+jwt), signed by the issuer-dc key.
         cert = jws(dc_key,
@@ -170,3 +136,4 @@ if __name__ == "__main__":
         status, code = http_post(port, "/oauth/authorize", body)
         print(f"STATUS {status}")
         print(code.decode(errors="replace"))
+        ctl.close()

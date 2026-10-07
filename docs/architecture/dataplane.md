@@ -11,7 +11,7 @@ emits the params.
 | Module | Role | Param(s) |
 |--------|------|----------|
 | `app/expression` | one checked-CEL Expression | `program`, `max_cost` |
-| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `reply_decode` |
+| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning + the exchange roles | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `reply_decode`; exchange: `id_field`, `method_field`, `target_field`, `headers_field`, `status_field`, `content_type_field`, `method`, `content_type`, `answer`, `ack` |
 | `app/aggregation` | event-time stateful engine | `ir_def` |
 | `app/decision` | first-hit rule container | `decision` |
 | `app/sensor_intake` | `SensorSample` → typed record frame | — |
@@ -46,8 +46,8 @@ The engines reserve `240..=255`. Three of those numbers have fixed meanings;
 | Number | Type | Meaning |
 |---|---|---|
 | `255` | string or bytes | the [version selector](versioning.md) |
-| `254` | message | the **carry** (`CARRY_FIELD`): the record's carried context, a nested message every connector returns unchanged, so a request built before an effect and the reply handled after it share no state but the record. On the [exchange surface](connectors.md#the-exchange-surface) it travels as the `msg_key` |
-| `253` | int | the **exchange status** (`EXCHANGE_STATUS_FIELD`) on a record made from a provider's reply: `0` answered, `1..=15` the contract's refusals. A payload's own field 253 is replaced by it |
+| `254` | message | the **carry** (`CARRY_FIELD`): the record's carried context, a nested message that comes back unchanged on the record made from an effect's answer, so a request built before an effect and the answer handled after it share no state but the record. On the [exchange surface](connectors.md#the-exchange-surface) the requester keeps it beside the open exchange; it never reaches the provider |
+| `253` | int | the **exchange status** (`EXCHANGE_STATUS_FIELD`) on a record made from a provider's answer: the HTTP status code it answered with. A body's own field 253 is replaced by it |
 
 A field with one of these numbers has its reserved meaning whatever the schema
 calls it, so the schema compiler accepts a reserved number only as its fixed type
@@ -59,7 +59,7 @@ message** crosses a frame as its own frame, typed `3`: a construction that is
 another construction's field value packs into one (`FRAME_PACK`), a path through
 a message-typed field reads it (`GET_FIELD`), and passing it on keeps its type. A
 byte-string field is never read as a message, and a map stage's elements are
-messages. A connector that returns the carry returns its type byte with it. `encode_frame` / `decode_frame` in `pipeline_core.rs`
+messages. The carry is restored with its type byte. `encode_frame` / `decode_frame` in `pipeline_core.rs`
 are the single codec for this format.
 
 ## The pipeline module
@@ -71,7 +71,9 @@ input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶
 ```
 
 - **decode** (optional `decode` param): a [byte-deserialization](../guides/wire-codec.md)
-  program that parses a raw protocol reply into a record frame before the stages.
+  program that parses the bytes arriving — a raw chunk on `record_in`, or a
+  collected request's body — into a record frame before the stages.
+  `reply_decode` does the same for a requester's answer bodies.
 - **version select**: the record's `X-Module-Version` selector (field 255) resolves
   to one of the loaded [versions](versioning.md); unknown ⇒ fail closed.
 - **stages**: an ordered chain of stage programs (see [stage kinds](#stage-kinds)).
@@ -127,12 +129,14 @@ the calling Stage's `MapSpec`, and lowered into the surrounding compute run's
 node — a map does not branch, so it is a stage, not a node. Its body is copied
 verbatim like a decision's; see `MAP_STAGE_COST`.
 
-The pipeline also speaks the ordered-ack exchange surface in both directions:
-wire `publish_out`/`ack_in` and results leave as correlated publishes to any
-provider of the surface; wire `publish_in`/`ack_out` and the pipeline is the
-sink, taking each publish's payload as its record and acknowledging it once
-its output is accepted downstream (see
-[connectors.md](connectors.md#the-exchange-surface)).
+The pipeline also meets the exchange contract, in the role its wired ports
+choose: a provider (`request_in` + `response_out`) takes each request as a
+record and, with `ack`, answers it once that record's output is accepted
+downstream; an answering node (`response_out` with `answer`) makes its result
+the response; a requester (`request_out` + `response_in`) makes its result a
+request and each answer a record; a relay passes an exchange on under its own
+id. The parts of an exchange other than its body map to data fields (see
+[connectors.md](connectors.md#the-pipeline-on-the-surface)).
 
 ## The aggregation module
 

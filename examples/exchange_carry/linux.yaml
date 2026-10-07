@@ -1,14 +1,15 @@
-# THE CARRY ACROSS AN EXCHANGE — a request's context leaves in the msg_key and
-# comes back on the reply, so the stage handling the answer has what the stage
-# that asked had, and nothing between them holds state.
+# THE CARRY ACROSS AN EXCHANGE — a request's context stays beside the open
+# exchange and comes back on the answer record, so the stage handling the answer
+# has what the stage that asked had, and nothing outside the record holds it.
 #
-#   cli_in ─▶ pipeline ─publish_out─▶ http (exchange client) ─▶ origin
-#                ▲ reply_in ◀─reply_out─┘   (the reply IS the ack)
+#   cli_in ─▶ pipeline ─request_out─▶ http (client) ─▶ origin
+#                ▲ response_in ◀─response_out─┘
 #                └─ result_out ─▶ cli_out
 #
-# The record carries its context in field 254 (a nested message, as a frame).
-# The pipeline lifts it into the publish's msg_key; the reply echoes the key;
-# the pipeline restores it as 254 on the reply record, beside the decoded body
+# The record names its method (2) and target (3) as data fields, mapped by
+# `method_field` / `target_field`; `encode` writes only the body, field 4. Its
+# context rides in field 254 (a nested message, as a frame), which the requester
+# keeps per exchange and restores on the answer record beside the decoded body
 # (5) and the exchange status (253). `tools/e2e/exchange-carry.sh` drives it.
 target: linux
 tick_us: 100
@@ -25,12 +26,14 @@ modules:
     params:
       # Rec{method, path, body, ctx} copied whole — `ctx: r.ctx` is the carry.
       ir_stages: "01ff3100050001020000001202000000050001030000001203000000050001040000001204000000050001fe00000012fe00000013"
-      # [method:u8][path_len:u16 LE][body_len:u16 LE][path][body] — the http
-      # client's request record, from fields 2, 3, 4.
-      encode: "0100020200000062010101000203000000646202010100020400000064620201010002030000006101000204000000616a"
-      # The reply payload (the response body) whole, as field 5.
+      method_field: 2
+      target_field: 3
+      # The request body: field 4's bytes.
+      encode: "01000204000000616a"
+      # The answer body whole, as field 5.
       reply_decode: "78400500000041"
   - name: http
+    # The client's provider ports live in its `exchange` variant.
     variant: exchange
     params:
       mode: 1              # client
@@ -40,10 +43,10 @@ modules:
 wiring:
   - from: cli_in.stdin_out
     to: pipeline.record_in
-  - from: pipeline.publish_out
-    to: http.publish_in
-  - from: http.reply_out
-    to: pipeline.reply_in
+  - from: pipeline.request_out
+    to: http.request_in
+  - from: http.response_out
+    to: pipeline.response_in
   - from: pipeline.result_out
     to: cli_out.bytes_in
   - from: http.net_out

@@ -39,7 +39,6 @@ modules:
 wiring:
   - from: cli_in.stdin_out
     to: sensor_intake.sample
-    buffer_group: 1
   - from: sensor_intake.record_out
     to: decision.record_in
   - from: decision.result_out

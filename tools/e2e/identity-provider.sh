@@ -2,9 +2,10 @@
 # The reference identity provider E2E: `examples/identity_provider/run.sh
 # --verify`, run as a CI gate rather than left as something a reader might
 # run by hand. An example nobody's CI executes is an example that rots, and
-# this one composes four repos' artefacts — chronicle's engines, wave's http
-# and ws_stream, kagi's token_verify and remote_channel — so it breaks for
-# reasons none of them can see alone.
+# this one composes four repos' artefacts — chronicle's pipeline, wave's http
+# and ws_net, kagi's typed operations and ledger, fluxor's remote_channel —
+# all meeting on the exchange contract, so it breaks for reasons none of them
+# can see alone.
 #
 # `run.sh` owns the assertions (every arm of the chain, each status compared
 # exactly, plus the 200's body and the 401's absence of one). This driver's

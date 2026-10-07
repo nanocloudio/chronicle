@@ -1,19 +1,21 @@
-# A PIPELINE PUBLISHING THROUGH THE ORDERED-ACK EXCHANGE SURFACE.
+# A PIPELINE PUBLISHING THROUGH THE EXCHANGE CONTRACT.
 #
 # The point of this graph is what is NOT in it. The pipeline names no broker,
-# no topic, no protocol: it doubles order.amount (an IR stage) and emits the
-# result as a `SinkPublish` frame on `publish_out`. Everything MQTT lives in
-# quantum's `mqtt_sink`, which is reached only by a wire.
+# no topic, no protocol: it doubles order.amount (an IR stage) and asks for
+# each result to be PUBLISHED, as a request on `request_out`. Everything MQTT
+# lives in quantum's `mqtt_sink`, which is reached only by a wire.
 #
 # Swapping the destination is one line — `mqtt_sink` becomes `kafka_sink` or
 # `amqp_sink`, which declare the same `stream.ordered_ack.sink` capability and
-# the same port pair — and the pipeline is untouched. That is the whole thesis
-# of the surface, and this is the graph that demonstrates it.
+# the same ports — and the pipeline is untouched. That is the whole thesis of
+# the contract, and this is the graph that demonstrates it.
 #
-# The pipeline carries no `encode` program: there is no publish frame to
-# hand-render, because framing for the surface is the contract's, not the
-# graph author's. And because the sink answers on `ack_out`, the pipeline
-# learns whether each record was durably accepted.
+# The pipeline carries no `encode` program: the record itself is the body, and
+# the exchange records around it are the contract's to frame, not the graph
+# author's. Because the sink answers every request on `response_out`, the
+# pipeline learns whether each record was durably accepted: each answer leaves
+# on `result_out` as a record holding its status at field 253, 200 once the
+# broker has the record.
 #
 #   fluxor run examples/pipeline_egress/linux.yaml
 target: linux
@@ -30,6 +32,7 @@ modules:
     params:
       # One stage: {1: id, 2: amount * 2}, as `chronicle compile-stages` emits it.
       ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+      method: 9            # PUBLISH
   - name: mqtt_sink
     params:
       authority: "127.0.0.1:11883"
@@ -39,11 +42,13 @@ modules:
 wiring:
   - from: cli_in.stdin_out
     to: pipeline.record_in
-  # The surface: records out, durable acks back.
-  - from: pipeline.publish_out
-    to: mqtt_sink.publish_in
-  - from: mqtt_sink.ack_out
-    to: pipeline.ack_in
+  # The exchange: records out as publishes, durable answers back.
+  - from: pipeline.request_out
+    to: mqtt_sink.request_in
+  - from: mqtt_sink.response_out
+    to: pipeline.response_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in
   # Transport, owned by the provider.
   - from: mqtt_sink.net_out
     to: linux_net.net_in

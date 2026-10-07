@@ -10,8 +10,8 @@
 #                           ↓                     else → EMPTY message = DROP
 #                         flip       pipeline     msg.reverse() — the compute
 #                           ↓
-#                         enc_sql    pipeline     ser: INSERT INTO reversed…
-#                           ↓ request_in
+#                         enc_sql    pipeline     requester: INSERT INTO
+#                           ⇅                     reversed… as the body
 #                         pg_client  (lattice)    same store the row came from
 #
 # The load-bearing simplifications, both consequences of the schema:
@@ -27,9 +27,10 @@
 # which the decision engine counts as `dropped` and routes nowhere — the
 # filter is POLICY in the decision table, not a special node.
 #
-# No reply path: an INSERT with no cid prefix produces no reply record, and
-# `reply_out` stays unwired. At-least-once delivery + INSERT of the same pk
-# = the duplicate collapses in the store (README).
+# The answer ends the chain: `enc_sql`'s `result_out` is unwired, so each
+# INSERT's answer status is its record's outcome, and its window frees the
+# next INSERT. At-least-once delivery + INSERT of the same pk = the duplicate
+# collapses in the store (README).
 target: linux
 tick_us: 100
 
@@ -80,10 +81,11 @@ modules:
     type: pipeline
     params:
       ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      method: 3            # POST: a query, the SQL in the body
       # INSERT INTO reversed (ts, msg) VALUES (<ts>, '<msg>')
       encode: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"
 
-  # ── lattice: the SQL connector (no cid — nothing awaits this reply) ──────
+  # ── lattice: the SQL connector ─────────────────────────────────────────
   - name: pg_client
     params:
       authority: "127.0.0.1:${REV_PG_PORT:-15432}"
@@ -106,9 +108,10 @@ wiring:
     to: flip.record_in
   - from: flip.result_out
     to: enc_sql.record_in
-  - from: enc_sql.result_out
+  - from: enc_sql.request_out
     to: pg_client.request_in
-    buffer_group: 2
+  - from: pg_client.response_out
+    to: enc_sql.response_in
 
   - from: pg_client.net_out
     to: linux_net.net_in

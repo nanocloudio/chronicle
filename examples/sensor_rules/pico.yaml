@@ -49,10 +49,9 @@ wiring:
   # `SensorSample` is a framed record envelope, so this edge runs in mailbox
   # mode: a 24-byte fixed-layout reading handed over in halves would decode
   # plausible values from the wrong offsets and a rule would fire on them. The
-  # composer enforces this rather than trusting the author to remember it.
+  # composer reads that from the content type, so the graph never has to say it.
   - from: temp_sensor.reading
     to: sensor_intake.sample
-    buffer_group: 1
 
   - from: sensor_intake.record_out
     to: decision.record_in

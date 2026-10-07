@@ -13,24 +13,23 @@
 // measures stage execution with no scheduler and no channels.
 module bench.http {
 
-  // wave's HttpRequest, projected. `stream_id` is wave's monotonic request
-  // GENERATION and the response must echo it, or the answer matches no slot
-  // and is dropped.
+  // The request as the provider maps it: `xid` is the exchange id wave's
+  // `http` chose, `method` and `path` the HEAD's method and target. The
+  // two-node split carries `xid` so the second node answers the right
+  // exchange; the single node answers the request it collected.
   message bench.Request {
-    conn_id: int = 1;
-    stream_id: int = 2;
-    method: int = 3;
-    path: string = 4;
+    xid: bytes = 1;
+    method: int = 2;
+    path: string = 3;
   }
 
-  // What the response encoder needs. The BODY is a literal in the encode
-  // program rather than a field: the point of measurement is the engine and
-  // the hop, so the payload is held identical to the baseline route's body
-  // and never travels through the VM.
+  // What the answer needs: its exchange and its status. The BODY is a literal
+  // in the encode program rather than a field: the point of measurement is the
+  // engine and the hop, so the payload is held identical to the baseline
+  // route's body and never travels through the VM.
   message bench.Reply {
-    conn_id: int = 1;
-    stream_id: int = 2;
-    status: int = 3;
+    xid: bytes = 1;
+    status: int = 4;
   }
 
   enum OK = 200;
@@ -38,16 +37,13 @@ module bench.http {
   // Deliberately trivial. A heavier transformation would measure the VM, which
   // the release microbenchmark already prices at 98.6 ns for three opcodes.
   transformation respond(r: bench.Request) -> bench.Reply {
-    bench.Reply { conn_id: r.conn_id, stream_id: r.stream_id, status: OK }
+    bench.Reply { xid: r.xid, status: OK }
   }
 
   // The two-node split: each node runs one half, so the pair differs from the
   // single node by exactly one channel hop.
   transformation pass(r: bench.Request) -> bench.Request {
-    bench.Request {
-      conn_id: r.conn_id, stream_id: r.stream_id,
-      method: r.method, path: r.path
-    }
+    bench.Request { xid: r.xid, method: r.method, path: r.path }
   }
 
   pipeline serve(req: bench.Request) -> bench.Reply {

@@ -10,10 +10,9 @@ version = "0.0.1"
 # target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
 [dependencies]
 fluxor = "0.0.1"
-# Protocol modules (http, ws_stream, rtp, websocket) live in wave since the
-# extraction from fluxor. `examples/grpc_h2/` composes wave's `http` in client
-# and server mode; without this the module resolves only from a stale lockfile
-# entry that still attributes it to `fluxor`.
+# wave owns the protocol modules (http, s3, ws_stream, rtp, websocket).
+# `examples/grpc_h2/` composes `http` in client and server mode, and
+# `examples/oci_registry/` signs its storage requests with `s3`.
 wave = "0.0.1"
 # kagi owns the identity protocols. `examples/identity_provider/` composes its
 # modules: the IdP is chronicle's generic engines routing to kagi's, and
@@ -23,9 +22,8 @@ kagi = "0.0.1"
 # composes quantum's `mqtt_sink`, an ordered-ack provider, so the pipeline
 # publishes through the contract and names no protocol.
 quantum = "0.0.1"
-# loam supplies the object/metadata tier the registry stores into. The SigV4
-# S3 connector itself is wave's `s3` module: signing an HTTP request is
-# protocol work, and it moved to the project that owns protocols.
+# loam supplies the storage tier the registry stores into: the `loam-s3`
+# service bundle, an S3 endpoint over one loam storage node.
 loam = "0.0.1"
 # lattice supplies `pg_client`, the reverser's SQL connector, plus the
 # reverser's storage-tier graph (pg_edge_anchor, cdc_pump, …); clustor is that

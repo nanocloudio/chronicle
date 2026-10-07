@@ -20,9 +20,9 @@ timer_class      = "agnostic"
 #           — six i64 fields, numbered 1 value, 2 scale, 3 t_micros, 4 seq,
 #           5 sensor_id, 6 flags.
 
-# Input: one whole reading. `buffer_group` is REQUIRED on the producing edge —
-# `SensorSample` is a framed record envelope, and the composer enforces that — so
-# a 24-byte fixed-layout record is never handed over in halves.
+# Input: one whole reading. `SensorSample` is a framed record envelope, so the
+# composer gives the producing edge a mailbox group of its own and a 24-byte
+# fixed-layout record is never handed over in halves.
 [[ports]]
 name         = "sample"
 direction    = "input"

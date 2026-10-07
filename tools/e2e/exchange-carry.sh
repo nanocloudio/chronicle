@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# THE CARRY ACROSS AN EXCHANGE, live: a record's context (field 254) leaves as
-# the publish's msg_key and comes back on the reply, restored as 254 on the
-# reply record — with the decoded body (5) and the exchange status (253).
+# THE CARRY ACROSS AN EXCHANGE, live: a record's context (field 254) stays with
+# the requester while the exchange is open and comes back restored as 254 on the
+# answer record — with the decoded body (5) and the exchange status (253).
 #
-# Asserted exactly: the reply record is built independently here from the
+# Asserted exactly: the answer record is built independently here from the
 # documented frame layout, and must equal what the graph emitted byte for byte.
 #
 # The bound is asserted from both sides, in one graph: a carry of exactly
@@ -40,7 +40,8 @@ if [ -n "${HTTP_PORT:-}" ]; then
 fi
 
 # frame(fields) -> hex; a field is (number, int | bytes | Msg). KEY_MAX is the
-# exchange contract's msg_key ceiling, which the pipeline's KEY_BUF tracks.
+# exchange contract's key ceiling, which the pipeline's KEY_BUF (the largest
+# carry it keeps) tracks.
 read -r REC_HEX WANT_HEX EDGE_HEX EDGE_WANT_HEX BIG_HEX < <(python3 - <<'PY'
 import struct
 KEY_MAX = 512
@@ -62,10 +63,10 @@ def carry(n):
     return c
 ctx = Msg(frame([(30, 7), (31, b"req-7")]))
 rec = frame([(2, 1), (3, b"/carry"), (4, b""), (254, ctx)])
-want = frame([(5, b"echo:/carry"), (254, ctx), (253, 0)])
+want = frame([(5, b"echo:/carry"), (254, ctx), (253, 200)])
 edge_ctx = carry(KEY_MAX)
 edge = frame([(2, 1), (3, b"/edge"), (4, b""), (254, edge_ctx)])
-edge_want = frame([(5, b"echo:/edge"), (254, edge_ctx), (253, 0)])
+edge_want = frame([(5, b"echo:/edge"), (254, edge_ctx), (253, 200)])
 big = frame([(2, 1), (3, b"/big"), (4, b""), (254, carry(KEY_MAX + 1))])
 print(rec.hex(), want.hex(), edge.hex(), edge_want.hex(), big.hex())
 PY
@@ -76,7 +77,7 @@ PY
 # is untouched.
 OBSERVE='/^wiring:/i\  - name: observe\n    params:\n      interval_ms: 100'
 
-# carry_refused is pipeline metric id 28 (modules/app/pipeline/manifest.toml).
+# carry_refused is pipeline metric id 29 (modules/app/pipeline/manifest.toml).
 # MON_METRIC names a module by its instance index, which the runtime's own
 # load log gives (`module N caps: …` then `loaded pipeline`) — read, not assumed.
 mod_index() { # <stderr file> <module name>
@@ -87,7 +88,7 @@ refused_count() { # <stderr file> -> the highest carry_refused value reported
   local m
   m=$(mod_index "$1" pipeline)
   [ -n "$m" ] || return 0
-  grep -oE "MON_METRIC mod=$m id=28 kind=1 val=[0-9]+" "$1" 2>/dev/null \
+  grep -oE "MON_METRIC mod=$m id=29 kind=1 val=[0-9]+" "$1" 2>/dev/null \
     | grep -oE '[0-9]+$' | sort -n | tail -1
 }
 
@@ -111,9 +112,9 @@ elif build_graph examples/exchange_carry/linux.yaml \
     *)             no carry "origin saw '$saw'" ;;
   esac
   if [ "$got" = "$WANT_HEX" ]; then
-    ok "the reply record carries the body, the SAME carry, and status 0"
+    ok "the answer record carries the body, the SAME carry, and status 200"
   else
-    no carry "reply record: want $WANT_HEX, got '$got'"
+    no carry "answer record: want $WANT_HEX, got '$got'"
   fi
 
   # AT the bound: a carry of exactly KEY_MAX bytes goes out and comes back

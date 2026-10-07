@@ -28,10 +28,10 @@ out of the VM's scope.
 
 What the VM does own is **framing a message** at a pipeline edge — the `ser`/`rd`
 byte programs, see [the byte-codec guide](../guides/wire-codec.md).
-`examples/identity_provider/` uses `encode` to render the HTTP requests kagi's
-modules consume. `examples/pipeline_egress/` needs no such program: publishing
-on the ordered-ack surface renders no frame, because framing there belongs to
-the contract rather than the graph author.
+A program only ever frames a BODY: the exchange records around it — ids,
+methods, targets, statuses — map to record fields and are written by the
+pipeline itself, because framing them belongs to the contract rather than the
+graph author.
 
 ## How an effect binds
 
@@ -48,155 +48,189 @@ the deployment answers separately, one binding per resource, and
 `chronicle graph <doc> <pipeline> [target] [bindings]` takes them on device:
 
 ```
-<resource>,<kind>,<provider>,<version>,<in_port>,<out_port>,<r|n>,<params>
+<resource>,<kind>,<provider>,<version>,<method>,<params>
 ```
 
 ```
-orders_store,pg,pg_client,0.1.0,request_in,reply_out,r,authority=127.0.0.1:5432;user=app;cid_len=#4
-feed,kafka,kafka_sink,0.1.0,publish_in,ack_out,n,authority=10.0.0.1:9092;topic=orders
+orders_store,pg,pg_client,0.1.0,POST,authority=127.0.0.1:5432;user=app;database=orders
+feed,mqtt,mqtt_sink,0.1.0,PUBLISH,authority=10.0.0.1:1883;keepalive_s=#60;topic=orders
 ```
 
-Every field is the provider's: the module name, the version tag it publishes
-under, the port pair, and the param names. Chronicle transports them and
-checks the shape. `r`/`n` says whether the provider answers with data a next
-stage can read; a value led by `#` is numeric and is emitted unquoted, because
-a provider's `u32` decoder rejects `"4"`. Bindings are joined by `|`,
-so `|`, `,`, `;` and `=` cannot appear inside a value.
+The module name, the version tag it publishes under and the param names are
+the provider's; Chronicle transports them and checks the shape. `<method>` is
+the exchange method each request asks — an HTTP method token, or `PUBLISH` for
+a durable destination — and resolves through the exchange contract's own table,
+so an unknown word refuses the binding. A value led by `#` is numeric and is
+emitted unquoted, because a provider's `u32` decoder rejects `"60"`. Bindings
+are joined by `|`, so `|`, `,`, `;` and `=` cannot appear inside a value. No
+binding names a port: every provider takes requests on `request_in` and answers
+on `response_out`.
 
 The planner ([`plan_core.rs`](../../modules/common/plan_core.rs)) turns each
 binding into a `Connector` — the graph node's `type:`, its store pin
-`<silicon>/<provider>:<version>`, its port pair and its params. Each binding
+`<silicon>/<provider>:<version>`, its method and its params. Each binding
 carries its own version tag because siblings release independently.
 `plan_provider_pins` computes the pins, the driver records them in `fluxor.lock`
 and composes `fluxor slot-image`, which resolves them from the OCI store and
 emits the OTA bundle, and
 [`graph_core.rs`](../../modules/common/graph_core.rs) renders the wired graph.
 
-Two refusals are deliberate. An unbound resource is a deployment error and is
-reported as one; the document is not at fault for declining to name an
-endpoint. And a stage after a non-replying effect (`n`) is refused
-(`GraphError::EffectNotChainable`): that provider's output port carries an
-acknowledgement or a status line, not a record, so wiring it into the next
-node's `record_in` would build a graph that runs and feeds a record parser
-bytes that are not a record.
+An effect is a request the pipeline node before it asks. That node becomes the
+**requester** (`method:` set, `request_out` to the provider's `request_in`,
+the provider's `response_out` back to its `response_in`), and each answer
+continues the chain from its `result_out`. The provider hangs off its
+requester; it is not a link in the record chain. With no compute node free to
+carry the effect — the plan starts with it, or it follows a decision or another
+effect — the planner places a pipeline node with no stages to carry it. Every
+provider answers every request once, so a stage may follow any effect: after a
+query it reads the rows, after a publish an empty answer whose status is at
+field 253.
+
+An unbound resource is refused as a deployment error; the document is not at
+fault for declining to name an endpoint.
 
 The plan suite (`tests/harness/tests/pipeline_suites/plan.rs`) pins the
-mapping, and `tools/e2e/graph.sh` asserts both halves — refusal without a
+lowering, and `tools/e2e/graph.sh` asserts both halves — refusal without a
 binding, lowering with one — through the real `.fmod`.
 
 ## The exchange surface
 
-Providers of the ordered-ack surface share ONE contract, defined in the Fluxor
-SDK at [`modules/sdk/contracts/exchange.rs`][exchange]. A provider declares
-which role it plays:
-
-- `stream.ordered_ack.sink` — a destination that only ACCEPTS records (an MQTT
-  topic, a Kafka partition, an INSERT): `publish_in` + `ack_out`.
-- `stream.ordered_ack.exchange` — a destination that ANSWERS WITH DATA (an
-  HTTP GET, a SELECT): additionally `reply_out`.
-
-A consumer that only publishes requires the parent, `stream.ordered_ack`, and
-accepts either.
+Every provider in the workspace speaks ONE contract, defined in the Fluxor SDK
+at [`modules/sdk/contracts/exchange.rs`][exchange]: an HTTP server and its
+application routes, an HTTP or S3 client, a database client, a broker sink, a
+pipeline. A requester opens an exchange under a 14-byte id it chooses; the
+provider echoes that id on every record of its answer.
 
 ```text
-publish_in (input):  [corr:u64][flags:u8][msg_key_len:u16][payload_len:u16]
-                     [msg_key…][payload…]
-ack_out    (output): [corr:u64][status:u8]
-reply_out  (output): [corr:u64][status:u8][msg_key_len:u16][payload_len:u16]
-                     [msg_key…][payload…]              — exchange only
+record          [kind:u8][flags:u8][id:14] payload           one channel record
+request HEAD    [method:u8][target_len:u16][hdr_len:u16][peer_len:u16][resp_credit:u32]
+                target | headers | peer | body…
+response HEAD   [status:u16][ct_len:u8][hdr_len:u16] content_type | headers | body…
+BODY            body bytes, MORE set while more follow
+ABORT · CREDIT · DATAGRAM · LINK (response direction, zero id: DOWN / UP)
 ```
 
-Each frame travels behind a 3-byte envelope, `[tag:u8][len:u16 LE]`
-(`MSG_PUBLISH`, `MSG_ACK`, `MSG_REPLY`). The frames and the correlation are
-identical across roles; only the presence of an answer differs. That is what
-makes a POST and a GET the same act, one capability apart — and why a pipeline
-stage publishing to Kafka and one calling an HTTP endpoint are the same wiring
-against a different pin.
+A HEAD carries the first body bytes inline; a body longer than one record
+follows in BODY records, past the inline bytes only on the receiver's credit.
+Statuses are HTTP codes for every provider: 200 answers (for a durable
+destination: accepted, with an empty body), and a provider's own refusals are
+400, 413, 500, 502, 503 and 504. `METHOD_PUBLISH` asks a durable destination to
+accept the body as one record, its target the ordering key.
+
+A provider declares the delivery terms it offers as a capability:
+
+- `stream.ordered_ack.sink` — a destination that ACCEPTS records (an MQTT
+  topic, a Kafka partition, an INSERT): a 200 means the record is durable.
+- `stream.ordered_ack.exchange` — a destination that ANSWERS WITH DATA (an
+  HTTP GET, a SELECT).
+
+A consumer that only needs its requests answered requires the parent,
+`stream.ordered_ack`, and accepts either. The ports are the same for both, so a
+pipeline publishing to Kafka and one calling an HTTP endpoint are the same
+wiring against a different pin.
 
 Two rules matter to a consumer:
 
-- **Answered exactly once.** A replying provider answers on `reply_out` (the
-  reply carries the status, so it IS the ack) and `ack_out` then carries only
-  the `corr = 0` link-state signals. A non-replying provider answers on
-  `ack_out`. Never both.
-- **The reply echoes `msg_key` unchanged.** A producer stage puts its join
-  context in the key and the stage handling the reply gets it back beside the
-  payload — so a request built in one stage and a response handled in the next
-  share no state but a graph edge.
+- **Answered exactly once.** An exchange ends at a terminal response record (a
+  HEAD or BODY without MORE) or an ABORT, and a provider ends every exchange it
+  is asked.
+- **LINK reports a change, not a precondition.** A provider whose backend link
+  drops writes LINK DOWN and, on reconnect, LINK UP. A requester does not wait
+  for UP before its first request, and after an UP re-issues every exchange it
+  holds open without an answer.
 
 ### Sizes
 
-The contract fixes one payload ceiling, so a producer has a number it can hold
-itself to:
-
 | Constant | Value |
 |---|---|
-| `PAYLOAD_MAX` | 8192 |
-| `KEY_MAX` | 512 |
-| `PUBLISH_FRAME_MAX` | 8717 — `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX`, one whole publish frame; a full-tier `publish_in` port's `max_record` adds the 3-byte envelope (8720) |
+| `RECORD_MAX` | 8192 — one exchange record, header included |
+| `PAYLOAD_MAX` | 8192 — a body collected whole |
+| `KEY_MAX` | 512 — an ordering key (a publish's target) |
 
 A provider whose backend cannot accept the full ceiling declares the smaller
 number as its `max_payload` capability fact, and the build checks it against
 the producer's own `max_payload` fact — never against a port's `max_record`,
-which frames a whole record rather than a payload. The rows are registered in
-Fluxor's `docs/architecture/limit_register.md`.
+which frames a whole record rather than a payload. Exchange edges are mailbox
+edges; Fluxor gives every framed edge a buffer group of its own, so a graph
+never declares one.
 
 ### The pipeline on the surface
 
-`app/pipeline` speaks the surface in both directions.
+`app/pipeline` meets the contract in the role its wired ports choose
+([`exchange_core.rs`](../../modules/common/exchange_core.rs)). The parts of an
+exchange other than its body — id, method, target, headers, status, content
+type — map to data fields named by the `id_field`, `method_field`,
+`target_field`, `headers_field`, `status_field` and `content_type_field`
+params, so stages read and write them like any other field and a codec only
+ever reads or writes a body.
 
-As a **producer**, it publishes when a graph wires `publish_out` to a
-provider's `publish_in` and `ack_out` back to `ack_in`; wiring neither leaves
-results on `result_out`. Each result frame is wrapped in a `Publish` with a
-fresh correlation id; its `msg_key` is the record's **carry** (field 254,
-[the frame](dataplane.md#the-typed-record-frame)), or empty when it carries
-none — a carry past `KEY_BUF` (`KEY_MAX`, 64 B on rp2040) is refused
-(`carry_refused`), never truncated.
-At most `MAX_INFLIGHT` publishes are
-unacknowledged at once, and a full window is backpressure — nothing is admitted
-until the destination answers. Typed refusals are counted. The pipeline is an
-at-most-once producer: it keeps no replay log, so publishes outstanding at a
-LINK_DOWN are counted as `invalidated`, not re-sent.
+- **Provider** (`request_in` + `response_out`). Each request is collected
+  whole — credit granted as it arrives, refused with 413 or 503 past a bound,
+  never truncated — and its body becomes a record (through `decode`, or a body
+  that is itself a record frame), with the mapped parts added. With `ack`
+  (`stream.ordered_ack.sink`, `ack = "transport"`), the request is answered 200
+  once its record's output is accepted downstream and 500 when the record
+  fails. Without it, a node downstream answers the request by its id. That is
+  what lets an application pipeline be the destination of a CDC feed directly,
+  acknowledging what it actually consumed. Either way a request is never left
+  waiting: one whose record fails is answered 500 here, and one whose stages
+  set the mapped status field is answered here with that status — a stage
+  refuses by saying how — its body through `encode` or empty.
+- **Answer** (`response_out` with `answer`). The result record is the response
+  to the exchange its id field names: status and content type from the mapped
+  fields (or 200 and the `content_type` param), body through `encode` or the
+  record frame itself.
+- **Requester** (`request_out` + `response_in`). The result record is a request
+  this node opens under an id of its own, asking `method` unless a mapped field
+  names one. Its **carry** (field 254, [the frame](dataplane.md#the-typed-record-frame))
+  stays in the node — a carry past `KEY_BUF` (512 B, 64 B on rp2040) is refused
+  (`carry_refused`), never truncated. Each answer becomes a record on
+  `result_out`: the body through `reply_decode` (without one, an empty body or
+  one record frame), the carry restored at 254 and the status at 253. A 2xx
+  body is the answer and must decode; any other status's body is the
+  provider's own, and when it does not decode the record carries the status
+  and the carry alone, so the stages after still answer at once. At most
+  `WINDOW` exchanges are open at once, and a full window is backpressure —
+  nothing is admitted until an answer frees a slot. Exchanges open at a LINK
+  DOWN are re-sent after the LINK UP (`replayed`), and a request made while the
+  link is down is held in its slot and sent then too, since a provider drops
+  what arrives before its UP. The node holds nothing of
+  the request but its carry, so request → effect → decoded answer is one node,
+  which is the Pipeline artefact's effect step made concrete.
+- **Relay** (all four exchange ports). A request HEAD becomes a record, its
+  stages rewrite it, and it leaves under the same id with its flags and inline
+  body; every other record of the exchange is forwarded untouched, requests
+  one way and the provider's answers the other. A body of any length streams
+  through, and the node holds no exchange state beyond the HEAD it is
+  rewriting. A request it cannot pass on is answered 500 (400 for a HEAD that
+  does not parse); one whose stages set the mapped status field is answered
+  with that status — a stage refuses by saying how — its body through `encode`
+  or empty. Every exchange the relay is asked is answered, so its requester is
+  never left waiting.
+- **Response relay** (`response_in` + `response_out` only). Another node's
+  answers pass through, so several nodes can answer one requester through its
+  single `response_in`.
 
-As a **sink** (`stream.ordered_ack.sink`, `ack = "transport"`), it takes each
-publish's payload as its record when a producer is wired to `publish_in`, and
-answers on `ack_out` once that record's output is accepted downstream — OK, or
-OVERSIZE for a payload beyond the contract ceiling, or UNROUTABLE when the
-payload cannot be processed. The intake takes any contract payload
-(`PAYLOAD_MAX`); the decoded record is one typed frame. LINK_UP is announced once the module is ready to take
-records. That is what lets an application pipeline be the destination of a
-CDC feed directly, acknowledging what it actually consumed.
-
-Against a **replying** provider, wire its `reply_out` to `reply_in`. The
-reply IS the ack: it frees the window slot, and becomes a record on
-`result_out` — the payload through `reply_decode` (without one, the payload
-must itself be one record frame), the echoed key restored as the carry (254),
-the exchange status at 253. The request's context crossed the destination in
-the key, so the node holds nothing between asking and answering: request →
-effect → decoded reply is one node, which is the Pipeline artefact's effect
-step made concrete. `examples/exchange_carry/` and
-`tools/e2e/exchange-carry.sh` prove it live, with an oversized carry refused.
-
-`examples/pipeline_egress/`, `examples/http_exchange/` and
-`examples/pipeline_chain/` are the graphs; `tools/e2e/pipeline-egress.sh`,
+`examples/exchange_carry/`, `examples/pipeline_egress/`,
+`examples/http_exchange/` and `examples/pipeline_chain/` are the graphs;
+`tools/e2e/exchange-carry.sh`, `tools/e2e/pipeline-egress.sh`,
 `tools/e2e/http-exchange.sh` and `tools/e2e/pipeline-chain.sh` prove the
-producer, exchange and sink roles live.
+requester, publish, HTTP and provider roles live, with an oversized carry
+refused.
 
 ## Port vocabulary
 
-Request/reply providers (`pg_client`, `redis_client`) and status-reporting
-sinks (`mongo_client`) use these names:
-
 | Port | Direction | Meaning |
 |---|---|---|
+| `request_in` → `response_out` | in/out | a provider: takes requests, answers each once |
+| `request_out` → `response_in` | out/in | a requester: asks, takes the answers |
 | `net_in` / `net_out` | both | transport, to the platform's network provider |
-| `request_in` → `reply_out` | in/out | request/reply protocols |
-| `publish_in` | in | payload sink; on the ordered-ack surface each publish is answered on `ack_out`/`reply_out`, on a status-reporting sink on `status_out` |
 | `message_out` | out | a subscribed stream |
-| `status_out` | out | lifecycle/result, human-readable (`TextPlain`) |
+| `status_out` | out | lifecycle, human-readable (`TextPlain`) |
 
-`status_out` is a human-readable line, not a record, which is why a binding on
-it is `n`.
+`request_*` ports carry `ExchangeRequest` records and `response_*` ports
+`ExchangeResponse` records. `status_out` is a human-readable line for an
+operator, never an answer.
 
 [exchange]: ../../../fluxor/modules/sdk/contracts/exchange.rs
 

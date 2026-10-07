@@ -136,9 +136,12 @@ a single collection cell.
 
 ## Connector wire edges — NOT a DSL block
 
-A dataplane's wire edges — the request built from a record, the reply parsed back
-into one — are [`ser` / `rd` byte programs](wire-codec.md) supplied as a generic
-`pipeline` module's `encode` / `decode` params.
+A dataplane's wire edges — the body of a request built from a record, the
+body of an answer parsed back into one — are [`ser` / `rd` byte
+programs](wire-codec.md) supplied as a generic `pipeline` module's `encode` /
+`decode` / `reply_decode` params. The rest of an exchange — its id, method,
+target, status and content type — maps to record fields by the pipeline's field
+map, so no program frames an exchange record.
 
 There is no `connector { … }` block in the DSL — writing one is a parse error.
 Wire edges are pipeline params rather than sealed canonical artefacts, which is

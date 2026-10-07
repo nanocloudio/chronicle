@@ -203,10 +203,10 @@ wiring:
     to: kv_request_router.etcd_in
   - from: kv_request_router.etcd_out
     to: cdc_pump.kv_in
-  - from: cdc_pump.publish_out
-    to: mqtt_sink.publish_in
-  - from: mqtt_sink.ack_out
-    to: cdc_pump.ack_in
+  - from: cdc_pump.request_out
+    to: mqtt_sink.request_in
+  - from: mqtt_sink.response_out
+    to: cdc_pump.response_in
   - from: mqtt_sink.net_out
     to: linux_net.net_in
   - from: linux_net.net_out
