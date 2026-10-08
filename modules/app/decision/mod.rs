@@ -78,7 +78,7 @@ include!("../../common/telemetry_core.rs");
 /// `max_record` per target, so the advertised ceiling and the buffer behind it are
 /// one number.
 ///
-/// Keyed on the arena rather than on `fluxor_silicon` for two reasons. It says the
+/// Keyed on the arena rather than on `fluxor_abi` for two reasons. It says the
 /// REASON — this is about how much memory there is, not which part — so a target
 /// added later inherits it without an edit. And it compiles under any toolchain: a
 /// `cfg` the build does not declare trips `unexpected_cfgs` under `-D warnings`,

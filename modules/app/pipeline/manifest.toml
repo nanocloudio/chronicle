@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 # Cadence-independent: a pure record transform. Stages run over the record in
 # front of them; telemetry reads the device clock, never the tick count.
 timer_class     = "agnostic"
@@ -31,16 +31,16 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2040 = 512 }
+max_record   = { default = 4096, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv6m = 512 }
 
 # Output: the final stage's constructed message, in the same typed record frame.
 [[ports]]
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2040 = 512 }
+max_record   = { default = 4096, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv6m = 512 }
 
 # ── Exchange ports ──────────────────────────────────────────────────────
 #
@@ -67,32 +67,32 @@ name         = "request_out"
 index        = 1
 direction    = "output"
 content_type = "ExchangeRequest"
-max_record   = { default = 8192, rp2040 = 1024 }
-buffer_size  = { default = 16384, rp2040 = 2048 }
+max_record   = { default = 8192, thumbv6m = 1024 }
+buffer_size  = { default = 16384, thumbv6m = 2048 }
 
 [[ports]]
 name         = "response_in"
 index        = 1
 direction    = "input"
 content_type = "ExchangeResponse"
-max_record   = { default = 8192, rp2040 = 1024 }
-buffer_size  = { default = 16384, rp2040 = 2048 }
+max_record   = { default = 8192, thumbv6m = 1024 }
+buffer_size  = { default = 16384, thumbv6m = 2048 }
 
 [[ports]]
 name         = "request_in"
 index        = 2
 direction    = "input"
 content_type = "ExchangeRequest"
-max_record   = { default = 8192, rp2040 = 1024 }
-buffer_size  = { default = 16384, rp2040 = 2048 }
+max_record   = { default = 8192, thumbv6m = 1024 }
+buffer_size  = { default = 16384, thumbv6m = 2048 }
 
 [[ports]]
 name         = "response_out"
 index        = 2
 direction    = "output"
 content_type = "ExchangeResponse"
-max_record   = { default = 8192, rp2040 = 1024 }
-buffer_size  = { default = 16384, rp2040 = 2048 }
+max_record   = { default = 8192, thumbv6m = 1024 }
+buffer_size  = { default = 16384, thumbv6m = 2048 }
 
 # Control: hot-reload ops for the version table (add a version / flip the default
 # / remove a drained one). See version_core.rs `vctl`. Optional — a config that
@@ -136,9 +136,9 @@ metrics = [
 ack         = "transport"
 ordering    = "single"
 broadcast   = "degenerate"
-max_payload = { default = 8192, rp2040 = 512 }
+max_payload = { default = 8192, thumbv6m = 512 }
 
 # The largest body a pipeline result can carry, against a provider's declared
 # backend ceiling: one record.
 [capability_facts."stream.ordered_ack"]
-max_payload = { default = 4096, rp2040 = 512 }
+max_payload = { default = 4096, thumbv6m = 512 }

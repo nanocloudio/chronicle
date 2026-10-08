@@ -95,10 +95,10 @@ impl Connector<'_> {
     }
 
     /// The store pin to record so the build composes this capability's
-    /// provider from the OCI store, scoped to `silicon`:
-    /// `<silicon>/<module>:<version>`.
-    pub fn provider_pin(&self, silicon: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
-        let mut p = gput(out, 0, silicon)?;
+    /// provider from the OCI store, scoped to the module ABI `abi`:
+    /// `<abi>/<module>:<version>`.
+    pub fn provider_pin(&self, abi: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
+        let mut p = gput(out, 0, abi)?;
         p = gput(out, p, b"/")?;
         p = gput(out, p, self.provider)?;
         p = gput(out, p, b":")?;
@@ -692,13 +692,13 @@ fn put_hex(out: &mut [u8], p: usize, bytes: &[u8]) -> Result<usize, GraphError> 
 ///
 /// The deploy driver records these into the project's `fluxor.lock` before
 /// building, so slot-image resolves each provider module from the OCI store.
-/// Pure: a function of the plan and the silicon — the pin-side mirror of the
-/// graph itself.
+/// Pure: a function of the plan and the module ABI the pins are tagged with —
+/// the pin-side mirror of the graph itself.
 ///
 /// Writes each pin into `out[i]`, returning how many were written.
 pub fn plan_provider_pins(
     stages: &[PlanStage],
-    silicon: &[u8],
+    abi: &[u8],
     out: &mut [&mut [u8]],
     lens: &mut [usize],
 ) -> Result<usize, GraphError> {
@@ -708,7 +708,7 @@ pub fn plan_provider_pins(
             continue;
         };
         let mut pin = [0u8; 96];
-        let pl = binding.provider_pin(silicon, &mut pin)?;
+        let pl = binding.provider_pin(abi, &mut pin)?;
 
         let mut seen = false;
         for k in 0..n {

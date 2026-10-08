@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 # Cadence-independent: a pure per-record translation with no notion of time of
 # its own. The reading's timestamp is carried through, never sampled here, so a
 # variable-cadence domain changes only WHEN a reading is translated.

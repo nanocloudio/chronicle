@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712", "rp2040", "rp2350"]
+hardware_targets = ["bcm2712", "rp2040", "rp2350", "linux"]
 # Cadence-independent: a pure record transform with no notion of time at all.
 timer_class     = "agnostic"
 
@@ -27,16 +27,16 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2040 = 512 }
+max_record   = { default = 4096, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv6m = 512 }
 
 # Output: the evaluated scalar result bytes (here, the selected string field).
 [[ports]]
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2040 = 512 }
+max_record   = { default = 4096, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv6m = 512 }
 
 [observability]
 # The common accounting taxonomy is front-loaded (ids 0..13, canonical field

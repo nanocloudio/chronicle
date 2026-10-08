@@ -16,29 +16,29 @@ buffer behind it are one number on every target rather than two that can disagre
 
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
-| aggregation | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2350 1024, rp2040 512) | 4096 (rp2350 1024, rp2040 512) | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | barrier_in | input | 64 | 256 | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | checkpoint_out | output | 40960 (rp2040 4096) | 40960 (rp2040 4096) | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | proposal_out | output | 512 | 512 | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | assigned_in | input | 64 | 256 | 26 |
-| aggregation | bcm2712,rp2350,rp2040 | leader_in | input | 64 | 256 | 26 |
-| chronicle_cli | bcm2712 | args | input |  | 131328 |  |
-| chronicle_cli | bcm2712 | stdout | output |  | 40960 |  |
-| chronicle_cli | bcm2712 | exit | output |  | 16 |  |
-| decision | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 22 |
-| decision | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 22 |
-| expression | bcm2712,rp2040,rp2350 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
-| expression | bcm2712,rp2040,rp2350 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 17 |
-| pipeline | bcm2712,rp2350,rp2040 | record_in | input | 4096 (rp2040 512) | 4096 (rp2040 512) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | result_out | output | 4096 (rp2040 512) | 4096 (rp2040 512) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | request_out | output | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | response_in | input | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | request_in | input | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | response_out | output | 8192 (rp2040 1024) | 16384 (rp2040 2048) | 31 |
-| pipeline | bcm2712,rp2350,rp2040 | control | ctrl_input | 4096 | 4096 | 31 |
-| sensor_intake | bcm2712,rp2350,rp2040 | sample | input | 24 | 240 |  |
-| sensor_intake | bcm2712,rp2350,rp2040 | record_out | output | 96 | 960 |  |
+| aggregation | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | barrier_in | input | 64 | 256 | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | checkpoint_out | output | 40960 (thumbv6m 4096) | 40960 (thumbv6m 4096) | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | proposal_out | output | 512 | 512 | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | assigned_in | input | 64 | 256 | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | leader_in | input | 64 | 256 | 26 |
+| chronicle_cli | bcm2712,linux | args | input |  | 131328 |  |
+| chronicle_cli | bcm2712,linux | stdout | output |  | 40960 |  |
+| chronicle_cli | bcm2712,linux | exit | output |  | 16 |  |
+| decision | bcm2712,rp2040,rp2350,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 22 |
+| decision | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 22 |
+| expression | bcm2712,rp2040,rp2350,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 17 |
+| expression | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 17 |
+| pipeline | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | request_out | output | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | response_in | input | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | request_in | input | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | response_out | output | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 31 |
+| pipeline | bcm2712,rp2350,rp2040,linux | control | ctrl_input | 4096 | 4096 | 31 |
+| sensor_intake | bcm2712,rp2350,rp2040,linux | sample | input | 24 | 240 |  |
+| sensor_intake | bcm2712,rp2350,rp2040,linux | record_out | output | 96 | 960 |  |
 
 Generated from `modules/app/*/manifest.toml`. Steady-state modules also
 declare a per-step budget of one record plus pending-output drain,
@@ -57,12 +57,12 @@ does not declare that target.
 
 | Module | bcm2712 | rp2350 | rp2040 |
 |---|---:|---:|---:|
-| aggregation | 312576 | 202816 | 23744 |
-| chronicle_cli | 397888 | n/a | n/a |
-| decision | 57536 | 57536 | 19648 |
-| expression | 10432 | 10432 | 3264 |
-| pipeline | 300288 | 166080 | 46016 |
-| sensor_intake | 320 | 256 | 256 |
+| aggregation | — | — | — |
+| chronicle_cli | — | n/a | n/a |
+| decision | — | — | — |
+| expression | — | — | — |
+| pipeline | — | — | — |
+| sensor_intake | — | — | — |
 
 State arena for reference: rp2040 65,536 B, rp2350 245,760 B, bcm2712 256 MiB.
 A deployment may declare a lower capacity for itself, in which case the

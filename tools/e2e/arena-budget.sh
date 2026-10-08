@@ -74,7 +74,7 @@ fi
 refusal=$(grep -o 'deployment envelope.*' "$E2E_GEN/tight.err" 2>/dev/null | head -1)
 need=$(printf '%s' "$refusal" | grep -oE 'need=[0-9]+' | grep -oE '[0-9]+')
 used=$(printf '%s' "$refusal" | grep -oE 'used=[0-9]+' | grep -oE '[0-9]+')
-recorded() { "$FLX" inspect "target/fluxor/bcm2712/modules/$1.fmod" 2>/dev/null \
+recorded() { "$FLX" inspect "target/fluxor/aarch64/modules/$1.fmod" 2>/dev/null \
   | grep -oE 'state: [0-9]+' | grep -oE '[0-9]+'; }
 # 0 when `rec` is the 64-byte rounding of some state size a carve of `c` implies.
 matches_carve() { # <recorded> <carve>

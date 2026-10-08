@@ -70,7 +70,7 @@ include!("../../common/telemetry_core.rs");
 /// `max_record` per target, so the advertised ceiling and the buffer behind it are
 /// one number.
 ///
-/// Keyed on the arena rather than on `fluxor_silicon` because it says the REASON —
+/// Keyed on the arena rather than on `fluxor_abi` because it says the REASON —
 /// how much memory there is, not which part — so a target added later inherits it
 /// without an edit, and because `abi::config` is in scope in every module while an
 /// undeclared `cfg` would trip `unexpected_cfgs` under `-D warnings`.

@@ -1,7 +1,7 @@
 version          = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+hardware_targets = ["bcm2712", "rp2350", "rp2040", "linux"]
 # Cadence-independent: windows are EVENT time carried in the records, the
 # checkpoint interval counts events, and telemetry reads the device clock.
 # Nothing here measures time in ticks, so a variable-cadence domain cannot
@@ -30,8 +30,8 @@ default  = true
 name         = "record_in"
 direction    = "input"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2350 = 1024, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2350 = 1024, rp2040 = 512 }
+max_record   = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
 
 # Output: one typed record frame per finalized window (a CustomerTotal), emitted
 # when the event-time watermark closes the window.
@@ -39,8 +39,8 @@ buffer_size  = { default = 4096, rp2350 = 1024, rp2040 = 512 }
 name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
-max_record   = { default = 4096, rp2350 = 1024, rp2040 = 512 }
-buffer_size  = { default = 4096, rp2350 = 1024, rp2040 = 512 }
+max_record   = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
+buffer_size  = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
 
 # Optional distributed activation barrier (in[1]): commit horizons from Clustor's
 # `consensus.committed_entries` (MSG_COMMITTED_ENTRY: [term:u64 LE][index:u64 LE]
@@ -68,8 +68,8 @@ direction    = "output"
 content_type = "OctetStream"
 # Sized to the proven maximum AggState snapshot so a full state is checkpointable
 # as one retained record, not silently dropped when it exceeds a small ring.
-max_record   = { default = 40960, rp2040 = 4096 }
-buffer_size  = { default = 40960, rp2040 = 4096 }
+max_record   = { default = 40960, thumbv6m = 4096 }
+buffer_size  = { default = 40960, thumbv6m = 4096 }
 
 # Producer half of the Clustor binding (raft-propose mode). Wiring proposal_out
 # (out[2]) enables it: the module submits its checkpoint snapshot to

@@ -22,9 +22,9 @@
 # sibling clustor project). `fluxor run` resolves a module's .fmod from
 # target/fluxor/<t>/modules and its port names from a source search path, so
 # stage both from clustor once:
-#   C=../clustor/modules/app; D=target/fluxor/bcm2712/modules; mkdir -p examples/modules
+#   C=../clustor/modules/app; D=target/fluxor/aarch64/modules; mkdir -p examples/modules
 #   for m in consensus durability; do \
-#     cp ../clustor/target/fluxor/bcm2712/modules/$m.fmod $D/; \
+#     cp ../clustor/target/fluxor/aarch64/modules/$m.fmod $D/; \
 #     ln -sfn "$(cd $C/$m && pwd)" examples/modules/$m; done
 #
 #   printf '\x03\x01\x00\x05\x00alice\x02\x01\x08\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x03\x01\x08\x00\x64\x00\x00\x00\x00\x00\x00\x00' \
