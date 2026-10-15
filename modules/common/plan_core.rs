@@ -562,10 +562,10 @@ pub fn lower_pipeline_with(
                 }
                 p = gput(out, p, b"    params:\n")?;
                 if run_lens[k] > 0 {
-                    p = gput(out, p, b"      ir_stages: \"")?;
+                    p = gput(out, p, b"      ir_stages: {hex: \"")?;
                     let (off, len) = ir_spans[k];
                     p = put_hex(out, p, &scratch[off..off + len])?;
-                    p = gput(out, p, b"\"\n")?;
+                    p = gput(out, p, b"\"}\n")?;
                 }
                 if let Some(e) = requester_of[k] {
                     let c = effects[e].ok_or(GraphError::EffectUnbound)?;
@@ -574,9 +574,9 @@ pub fn lower_pipeline_with(
                     p = gput(out, p, b"\n")?;
                 }
                 if run_maps[k] {
-                    p = gput(out, p, b"      stage_kinds: \"")?;
+                    p = gput(out, p, b"      stage_kinds: {hex: \"")?;
                     p = put_hex(out, p, &run_kinds[k][..run_lens[k]])?;
-                    p = gput(out, p, b"\"\n")?;
+                    p = gput(out, p, b"\"}\n")?;
                 }
             }
             1 => {
@@ -586,9 +586,9 @@ pub fn lower_pipeline_with(
                 if chain[k].name() != b"decision" {
                     p = gput(out, p, b"    type: decision\n")?;
                 }
-                p = gput(out, p, b"    params:\n      decision: \"")?;
+                p = gput(out, p, b"    params:\n      decision: {hex: \"")?;
                 p = put_hex(out, p, decisions[k])?;
-                p = gput(out, p, b"\"\n")?;
+                p = gput(out, p, b"\"}\n")?;
             }
             _ => {
                 let c = effects[k].ok_or(GraphError::EffectUnbound)?;

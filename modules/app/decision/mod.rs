@@ -1,7 +1,7 @@
 //! Decision executor — a Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the decision table is NOT baked — it arrives as a `decision`
-//! module param (hex of the serialized container `[nrules][when,outcome]…[default]`,
+//! module param (a `blob`: the serialized container `[nrules][when,outcome]…[default]`,
 //! see `decision_core.rs`). So one decision binary runs ANY Decision: the compiler
 //! emits each predicate/outcome program, a config packs the container, and this
 //! module runs a first-hit policy over an input record, emitting the selected
@@ -46,7 +46,7 @@ mod dec {
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
     include!("../../common/decision_core.rs");
-    include!("../../common/hex_core.rs");
+    include!("../../common/blob_core.rs");
     include!("../../common/outcome_core.rs");
     include!("../../common/io_core.rs");
     include!("../../common/accounting_core.rs");
@@ -54,9 +54,9 @@ mod dec {
     include!("../../common/decision_step_core.rs");
 }
 use dec::{
-    decision_step, describe_decision_error, hex_decode, scan_decision_container, Accounting,
-    Branch, DecisionError, Mode, Pending, Ran, Reason, StepResult, SysChan, Undecided,
-    ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
+    decision_step, describe_decision_error, scan_decision_container, Accounting, BlobIn, Branch,
+    DecisionError, Mode, Pending, Ran, Reason, StepResult, SysChan, Undecided, ACCT_IS_GAUGE,
+    ACCT_METRIC_COUNT,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -86,8 +86,9 @@ include!("../../common/telemetry_core.rs");
 const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
 const REC_BUF: usize = if TINY { 512 } else { 4096 };
 
-/// The decision param, as hex on the way in and as the deserialized container
-/// in use. `HEX_BUF` is twice `CONT_BUF` because hex doubles.
+/// The decision param: the container itself, a `blob` written straight into
+/// this buffer as it arrives (hex once doubled every program in a graph's
+/// config, and this node's state with it).
 ///
 /// `CONT_BUF` carries the largest table the authoring path can produce — a
 /// full `author_core::MAX_RULE` decision — so a container this node is handed
@@ -103,16 +104,14 @@ const REC_BUF: usize = if TINY { 512 } else { 4096 };
 /// hold, at LOAD, where the only evidence is a policy that decides something else.
 ///
 /// On a full-arena target the bound is `author_core::BIN_BUF`, so the engine
-/// loads anything the authoring path can assemble. Both buffers live in module
-/// STATE, so they cost state and not a PIC frame: 48 KiB an instance at the full
-/// tier — negligible against a 256 MiB (BCM2712) arena, about a fifth of
-/// RP2350's 240 KiB.
+/// loads anything the authoring path can assemble. The buffer lives in module
+/// STATE, so it costs state and not a PIC frame: 16 KiB an instance at the full
+/// tier — negligible against a 256 MiB (BCM2712) arena.
 const CONT_BUF: usize = if TINY {
     dec::MAX_CONTAINER_BIN
 } else {
     dec::MAX_CONTAINER_BIN_FULL
 };
-const HEX_BUF: usize = 2 * CONT_BUF;
 
 #[repr(C)]
 struct ModuleState {
@@ -125,8 +124,8 @@ struct ModuleState {
     out_buf: [u8; REC_BUF],
     /// One retained output frame, drained before any new input is admitted.
     pending: Pending,
-    hex: [u8; HEX_BUF],
-    hex_len: u16,
+    /// The `decision` blob's arrival into `cont`.
+    prog: BlobIn,
     cont: [u8; CONT_BUF],
     cont_len: u16,
     /// The common accounting taxonomy: a delivered non-empty outcome is
@@ -154,9 +153,6 @@ struct ModuleState {
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
-    /// A string param overflowed its buffer during parsing (truncated) — a fault,
-    /// since a truncated container could decode to a different policy.
-    param_overflow: bool,
     /// Current operating mode (`Mode` as u8), published as `module_mode`.
     mode: u8,
     /// Wall-clock ms of the last telemetry publish (throttle state).
@@ -171,17 +167,10 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    // `str_chunked`: the hex arrives as TLV entries of at most 255 bytes
-    // under the same tag and this handler APPENDS each one. A decision
-    // table is routinely longer than one entry.
-    1, decision, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.hex_len as usize) < HEX_BUF {
-            s.hex[s.hex_len as usize] = *d.add(i);
-            s.hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // `blob`: the container's own bytes, in chunks of at most 255, the first
+    // led by its whole length (blob_core).
+    1, decision, blob, 0 => |s, d, len| {
+        s.prog.take(&mut s.cont, core::slice::from_raw_parts(d, len));
     };
 }
 
@@ -231,10 +220,9 @@ pub extern "C" fn module_new(
         s.in_chan = in_chan;
         s.out_chan = out_chan;
         s.pending = Pending { off: 0, len: 0 };
-        s.hex_len = 0;
+        s.prog = BlobIn::new();
         s.cont_len = 0;
         s.acct = Accounting::default();
-        s.param_overflow = false;
         s.mode = Mode::AwaitingConfig.as_u8();
         // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
         // uptime, near 0 at startup), not only after one full interval.
@@ -247,16 +235,16 @@ pub extern "C" fn module_new(
         s.faulted = 0;
 
         // FAULT DISCIPLINE: a `decision` param that was PROVIDED but is
-        // broken — bad hex, a truncated container, a program this build
+        // broken — a truncated container, a program this build
         // cannot run — is a configuration fault, named once at error level;
         // the node then refuses input (visible backpressure) rather than
         // sitting inert while records vanish. "No param" stays distinct.
         parse_tlv(s, params, params_len);
         let mut fault: &'static [u8] = b"";
-        if s.hex_len > 0 {
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.cont) {
+        if s.prog.given() {
+            match s.prog.whole() {
                 Some(n) => s.cont_len = n as u16,
-                None => fault = b"[decision] FAULT: decision param is not valid hex",
+                None => fault = b"[decision] FAULT: decision param cut short or past its buffer",
             }
         }
         if s.cont_len > 0 {
@@ -265,9 +253,6 @@ pub extern "C" fn module_new(
             if scan_decision_container(&s.cont[..s.cont_len as usize]).is_err() {
                 fault = b"[decision] FAULT: container invalid or needs a builtin not in this build";
             }
-        }
-        if s.param_overflow {
-            fault = b"[decision] FAULT: a param exceeded its buffer and was truncated";
         }
         if !fault.is_empty() {
             s.cont_len = 0;

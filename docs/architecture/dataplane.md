@@ -90,7 +90,8 @@ ready-made multi-version table.
 ### Stage kinds
 
 A stage's `code` is Transformation bytecode by default. The optional
-`stage_kinds` param — one hex byte per stage, parallel to the container —
+`stage_kinds` param — one byte per stage, parallel to the container, a `blob`
+like every program param (`stage_kinds: {hex: "0100"}`) —
 names a different executor for a stage:
 
 | Kind | `code` is | Executor |

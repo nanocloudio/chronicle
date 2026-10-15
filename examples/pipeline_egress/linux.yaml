@@ -31,7 +31,7 @@ modules:
   - name: pipeline
     params:
       # One stage: {1: id, 2: amount * 2}, as `chronicle compile-stages` emits it.
-      ir_stages: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"
+      ir_stages: {hex: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"}
       method: 9            # PUBLISH
   - name: mqtt_sink
     params:

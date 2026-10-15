@@ -25,9 +25,9 @@ modules:
       # One IR stage: [count=01][route=ff none][len][decision container].
       # No cost field — lowering adds it; a decision stage is copied verbatim
       # rather than transcoded, because its body is not flat IR.
-      ir_stages: "01ff4300014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+      ir_stages: {hex: "01ff4300014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"}
       # Stage 0 is a DECISION, not transformation bytecode.
-      stage_kinds: "01"
+      stage_kinds: {hex: "01"}
 wiring:
   - from: cli_in.stdin_out
     to: pipeline.record_in

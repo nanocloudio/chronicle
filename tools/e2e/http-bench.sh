@@ -54,7 +54,7 @@ PY
 PAGE=$(python3 - <<'PY'
 import re
 s = open("examples/http_bench/one_node.yaml").read()
-enc = re.search(r'encode: "([0-9a-f]+)"', s).group(1)
+enc = re.search(r'encode: \{hex: "([0-9a-f]+)"\}', s).group(1)
 # LIT [len u16 LE] bytes, then FINISH.
 assert enc[:2] == "60" and enc[-2:] == "6a"
 n = int.from_bytes(bytes.fromhex(enc[2:6]), "little")

@@ -3,8 +3,8 @@
 Chronicle carries two byte-level VMs beside the expression evaluator: **`ser`**
 builds a byte string from a record, and **`rd`** parses bytes back into a record.
 They run inside the generic `pipeline` module as its `encode` / `decode` params —
-hex bytecode, like every other param — so a record↔wire framing is data, not a
-build.
+bytecode in a `blob` param (`encode: {hex: "…"}` in a graph), like every other
+program param — so a record↔wire framing is data, not a build.
 
 Sources, `include!`d verbatim by both the host harness and the `.fmod`:
 [`modules/common/ser_core.rs`](../../modules/common/ser_core.rs) and
@@ -23,7 +23,8 @@ those as graph nodes.
 ## Authoring a program
 
 There is no template language. `encode` / `decode` programs are assembled from
-the opcode constants below and hex-encoded into the param — see
+the opcode constants below and written into the param as its hex (`{hex: "…"}`;
+the packer hands the module the bytes) — see
 [`tests/harness/tests/pipeline_suites/ser.rs`](../../tests/harness/tests/pipeline_suites/ser.rs)
 and [`deser.rs`](../../tests/harness/tests/pipeline_suites/deser.rs) for worked
 programs, and `examples/identity_provider/chronicle_authorize.yaml` for both in

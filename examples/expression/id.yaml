@@ -14,7 +14,7 @@ platform:
 modules:
   - name: expression
     params:
-      program: "0100020100000000"   # order.id (field 1)
+      program: {hex: "0100020100000000"}   # order.id (field 1)
       max_cost: 3
 
 wiring:

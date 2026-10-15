@@ -6,14 +6,14 @@
 # image, and the kernel's resource ledger enforces it as the arena's capacity for
 # that deployment, at or below the compiled `STATE_ARENA_SIZE`.
 #
-# The loader carves 57,544 B for `decision` and 328 B for `sensor_intake`: each
+# The loader carves 24,776 B for `decision` and 328 B for `sensor_intake`: each
 # module's state size plus a 4-byte canary, 8-byte aligned. The `.fmod`s record
-# 57,536 and 320, those state sizes rounded up to whole 64-byte units, and
+# 24,768 and 320, those state sizes rounded up to whole 64-byte units, and
 # tools/e2e/arena-budget.sh holds each recorded figure to the carve the loader
 # reports, so the recorded numbers are the loader's own and not an independent
 # estimate that happens to look right.
 #
-# `fits` is sized at the sum of the two, 57,872. `tight` is one byte under it.
+# `fits` is sized at the sum of the two, 25,104. `tight` is one byte under it.
 # tools/e2e/arena-budget.sh drives both: the first must load and decide, the
 # second must be REFUSED AT MODULE LOAD, and the refusal must name the envelope
 # rather than the compiled arena — two ceilings guard this pool and a diagnostic
@@ -28,14 +28,14 @@
 target: linux
 tick_us: 100
 capacity:
-  state_arena: 57871
+  state_arena: 25103
 platform:
   cli: {}
 modules:
   - name: sensor_intake
   - name: decision
     params:
-      decision: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"
+      decision: {hex: "014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"}
 wiring:
   - from: cli_in.stdin_out
     to: sensor_intake.sample

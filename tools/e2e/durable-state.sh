@@ -49,7 +49,7 @@ if [ "$restored" != "$snap" ]; then
 fi
 
 # --- 4. resume a FRESH graph from the stored snapshot ---------------------
-build_graph examples/aggregation/linux.yaml "s|ir_def: \"|state: \"$restored\"\\n      ir_def: \"|" \
+build_graph examples/aggregation/linux.yaml "s|ir_def: {hex: \"|state: {hex: \"$restored\"}\\n      ir_def: {hex: \"|" \
   || { no durable "resume build"; finish; exit; }
 resumed=$(run_hex "$EV2$FLUSH" 6)
 

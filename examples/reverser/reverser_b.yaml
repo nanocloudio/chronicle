@@ -53,14 +53,14 @@ modules:
     type: pipeline
     params:
       # pass_evt — the three-field identity over rev.Evt.
-      ir_stages: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"
+      ir_stages: {hex: "01ff250005000101000000120100000005000102000000120200000005000103000000120300000013"}
       # app_out frame: [topic_len=17]"lattice/cdc/feed1" then the cdc_wire
       # envelope [format:u16][kind][flags][feed:u64][table:u32][key_len:u16]
       # [key][commit_ts:u64]…  SKIP 18 (the fixed topic), LIT-assert format 1,
       # kind → f3, whole key verbatim → f2 (empty for watermarks — fine),
       # commit_ts → f1. Every envelope kind decodes cleanly; FILTERING is the
       # decision's job, so the errors counter stays a real error counter.
-      decode: "70120071020001007501014003000000700d00750201744002000000750801400100000041"
+      decode: {hex: "70120071020001007501014003000000700d00750201744002000000750801400100000041"}
 
   - name: keep_puts
     type: decision
@@ -68,22 +68,22 @@ modules:
       # reverser.uproc `keep_puts`: when kind == PUT construct rev.Change
       # { ts, msg.substring(9, size-2) }; default constructs rev.Change {} —
       # EMPTY, the counted drop.
-      decision: "0105000000120001000203000000100100000000000000200012000000390001000201000000400100000001000202000000100900000000000000010002020000005301001002000000000000005153090040020000004101000000010041"
+      decision: {hex: "0105000000120001000203000000100100000000000000200012000000390001000201000000400100000001000202000000100900000000000000010002020000005301001002000000000000005153090040020000004101000000010041"}
 
   - name: flip
     type: pipeline
     params:
       # reverser.uproc `flip`: rev.Change { ts, msg.reverse() } — contains
       # CALL REVERSE_STR, the pinned CEL strings extension.
-      ir_stages: "01ff1c0005000101000000120100000005000102000000150b00120200000013"
+      ir_stages: {hex: "01ff1c0005000101000000120100000005000102000000150b00120200000013"}
 
   - name: enc_sql
     type: pipeline
     params:
-      ir_stages: "01ff190005000101000000120100000005000102000000120200000013"
+      ir_stages: {hex: "01ff190005000101000000120100000005000102000000120200000013"}
       method: 3            # POST: a query, the SQL in the body
       # INSERT INTO reversed (ts, msg) VALUES (<ts>, '<msg>')
-      encode: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"
+      encode: {hex: "602700494e5345525420494e544f207265766572736564202874732c206d7367292056414c554553202801000201000000616003002c2027010002020000006160020027296a"}
 
   # ── lattice: the SQL connector ─────────────────────────────────────────
   - name: pg_client

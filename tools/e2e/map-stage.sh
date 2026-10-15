@@ -20,7 +20,7 @@ build_graph packaging/cli/linux.yaml >/dev/null || { no map "cli graph build"; f
 SRC=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' examples/map_stage/selector.uproc)
 yaml="$E2E_GEN/map-stage-$E2E_RUN.yaml"
 cli graph "$SRC" select linux >"$yaml" 2>/dev/null
-grep -q 'stage_kinds: "0200"' "$yaml" \
+grep -q 'stage_kinds: {hex: "0200"}' "$yaml" \
   && ok "the map lowers into the compute run's node (stage_kinds 02,00)" \
   || no map "no map stage kind in the lowered graph"
 

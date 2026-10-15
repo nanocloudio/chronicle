@@ -1,7 +1,7 @@
 //! Aggregation engine — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the aggregation definition is NOT baked — it arrives as a `def`
-//! module param (hex-encoded), a serialized container:
+//! module param (a `blob`), a serialized container:
 //!   [window_size:i64][lateness:i64][max_lanes:u32]
 //!   [key prog][time prog][emit prog]           (prog = [cost:u32][len:u16][code])
 //!   [nops:u8] then per op [kind:u8][selector prog]
@@ -43,8 +43,8 @@ mod agg {
     // Keyed on the ARENA, for the same reason this module's own buffers are: it
     // states why the number differs rather than which die it is for, so a target
     // added later inherits the right tier without an edit. They are the dominant
-    // term in the module's state, because the emission queue, the snapshot buffer
-    // and its hex decode are all lane×pane products.
+    // term in the module's state, because the emission queue and the snapshot
+    // buffer are lane×pane products.
     //
     // Four keys with four live panes each is a REAL reduction in what a node
     // holds, not a packing trick. A graph needing more partitions on a 64 KiB die
@@ -65,6 +65,7 @@ mod agg {
     include!("../../common/pipeline_core.rs");
     include!("../../common/agg_core.rs");
     include!("../../common/hex_core.rs");
+    include!("../../common/blob_core.rs");
     // Lower a shipped checked IR-`def` at load (the `ir_def` param), transcoding
     // it to the bytecode `def` `build_spec` consumes. `op::`/`ir::` resolve here
     // because vm_core.rs is include!'d into this same block. Same self-validation
@@ -76,10 +77,10 @@ mod agg {
     include!("../../common/syschan_core.rs");
 }
 use agg::{
-    admit_frame, agg_op_read, drain_all, frame_len, hex_decode, ingest, lower_def, read_prog,
-    Accounting, Admit, AggSpec, AggState, BarrierGate, Durability, EmitTrigger, Mode, OpSpec,
-    Pending, Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, COLL_CAP, KEY_CAP, MAX_LANES,
-    MAX_OPS, MAX_PANES,
+    admit_frame, agg_op_read, drain_all, frame_len, ingest, lower_def, read_prog, Accounting,
+    Admit, AggSpec, AggState, BarrierGate, BlobIn, Durability, EmitTrigger, Mode, OpSpec, Pending,
+    Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, COLL_CAP, KEY_CAP, MAX_LANES, MAX_OPS,
+    MAX_PANES,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -116,7 +117,6 @@ const fn by_arena(tiny: usize, small: usize, full: usize) -> usize {
     }
 }
 
-const HEX_BUF: usize = by_arena(2048, 4096, 8192);
 const CONT_BUF: usize = by_arena(1024, 2048, 4096);
 /// Input event buffer, sized to the port max_record so a whole typed event frame
 /// from an upstream pipeline/decision module is admitted — never a partial.
@@ -183,9 +183,6 @@ const _: () = assert!(MAX_SNAPSHOT >= SNAPSHOT_EXACT);
 /// capacity growth that pushed the snapshot past 64 KiB would wrap it. Asserted
 /// rather than commented, since the cursor width is not visible from here.
 const _: () = assert!(MAX_SNAPSHOT <= u16::MAX as usize);
-/// Hex of a supplied restore checkpoint: twice the decoded snapshot. `state_hex_len`
-/// is `u32` because this exceeds a `u16`.
-const SNAP_HEX: usize = 2 * MAX_SNAPSHOT;
 
 #[repr(C)]
 struct ModuleState {
@@ -208,21 +205,18 @@ struct ModuleState {
     /// per step). `emit_overflow` and the saturation counters refine
     /// `outputs_failed`.
     acct: Accounting,
-    hex: [u8; HEX_BUF],
-    hex_len: u16,
+    /// The `def` blob's arrival into `cont`.
+    def_in: BlobIn,
     cont: [u8; CONT_BUF],
     cont_len: u16,
-    // `true` when the hex holds a flat checked IR-`def` (`ir_def` param) to be
-    // lowered at load, rather than a pre-lowered bytecode `def` (`def` param).
-    is_ir: bool,
-    // Scratch for the decoded IR-`def` before `lower_def` emits into `cont`.
+    // A flat checked IR-`def` (`ir_def` param), arrived into `ir_scratch` and
+    // lowered into `cont` at load, rather than a pre-lowered bytecode `def`.
+    ir_in: BlobIn,
     ir_scratch: [u8; CONT_BUF],
-    // A CHECKPOINT to resume from (`state` param): hex of an AggState::snapshot.
-    // Non-empty ⇒ restore the windowed state at load instead of starting fresh —
-    // durable deterministic state / replay-recovery.
-    state_hex: [u8; SNAP_HEX],
-    state_hex_len: u32,
-    has_state: bool,
+    // A CHECKPOINT to resume from (`state` param): an AggState::snapshot,
+    // arrived into `ckpt_stage`. Given ⇒ restore the windowed state at load
+    // instead of starting fresh — durable deterministic state / replay-recovery.
+    state_in: BlobIn,
     // A full-snapshot staging buffer, reused for the checkpoint EMIT (snapshot →
     // stage) and, at load, for decoding a supplied restore checkpoint. Sized to the
     // proven maximum snapshot so every admitted state is checkpointable/restorable.
@@ -241,9 +235,7 @@ struct ModuleState {
     // emits nothing — until a commit horizon (barrier_in, in[1]) proves
     // the replicated log durable past that index AT THE MATCHING TERM (log-index,
     // term-fenced; BarrierGate). No barrier param ⇒ active immediately (back-compat).
-    barrier_hex: [u8; 64],
-    barrier_hex_len: u16,
-    has_barrier: bool,
+    barrier_in: BlobIn,
     barrier_chan: i32,
     barrier_buf: [u8; 64],
     gate: BarrierGate,
@@ -285,70 +277,33 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    // `str_chunked`: the hex arrives as TLV entries of at most 255 bytes
-    // under the same tag and this handler APPENDS each one.
-    1, def, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.hex_len as usize) < HEX_BUF {
-            s.hex[s.hex_len as usize] = *d.add(i);
-            s.hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // Every program param is a `blob`: its own bytes, in chunks of at most
+    // 255 written straight into the buffer it is used from, the first led by
+    // its whole length (blob_core). `set_defaults()` hands each handler zero
+    // bytes first, which a `BlobIn` takes as no chunk.
+    //
+    // A pre-lowered bytecode `def`.
+    1, def, blob, 0 => |s, d, len| {
+        s.def_in.take(&mut s.cont, core::slice::from_raw_parts(d, len));
     };
     // Higher-level IR-`def` (a shipped checked IR) lowered to bytecode at load.
-    // Guard on len>0: set_defaults() fires every closure, so an absent param
-    // must not flip `is_ir` and route a bytecode `def` through `lower_def`.
-    // `str_chunked`: the value arrives as TLV entries of at most 255
-    // bytes under the same tag and this handler APPENDS each one, which is
-    // what a lowered IR-`def` needs — a flat `str` is refused past one
-    // entry at build time.
-    3, ir_def, str_chunked, 0 => |s, d, len| {
-        if len > 0 {
-            s.is_ir = true;
-            let mut i = 0usize;
-            while i < len && (s.hex_len as usize) < HEX_BUF {
-                s.hex[s.hex_len as usize] = *d.add(i);
-                s.hex_len += 1;
-                i += 1;
-            }
-            if i < len { s.param_overflow = true; }
-        }
+    3, ir_def, blob, 0 => |s, d, len| {
+        s.ir_in.take(&mut s.ir_scratch, core::slice::from_raw_parts(d, len));
     };
-    // A checkpoint (hex of AggState::snapshot) to resume from. Guard on len>0:
-    // set_defaults() fires every closure, so an absent param must not flip
-    // has_state and try to restore from empty bytes.
-    // `str_chunked`: a restored snapshot arrives as TLV entries of at most
-    // 255 bytes under the same tag and this handler APPENDS each one.
-    4, state, str_chunked, 0 => |s, d, len| {
-        if len > 0 {
-            s.has_state = true;
-            let mut i = 0usize;
-            while i < len && (s.state_hex_len as usize) < SNAP_HEX {
-                s.state_hex[s.state_hex_len as usize] = *d.add(i);
-                s.state_hex_len += 1;
-                i += 1;
-            }
-        }
+    // A checkpoint (an AggState::snapshot) to resume from.
+    4, state, blob, 0 => |s, d, len| {
+        s.state_in.take(&mut s.ckpt_stage, core::slice::from_raw_parts(d, len));
     };
     // Emit a checkpoint on out[1] every N events (0 = disabled).
     5, checkpoint_every, u32, 0 => |s, d, len| {
         s.ckpt_every = p_u32(d, len, 0, 0);
     };
-    // Distributed activation barrier: hex of [term:u64 LE][index:u64 LE] — the
+    // Distributed activation barrier: [term:u64 LE][index:u64 LE] — the
     // replicated-log commit coordinates the loaded `state` checkpoint was made
-    // durable at. Guard on len>0 (set_defaults fires every closure). Absent ⇒ no
-    // barrier, module active immediately. index 0 ⇒ no barrier too (see new()).
-    6, barrier, str, 0 => |s, d, len| {
-        if len > 0 {
-            s.has_barrier = true;
-            let mut i = 0usize;
-            while i < len && (s.barrier_hex_len as usize) < 64 {
-                s.barrier_hex[s.barrier_hex_len as usize] = *d.add(i);
-                s.barrier_hex_len += 1;
-                i += 1;
-            }
-        }
+    // durable at. Absent ⇒ no barrier, module active immediately. index 0 ⇒ no
+    // barrier too (see new()).
+    6, barrier, blob, 0 => |s, d, len| {
+        s.barrier_in.take(&mut s.barrier_buf, core::slice::from_raw_parts(d, len));
     };
 }
 
@@ -408,16 +363,14 @@ pub extern "C" fn module_new(
         // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
         // uptime, near 0 at startup), not only after one full interval.
         s.tlm_last_ms = dev_millis(sys).wrapping_sub(TLM_INTERVAL_MS);
-        s.hex_len = 0;
+        s.def_in = BlobIn::new();
         s.cont_len = 0;
-        s.is_ir = false;
-        s.state_hex_len = 0;
-        s.has_state = false;
+        s.ir_in = BlobIn::new();
+        s.state_in = BlobIn::new();
         s.ckpt_chan = dev_channel_port(sys, 1, 1); // out[1]: checkpoint stream
         s.ckpt_every = 0;
         s.events_since_ckpt = 0;
-        s.barrier_hex_len = 0;
-        s.has_barrier = false;
+        s.barrier_in = BlobIn::new();
         s.barrier_chan = dev_channel_port(sys, 0, 1); // input[1]: commit horizon
         s.gate = BarrierGate::new();
         s.active = true; // no barrier ⇒ active; may be staged below
@@ -440,34 +393,40 @@ pub extern "C" fn module_new(
                 b"[aggregation] FAULT: a param exceeded its buffer and was truncated";
             dev_log(sys, 1, m.as_ptr(), m.len());
         }
-        if s.is_ir {
-            // `ir_def` param: decode the hex to the flat IR-`def`, then lower it
-            // HERE into the bytecode `def`. A program that won't lower fails
-            // closed (cont_len=0) at LOAD, not a runtime BadOpcode — and the
-            // cost bound is re-derived from the IR, never trusted from a param.
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.ir_scratch) {
-                Some(n) => match lower_def(&s.ir_scratch[..n], &mut s.cont) {
-                    Ok(m) => s.cont_len = m as u16,
-                    Err(_) => s.cont_len = 0,
-                },
-                None => s.cont_len = 0,
-            }
-        } else {
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.cont) {
-                Some(n) => s.cont_len = n as u16,
-                None => s.cont_len = 0,
-            }
+        // A program param given but cut short or past its buffer is a terminal
+        // fault, like an overflowing one: a truncated def is a different def.
+        let cut = (s.def_in.given() && s.def_in.whole().is_none())
+            || (s.ir_in.given() && s.ir_in.whole().is_none());
+        if cut {
+            s.faulted = true;
+            let m: &'static [u8] =
+                b"[aggregation] FAULT: a program param was cut short or exceeded its buffer";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+        }
+        if let Some(n) = s.ir_in.whole() {
+            // `ir_def` param: lower the flat IR-`def` HERE into the bytecode
+            // `def`. A program that won't lower fails closed (cont_len=0) at
+            // LOAD, not a runtime BadOpcode — and the cost bound is re-derived
+            // from the IR, never trusted from a param.
+            s.cont_len = match lower_def(&s.ir_scratch[..n], &mut s.cont) {
+                Ok(m) => m as u16,
+                Err(_) => 0,
+            };
+        } else if let Some(n) = s.def_in.whole() {
+            s.cont_len = n as u16;
         }
         // Resume from a checkpoint if one was supplied — durable deterministic
-        // state. Decode the hex into the checkpoint stage and restore in place
-        // over the fresh AggState. A malformed or oversized checkpoint leaves
+        // state, restored in place from the checkpoint stage over the fresh
+        // AggState. A malformed or oversized checkpoint leaves
         // the state empty, never half-built, and is a terminal fault.
-        if s.has_state {
+        if s.state_in.given() {
             // A checkpoint was SUPPLIED. It restores, or it is a terminal fault —
             // never a silent fall-back to a fresh state, which would erase the very
             // history the checkpoint exists to preserve. Absent state (the
-            // `!has_state` case) is what legitimately starts fresh.
-            let restored = hex_decode(&s.state_hex[..s.state_hex_len as usize], &mut s.ckpt_stage)
+            // ungiven case) is what legitimately starts fresh.
+            let restored = s
+                .state_in
+                .whole()
                 .and_then(|n| s.agg.restore_into(&s.ckpt_stage[..n]));
             match restored {
                 Some(()) => {
@@ -491,11 +450,8 @@ pub extern "C" fn module_new(
         // it inactive until the commit horizon proves it durable past that
         // index at the matching term. A malformed/short barrier fails closed
         // (stays staged, never activates without proof). index 0 = no barrier.
-        if s.has_barrier {
-            match hex_decode(
-                &s.barrier_hex[..s.barrier_hex_len as usize],
-                &mut s.barrier_buf,
-            ) {
+        if s.barrier_in.given() {
+            match s.barrier_in.whole() {
                 Some(n) if n >= 16 => {
                     let term = u64::from_le_bytes([
                         s.barrier_buf[0],

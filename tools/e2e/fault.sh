@@ -30,12 +30,15 @@ check_fault() { # <name> <graph> <sed-expr> <fault-substring>
   rm -f "$err"
 }
 
-# Each module: break its driving param to invalid hex, assert its named FAULT.
+# Each module: give its driving param a program that is not one (one byte,
+# `ff`) — a well-formed blob, so the packer builds it and the ENGINE must
+# refuse it — and assert its named FAULT. (A hex string where a blob belongs
+# is refused earlier, at build: see the packer's own tests.)
 check_fault decision   examples/decision/linux.yaml \
-  's|decision: "[0-9a-f]*"|decision: "zzzz"|'   "[decision] FAULT"
+  's|decision: {hex: "[0-9a-f]*"}|decision: {hex: "ff"}|'   "[decision] FAULT"
 check_fault expression examples/expression/linux.yaml \
-  's|program: "[0-9a-f]*"|program: "zzzz"|'     "[expr] FAULT"
+  's|program: {hex: "[0-9a-f]*"}|program: {hex: "ff"}|'     "[expr] FAULT"
 check_fault pipeline   examples/pipeline/linux.yaml \
-  's|ir_stages: "[0-9a-f]*"|ir_stages: "zzzz"|' "[pipeline] FAULT"
+  's|ir_stages: {hex: "[0-9a-f]*"}|ir_stages: {hex: "ff"}|' "[pipeline] FAULT"
 
 finish

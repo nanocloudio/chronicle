@@ -104,7 +104,7 @@ a2=$(cli release-ctl add v "$GREEN" 2>/dev/null | head -1)
 # digests included.
 V1=01ff040000000d0001000202000000400100000041
 V2=01ff0600000017000100020200000010020000000000000052400100000041
-PINNED=$(sed -n 's/.*versions: "\([0-9a-f]*\)".*/\1/p' examples/multi_version/linux.yaml | head -1)
+PINNED=$(sed -n 's/.*versions: {hex: "\([0-9a-f]*\)"}.*/\1/p' examples/multi_version/linux.yaml | head -1)
 authored=$(cli release v1 "v1:$V1" "v2:$V2" 2>/dev/null | head -1)
 if [ -z "$PINNED" ]; then
   no release "could not read the pinned versions param from the example"

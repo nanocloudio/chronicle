@@ -35,7 +35,7 @@ n_nodes=$(printf '%s\n' "$got" | grep -c '^  - name: ')
   || no graph "expected 1 module node, got $n_nodes"
 
 # The stages must actually be IN there as a packed container, not a placeholder.
-printf '%s\n' "$got" | grep -q 'ir_stages: "[0-9a-f][0-9a-f]*"' \
+printf '%s\n' "$got" | grep -q 'ir_stages: {hex: "[0-9a-f][0-9a-f]*"}' \
   && ok "the node carries the compiled ir_stages container" \
   || no graph "no ir_stages param in the emitted graph"
 

@@ -25,13 +25,13 @@ modules:
   - name: pipeline
     params:
       # Rec{method, path, body, ctx} copied whole — `ctx: r.ctx` is the carry.
-      ir_stages: "01ff3100050001020000001202000000050001030000001203000000050001040000001204000000050001fe00000012fe00000013"
+      ir_stages: {hex: "01ff3100050001020000001202000000050001030000001203000000050001040000001204000000050001fe00000012fe00000013"}
       method_field: 2
       target_field: 3
       # The request body: field 4's bytes.
-      encode: "01000204000000616a"
+      encode: {hex: "01000204000000616a"}
       # The answer body whole, as field 5.
-      reply_decode: "78400500000041"
+      reply_decode: {hex: "78400500000041"}
   - name: http
     # The client's provider ports live in its `exchange` variant.
     variant: exchange

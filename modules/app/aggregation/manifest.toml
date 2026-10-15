@@ -60,7 +60,7 @@ buffer_size  = 256
 # Optional checkpoint stream (out[1]): the raw AggState::snapshot bytes, emitted
 # every `checkpoint_every` events when that param is set. A downstream sink
 # persists them; on restart the last snapshot is fed back via the `state` param
-# (hex) to resume the windowed state — durable deterministic state.
+# (a `blob`: `{hex: …}` in a graph) to resume the windowed state — durable deterministic state.
 [[ports]]
 name         = "checkpoint_out"
 index        = 1

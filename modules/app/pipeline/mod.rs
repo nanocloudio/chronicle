@@ -82,9 +82,8 @@ const WINDOW: usize = if TINY {
 } else {
     8
 };
-/// The reply decoder's program buffers — absent on a tiny target, which
+/// The reply decoder's program buffer — absent on a tiny target, which
 /// takes answers whose body is already a record frame.
-const RDEC_HEX_BUF: usize = if TINY { 0 } else { HEX_BUF };
 const RDEC_PROG_BUF: usize = if TINY { 0 } else { PROG_BUF };
 /// A content type this pipeline answers with by default.
 const CT_BUF: usize = 64;
@@ -605,6 +604,7 @@ mod pipe {
     // The decision executor, so a decision can be a STAGE rather than a node.
     include!("../../common/decision_core.rs");
     include!("../../common/hex_core.rs");
+    include!("../../common/blob_core.rs");
     include!("../../common/ser_core.rs");
     include!("../../common/deser_core.rs");
     include!("../../common/version_core.rs");
@@ -716,21 +716,20 @@ fn run_decision_stage(
 
 use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
-    eval_decode_scratch, frame_len, hex_decode, is_data_field, lower_stages_kinded,
-    parse_version_table, pipeline_reload_kinded, record_id, request_fields, request_head,
-    response_fields, response_head, run_decision_metered, run_map_stage, run_stage_metered,
-    run_stages_metered, run_stages_with, scan_code, scan_decision_container, scan_map_container,
-    scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
-    Answer, Builder, EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError,
-    Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
-    CARRY_FIELD, EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE,
+    eval_decode_scratch, frame_len, is_data_field, lower_stages_kinded, parse_version_table,
+    pipeline_reload_kinded, record_id, request_fields, request_head, response_fields,
+    response_head, run_decision_metered, run_map_stage, run_stage_metered, run_stages_metered,
+    run_stages_with, scan_code, scan_decision_container, scan_map_container, scan_version_table,
+    stage_at, stage_count, version_selector_from_frame, Accounting, Admit, Answer, BlobIn, Builder,
+    EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError, Scratch, Stage,
+    StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD,
+    EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE,
     STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
-const HEX_BUF: usize = 4096;
 const PROG_BUF: usize = 2048;
 /// The trailing encoder's output and the ingress decoder's frame: one record,
 /// tiered with it. An encoded body becomes an exchange record's body or is
@@ -793,14 +792,12 @@ struct ModuleState {
     buf_a: [u8; REC_BUF],
     buf_b: [u8; REC_BUF],
     out_buf: [u8; REC_BUF],
-    // `ir_stages` hex, lowered into `prog`, which becomes the single default
-    // version when no `versions` table is given.
-    hex: [u8; HEX_BUF],
-    hex_len: u16,
+    // `ir_stages`, arrived into `ir_scratch` and lowered into `prog`, which
+    // becomes the single default version when no `versions` table is given.
+    ir_in: BlobIn,
     prog: [u8; PROG_BUF],
     ir_scratch: [u8; PROG_BUF],
-    ver_hex: [u8; HEX_BUF],
-    ver_hex_len: u16,
+    ver_in: BlobIn,
     vbin: [u8; VBIN_BUF],
     vbin_len: u16,
     /// The candidate table a reload is staged and validated in before it
@@ -810,6 +807,7 @@ struct ModuleState {
     /// every stage is compute.
     stage_kinds: [u8; MAX_NODE_STAGES],
     stage_kinds_len: u8,
+    kinds_in: BlobIn,
     /// One retained output frame on `result_out`, drained before any new input
     /// is admitted.
     pending: Pending,
@@ -867,8 +865,7 @@ struct ModuleState {
     relay_body_len: u16,
     /// The program that turns an answer body into a record. Without it an
     /// answer body must be one record frame.
-    rdec_hex: [u8; RDEC_HEX_BUF],
-    rdec_hex_len: u16,
+    rdec_in: BlobIn,
     rdec: [u8; RDEC_PROG_BUF],
     rdec_len: u16,
     /// One retained answer record, drained before another answer is taken.
@@ -908,8 +905,7 @@ struct ModuleState {
     // Optional trailing encoder: a byte-serialization program applied to the
     // final record to produce a body (an exchange's) or a wire payload. When
     // present, the module emits those bytes instead of a frame.
-    enc_hex: [u8; HEX_BUF],
-    enc_hex_len: u16,
+    enc_in: BlobIn,
     enc: [u8; PROG_BUF],
     enc_len: u16,
     enc_out: [u8; ENC_BUF],
@@ -917,8 +913,7 @@ struct ModuleState {
     // Optional front-end decoder: a byte-deserialization program that parses a
     // raw protocol chunk, or a collected request's body, into a record frame
     // before the stages.
-    dec_hex: [u8; HEX_BUF],
-    dec_hex_len: u16,
+    dec_in: BlobIn,
     dec: [u8; PROG_BUF],
     dec_len: u16,
     dec_out: [u8; ENC_BUF],
@@ -943,96 +938,50 @@ struct ModuleState {
 define_params! {
     ModuleState;
 
-    // `str_chunked`: the encode program arrives as TLV entries of at most
-    // 255 bytes under the same tag and this handler APPENDS each one.
-    2, encode, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.enc_hex_len as usize) < HEX_BUF {
-            s.enc_hex[s.enc_hex_len as usize] = *d.add(i);
-            s.enc_hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // Every program param is a `blob`: the program's own bytes, in chunks of
+    // at most 255 written straight into the buffer it runs from, the first
+    // led by its whole length (blob_core). Hex once doubled every program in
+    // a graph's config, and this node's state with it.
+    //
+    // The trailing encoder's program (ser).
+    2, encode, blob, 0 => |s, d, len| {
+        s.enc_in.take(&mut s.enc, core::slice::from_raw_parts(d, len));
     };
 
-    // `str_chunked` like `encode`: a decode program that reads a whole request
-    // (a target, a header, a JSON body, a key) is past one 255-byte entry.
-    3, decode, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.dec_hex_len as usize) < HEX_BUF {
-            s.dec_hex[s.dec_hex_len as usize] = *d.add(i);
-            s.dec_hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // The front-end decoder's program (rd): one that reads a whole request
+    // (a target, a header, a JSON body, a key) is past one 255-byte chunk.
+    3, decode, blob, 0 => |s, d, len| {
+        s.dec_in.take(&mut s.dec, core::slice::from_raw_parts(d, len));
     };
 
-    4, versions, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ver_hex_len as usize) < HEX_BUF {
-            s.ver_hex[s.ver_hex_len as usize] = *d.add(i);
-            s.ver_hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // A ready-made version table (`chronicle release`).
+    4, versions, blob, 0 => |s, d, len| {
+        s.ver_in.take(&mut s.vbin, core::slice::from_raw_parts(d, len));
     };
 
     // The program that turns an answer's body into a record (see
     // `response_in`). Without it an answer body must be one record frame.
-    7, reply_decode, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.rdec_hex_len as usize) < RDEC_HEX_BUF {
-            s.rdec_hex[s.rdec_hex_len as usize] = *d.add(i);
-            s.rdec_hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    7, reply_decode, blob, 0 => |s, d, len| {
+        s.rdec_in.take(&mut s.rdec, core::slice::from_raw_parts(d, len));
     };
 
-    // Which executor runs each stage, one hex byte per stage, parallel to
+    // Which executor runs each stage, one byte per stage, parallel to
     // `ir_stages`: `00` compute, `01` decision, `02` map. Absent means all
     // compute, which is what a graph that names no executors is asking for.
     // One vector serves every version in the table, hot-reloaded ones included.
+    // More kinds than stages this build runs: refused, not cut short.
     //
     // Declared here rather than inside the stage container because that
     // container's bytes are recorded in a frozen corpus and in every emitted
     // graph: changing its shape would invalidate answers that cannot be
     // regenerated.
-    6, stage_kinds, str, 0 => |s, d, len| {
-        let mut raw = [0u8; MAX_NODE_STAGES * 2];
-        // More kinds than stages this build runs: refused, not cut short.
-        if len > raw.len() { s.param_overflow = true; }
-        let n = if len > raw.len() { raw.len() } else { len };
-        let mut i = 0usize;
-        while i < n {
-            raw[i] = *d.add(i);
-            i += 1;
-        }
-        let mut out = [0u8; MAX_NODE_STAGES];
-        if let Some(nb) = hex_decode(&raw[..n], &mut out) {
-            s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_NODE_STAGES];
-            let mut k = 0usize;
-            while k < nb && k < MAX_NODE_STAGES {
-                s.stage_kinds[k] = out[k];
-                k += 1;
-            }
-            s.stage_kinds_len = nb as u8;
-        } else {
-            s.param_overflow = true;
-        }
+    6, stage_kinds, blob, 0 => |s, d, len| {
+        s.kinds_in.take(&mut s.stage_kinds, core::slice::from_raw_parts(d, len));
     };
-    // A shipped IR-stages container (hex), lowered to a bytecode-stages container
-    // at load (each stage's cost re-derived). `str_chunked`: the stage list
-    // arrives as TLV entries of at most 255 bytes under the same tag and this
-    // handler APPENDS each one.
-    5, ir_stages, str_chunked, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.hex_len as usize) < HEX_BUF {
-            s.hex[s.hex_len as usize] = *d.add(i);
-            s.hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // A shipped IR-stages container, lowered to a bytecode-stages container
+    // at load (each stage's cost re-derived).
+    5, ir_stages, blob, 0 => |s, d, len| {
+        s.ir_in.take(&mut s.ir_scratch, core::slice::from_raw_parts(d, len));
     };
 
     // Which data fields carry the parts of an exchange that are not its body
@@ -1114,13 +1063,14 @@ pub extern "C" fn module_new(
         s.buf_a = [0u8; REC_BUF];
         s.buf_b = [0u8; REC_BUF];
         s.out_buf = [0u8; REC_BUF];
-        s.hex_len = 0;
-        s.enc_hex_len = 0;
+        s.ir_in = BlobIn::new();
+        s.enc_in = BlobIn::new();
         s.enc_len = 0;
-        s.dec_hex_len = 0;
+        s.dec_in = BlobIn::new();
         s.dec_len = 0;
-        s.ver_hex_len = 0;
+        s.ver_in = BlobIn::new();
         s.vbin_len = 0;
+        s.kinds_in = BlobIn::new();
         s.vbin_cand = [0u8; VBIN_BUF];
         s.pending = Pending { off: 0, len: 0 };
         s.stage_kinds = [STAGE_KIND_COMPUTE; MAX_NODE_STAGES];
@@ -1150,7 +1100,7 @@ pub extern "C" fn module_new(
         s.relay_credit = 0;
         s.relay_body_at = 0;
         s.relay_body_len = 0;
-        s.rdec_hex_len = 0;
+        s.rdec_in = BlobIn::new();
         s.rdec_len = 0;
         s.reply_pending = Pending { off: 0, len: 0 };
         s.refused = 0;
@@ -1174,23 +1124,32 @@ pub extern "C" fn module_new(
         s.faulted = 0;
 
         parse_tlv(s, params, params_len);
+        // A program param given but cut short or past its buffer is a FAULT
+        // (below): a truncated program is a different program.
+        let mut cut = false;
+        if s.kinds_in.given() {
+            match s.kinds_in.whole() {
+                Some(n) => s.stage_kinds_len = n as u8,
+                None => cut = true,
+            }
+        }
 
         // Build the version table. A `versions` param is a ready-made table; an
         // `ir_stages` param becomes a single default-version table.
         // Lower the shipped `ir_stages` IR container into the bytecode-stages
         // container `s.prog` (each stage's cost re-derived at load).
-        // FAULT DISCIPLINE: a param that was PROVIDED but is broken — bad
-        // hex, a container that fails to lower, a program this build cannot
+        // FAULT DISCIPLINE: a param that was PROVIDED but is broken — a
+        // program cut short, a container that fails to lower, a program this build cannot
         // run — is a configuration fault, named once at error level; the
         // node then refuses input (visible backpressure) rather than sitting
         // inert while records vanish. "No param" stays a distinct message.
         let mut fault: &'static [u8] = b"";
-        let prog_n = if s.hex_len == 0 {
+        let prog_n = if !s.ir_in.given() {
             None
         } else {
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.ir_scratch) {
+            match s.ir_in.whole() {
                 None => {
-                    fault = b"[pipeline] FAULT: ir_stages param is not valid hex";
+                    cut = true;
                     None
                 }
                 Some(flen) => match lower_stages_kinded(
@@ -1207,10 +1166,10 @@ pub extern "C" fn module_new(
             }
         };
 
-        if s.ver_hex_len > 0 {
-            match hex_decode(&s.ver_hex[..s.ver_hex_len as usize], &mut s.vbin) {
+        if s.ver_in.given() {
+            match s.ver_in.whole() {
                 Some(n) => s.vbin_len = n as u16,
-                None => fault = b"[pipeline] FAULT: versions param is not valid hex",
+                None => cut = true,
             }
         } else if let Some(n) = prog_n {
             // [1][0][digest:8 = 0][tag_len:0][prog_len:u16][prog]
@@ -1239,33 +1198,21 @@ pub extern "C" fn module_new(
             s.vbin_len = w as u16;
         }
 
-        match hex_decode(&s.enc_hex[..s.enc_hex_len as usize], &mut s.enc) {
-            Some(n) => s.enc_len = n as u16,
-            None => {
-                s.enc_len = 0;
-                if s.enc_hex_len > 0 {
-                    fault = b"[pipeline] FAULT: encode param is not valid hex";
+        let mut whole = |b: &BlobIn| -> u16 {
+            if !b.given() {
+                return 0;
+            }
+            match b.whole() {
+                Some(n) => n as u16,
+                None => {
+                    cut = true;
+                    0
                 }
             }
-        }
-        match hex_decode(&s.rdec_hex[..s.rdec_hex_len as usize], &mut s.rdec) {
-            Some(n) => s.rdec_len = n as u16,
-            None => {
-                s.rdec_len = 0;
-                if s.rdec_hex_len > 0 {
-                    fault = b"[pipeline] FAULT: reply_decode param is not valid hex";
-                }
-            }
-        }
-        match hex_decode(&s.dec_hex[..s.dec_hex_len as usize], &mut s.dec) {
-            Some(n) => s.dec_len = n as u16,
-            None => {
-                s.dec_len = 0;
-                if s.dec_hex_len > 0 {
-                    fault = b"[pipeline] FAULT: decode param is not valid hex";
-                }
-            }
-        }
+        };
+        s.enc_len = whole(&s.enc_in);
+        s.rdec_len = whole(&s.rdec_in);
+        s.dec_len = whole(&s.dec_in);
         // Load-time scan of every version's stage programs: unknown opcodes,
         // truncation, builtins not in this build's variant. Refused here,
         // once — never per-record. (`encode`/`decode` are ser/rd byte-VM
@@ -1288,7 +1235,7 @@ pub extern "C" fn module_new(
                 fault = b"[pipeline] FAULT: a stage needs an opcode/builtin not in this build";
             }
         }
-        if s.param_overflow {
+        if s.param_overflow || cut {
             fault = b"[pipeline] FAULT: a param exceeded its buffer and was truncated";
         }
         // The exchange wiring must be one the roles define: a provider owes

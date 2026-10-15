@@ -17,7 +17,7 @@ platform:
 modules:
   - name: expression
     params:
-      ir: "0500010200000014"   # checked IR of order.customer_id (field 2)
+      ir: {hex: "0500010200000014"}   # checked IR of order.customer_id (field 2)
 wiring:
   - from: cli_in.stdin_out
     to: expression.record_in

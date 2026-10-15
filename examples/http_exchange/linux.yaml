@@ -36,9 +36,9 @@ modules:
       status_field: 6
       content_type_field: 7
       # The request body: field 4's bytes.
-      encode: "01000204000000616a"
+      encode: {hex: "01000204000000616a"}
       # The answer body whole, as field 5.
-      reply_decode: "78400500000041"
+      reply_decode: {hex: "78400500000041"}
   - name: http
     # The client's provider ports live in its `exchange` variant.
     variant: exchange

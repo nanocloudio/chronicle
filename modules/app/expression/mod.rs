@@ -1,7 +1,7 @@
 //! Expression evaluator — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the checked-CEL bytecode is NOT baked into the module — it
-//! arrives as a `program` module param (hex-encoded, since a config carries text)
+//! arrives as a `program` module param (a `blob`: `{hex: "…"}` in a graph)
 //! with a `max_cost` ceiling. So one evaluator binary serves ANY Expression: the
 //! `.uproc`/CEL compiler emits the bytecode, a config sets it as the param, and
 //! this module runs it. Two configs with different `program` values produce
@@ -43,7 +43,7 @@ mod expr {
     use super::abi::SyscallTable;
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
-    include!("../../common/hex_core.rs");
+    include!("../../common/blob_core.rs");
     include!("../../common/lower_core.rs");
     include!("../../common/outcome_core.rs");
     include!("../../common/io_core.rs");
@@ -52,7 +52,7 @@ mod expr {
     include!("../../common/expression_step_core.rs");
 }
 use expr::{
-    expr_step, hex_decode, lower_flat, scan_code, Accounting, Mode, Pending, StepResult, SysChan,
+    expr_step, lower_flat, scan_code, Accounting, BlobIn, Mode, Pending, StepResult, SysChan,
     ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
 };
 
@@ -82,7 +82,6 @@ include!("../../common/telemetry_core.rs");
 /// three to one derivation.
 const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
 const REC_BUF: usize = if TINY { 512 } else { 4096 };
-const HEX_BUF: usize = 1024;
 const CODE_BUF: usize = 512;
 
 #[repr(C)]
@@ -95,13 +94,11 @@ struct ModuleState {
     /// One retained output frame, drained before any new input is admitted.
     pending: Pending,
 
-    // Param-driven definition.
-    hex: [u8; HEX_BUF],
-    hex_len: u16,
-    // `true` when the hex holds a flat checked IR (`ir` param) to be lowered at
-    // load, rather than pre-lowered bytecode (`program` param).
-    is_ir: bool,
-    // Scratch for the decoded flat IR before `lower_flat` emits into `code`.
+    // Param-driven definition, `blob` params: pre-lowered bytecode (`program`)
+    // arriving straight into `code`, or a flat checked IR (`ir`) arriving into
+    // `flat` and lowered into `code` at load.
+    prog_in: BlobIn,
+    ir_in: BlobIn,
     flat: [u8; CODE_BUF],
     code: [u8; CODE_BUF],
     code_len: u16,
@@ -115,10 +112,6 @@ struct ModuleState {
     /// 1 = configuration fault at init: the node refuses input (declared
     /// metric; the named reason was logged once at error level).
     faulted: u32,
-    /// Set when a string param exceeded its buffer during parsing. A truncated hex
-    /// program could decode to a DIFFERENT valid program, so an overflow faults the
-    /// candidate rather than running silently-altered bytecode.
-    param_overflow: bool,
     /// Current operating mode (`outcome_core::Mode` as u8), published as the
     /// `module_mode` gauge so an operator can tell ready / output-blocked / faulted
     /// / awaiting-config apart from telemetry alone.
@@ -127,42 +120,25 @@ struct ModuleState {
     tlm_last_ms: u64,
 }
 
-// Module params: the hex bytecode `program` (str, chunk-appended) and its static
-// `max_cost` ceiling. `define_params!` generates `parse_tlv`/`dispatch_param`.
+// Module params: the bytecode `program` (a `blob`) and its static `max_cost`
+// ceiling, or a flat checked IR `ir` (a `blob`) whose cost bound is re-derived.
+// `define_params!` generates `parse_tlv`/`dispatch_param`; each blob arrives
+// in chunks of at most 255, the first led by its whole length (blob_core).
 define_params! {
     ModuleState;
 
-    1, program, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.hex_len as usize) < HEX_BUF {
-            s.hex[s.hex_len as usize] = *d.add(i);
-            s.hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    1, program, blob, 0 => |s, d, len| {
+        s.prog_in.take(&mut s.code, core::slice::from_raw_parts(d, len));
     };
 
     2, max_cost, u32, 8 => |s, d, len| {
         s.max_cost = p_u32(d, len, 0, 8) as u64;
     };
 
-    // A shipped flat checked IR (hex), lowered to bytecode at load. Shares the hex
-    // buffer with `program`; the `is_ir` flag selects the load path. No `max_cost`
-    // is needed — `lower_flat` re-derives the cost bound from the IR itself.
-    // NOTE: `define_params!` generates `set_defaults()`, which invokes EVERY
-    // declared param's closure in declaration order regardless of whether the
-    // config supplies it. So the `is_ir` flag must be set only when this param
-    // actually carries bytes — setting it unconditionally routes a plain
-    // `program` bytecode param through `lower_flat` and fails the load.
-    3, ir, str, 0 => |s, d, len| {
-        if len > 0 { s.is_ir = true; }
-        let mut i = 0usize;
-        while i < len && (s.hex_len as usize) < HEX_BUF {
-            s.hex[s.hex_len as usize] = *d.add(i);
-            s.hex_len += 1;
-            i += 1;
-        }
-        if i < len { s.param_overflow = true; }
+    // A shipped flat checked IR, lowered to bytecode at load. No `max_cost` is
+    // needed — `lower_flat` re-derives the cost bound from the IR itself.
+    3, ir, blob, 0 => |s, d, len| {
+        s.ir_in.take(&mut s.flat, core::slice::from_raw_parts(d, len));
     };
 }
 
@@ -214,13 +190,12 @@ pub extern "C" fn module_new(
         s.in_buf = [0u8; REC_BUF];
         s.out_buf = [0u8; REC_BUF];
         s.pending = Pending { off: 0, len: 0 };
-        s.hex_len = 0;
-        s.is_ir = false;
+        s.prog_in = BlobIn::new();
+        s.ir_in = BlobIn::new();
         s.code_len = 0;
         s.max_cost = 8;
         s.acct = Accounting::default();
         s.faulted = 0;
-        s.param_overflow = false;
         s.mode = Mode::AwaitingConfig.as_u8();
         // Backdate so the FIRST telemetry publish fires promptly (dev_millis is
         // uptime, near 0 at startup), not only after one full interval.
@@ -228,19 +203,19 @@ pub extern "C" fn module_new(
 
         // Decode the param-supplied definition into runnable bytecode.
         //
-        // FAULT DISCIPLINE: a param that was PROVIDED but is broken — bad
-        // hex, failed lowering, an opcode or builtin this build lacks — is a
+        // FAULT DISCIPLINE: a param that was PROVIDED but is broken — cut
+        // short, failed lowering, an opcode or builtin this build lacks — is a
         // configuration fault, named once at error level, and the node
         // refuses input (visible backpressure) rather than sitting inert
         // while records vanish. "No param at all" stays a distinct message:
         // a node awaiting late config is not a broken one.
         parse_tlv(s, params, params_len);
         let mut fault: &'static [u8] = b"";
-        if s.is_ir {
-            // `ir` param: decode the hex to the flat IR, then lower it HERE. A
-            // successful lowering is the proof this module can run it; the cost
-            // bound is re-derived, not trusted.
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.flat) {
+        if s.ir_in.given() {
+            // `ir` param: lower the flat IR HERE. A successful lowering is the
+            // proof this module can run it; the cost bound is re-derived, not
+            // trusted.
+            match s.ir_in.whole() {
                 Some(flen) => match lower_flat(&s.flat[..flen], &mut s.code) {
                     Ok((clen, cost)) => {
                         s.code_len = clen as u16;
@@ -248,13 +223,13 @@ pub extern "C" fn module_new(
                     }
                     Err(_) => fault = b"[expr] FAULT: ir param failed to lower",
                 },
-                None => fault = b"[expr] FAULT: ir param is not valid hex",
+                None => fault = b"[expr] FAULT: ir param cut short or past its buffer",
             }
-        } else if s.hex_len > 0 {
-            // `program` param: pre-lowered bytecode, hex-decoded straight in.
-            match hex_decode(&s.hex[..s.hex_len as usize], &mut s.code) {
+        } else if s.prog_in.given() {
+            // `program` param: pre-lowered bytecode, arrived straight in.
+            match s.prog_in.whole() {
                 Some(n) => s.code_len = n as u16,
-                None => fault = b"[expr] FAULT: program param is not valid hex",
+                None => fault = b"[expr] FAULT: program param cut short or past its buffer",
             }
         }
         // Load-time scan: unknown opcodes, truncation, builtins not in this
@@ -262,18 +237,13 @@ pub extern "C" fn module_new(
         if s.code_len > 0 && scan_code(&s.code[..s.code_len as usize]).is_err() {
             fault = b"[expr] FAULT: program needs an opcode/builtin not in this build";
         }
-        // A param that overflowed its buffer was truncated — fault rather than run
-        // silently-altered bytecode. Checked last so it always wins.
-        if s.param_overflow {
-            fault = b"[expr] FAULT: a param exceeded its buffer and was truncated";
-        }
         if !fault.is_empty() {
             s.code_len = 0;
             s.faulted = 1;
             dev_log(sys, 1, fault.as_ptr(), fault.len());
         } else if s.code_len == 0 {
             dev_log(sys, 3, b"[expr] no program param".as_ptr(), 23);
-        } else if s.is_ir {
+        } else if s.ir_in.given() {
             dev_log(sys, 3, b"[expr] init (ir)".as_ptr(), 16);
         } else {
             dev_log(sys, 3, b"[expr] init".as_ptr(), 11);

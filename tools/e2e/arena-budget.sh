@@ -7,14 +7,14 @@
 # to the graph's exact need.
 #
 # The two graphs differ by ONE BYTE of envelope:
-#   fits  — 57,872 B, exactly what `sensor_intake` (328) + `decision` (57,544)
+#   fits  — 25,104 B, exactly what `sensor_intake` (328) + `decision` (24,776)
 #           need. Must load and decide.
-#   tight — 57,871 B. `decision` must be refused, and nothing must be emitted.
+#   tight — 25,103 B. `decision` must be refused, and nothing must be emitted.
 #
-# 57,544 and 328 are the loader's carves: the module's state size plus a 4-byte
+# 24,776 and 328 are the loader's carves: the module's state size plus a 4-byte
 # canary, 8-byte aligned. The refusal names both (`need=`, `used=`), and the last
 # check below holds the state figure `pack` recorded in each `.fmod` (whole
-# 64-byte units, what compose-time admission charges: 57,536 and 320) to the
+# 64-byte units, what compose-time admission charges: 24,768 and 320) to the
 # carve the loader actually made — so the recorded numbers are the loader's own,
 # not an estimate that happens to look right.
 . "$(dirname "$0")/../lib.sh"
@@ -58,7 +58,7 @@ fi
 # send a reader to rebuild a kernel over a number that had nothing to do with it,
 # so the message has to distinguish them and this asserts that it does.
 if grep -q "deployment envelope" "$E2E_GEN/tight.err" 2>/dev/null &&
-   grep -q "cap=57871" "$E2E_GEN/tight.err" 2>/dev/null; then
+   grep -q "cap=25103" "$E2E_GEN/tight.err" 2>/dev/null; then
   ok "arena admission: the refusal names the envelope and the cap actually in force"
 else
   no arena "the loader refused but named the wrong ceiling: $(grep -o 'STATE ARENA EXHAUSTED.*' "$E2E_GEN/tight.err" 2>/dev/null | head -1)"
@@ -70,7 +70,7 @@ fi
 # module's state size lies in [carve-11, carve-4]; `pack` records that size
 # rounded up to 64 bytes. Each `.fmod`'s recorded figure must be the 64-byte
 # rounding of a size in that window, and the envelope that fits must be the
-# two carves summed — so none of 57,544 / 328 / 57,872 is taken on trust.
+# two carves summed — so none of 24,776 / 328 / 25,104 is taken on trust.
 refusal=$(grep -o 'deployment envelope.*' "$E2E_GEN/tight.err" 2>/dev/null | head -1)
 need=$(printf '%s' "$refusal" | grep -oE 'need=[0-9]+' | grep -oE '[0-9]+')
 used=$(printf '%s' "$refusal" | grep -oE 'used=[0-9]+' | grep -oE '[0-9]+')
