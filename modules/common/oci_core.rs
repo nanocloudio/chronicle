@@ -19,6 +19,13 @@
 // `put_named`/`get_named` and carry no such guarantee — by nature, since a tag
 // is meant to move.
 //
+// A store read may answer "not yet" (`OciError::WouldBlock`). That is never
+// absence: nothing is decided, and in particular `oci_init` must not read it as
+// "no index" and write an empty one over a real index. Every operation that
+// reads does ALL its reads before its first write, so a read that waits returns
+// with nothing written, and the caller asks the same operation again (same
+// [`ReadHold`], same [`OciFetch`]) on a later step.
+//
 // Requires `blobstore_core`, the SDK `sha256`, and a `SyscallTable`.
 
 /// Media types — the `application/vnd.nanocloud.*` convention, matching the host
@@ -55,8 +62,14 @@ pub enum OciError {
     Store,
     /// The store took a write but has not decided it yet.
     Pending,
+    /// A read answered "not yet": nothing is decided and nothing was written
+    /// after it. Ask the same operation again on a later step.
+    WouldBlock,
     /// A referenced blob, tag, or required member is absent.
     NotFound,
+    /// The store refused a read for a reason other than absence (its errno).
+    /// Not absence: nothing is written on the strength of it.
+    ReadFailed(i32),
     /// A caller buffer cannot hold the result.
     TooLarge,
     /// The JSON is not well formed, or lacks a member the layout requires.
@@ -72,7 +85,9 @@ impl From<BlobError> for OciError {
         match e {
             BlobError::PutFailed => OciError::Store,
             BlobError::Pending => OciError::Pending,
+            BlobError::WouldBlock => OciError::WouldBlock,
             BlobError::NotFound => OciError::NotFound,
+            BlobError::ReadFailed(e) => OciError::ReadFailed(e),
             BlobError::TooLarge => OciError::TooLarge,
             BlobError::DigestMismatch => OciError::DigestMismatch,
         }
@@ -379,11 +394,25 @@ pub struct Layer<'a> {
 /// Initialize an image layout: write `oci-layout` and, if absent, an empty
 /// `index.json`. Idempotent — re-opening an existing store keeps its index.
 ///
+/// Only an index the store reports ABSENT is replaced. The read comes first: a
+/// "not yet" returns `WouldBlock` with nothing written, so a store that has not
+/// answered yet can never be mistaken for an empty one; a read the store
+/// refused (`ReadFailed`) likewise returns with nothing written.
+///
 /// # Safety
 /// `sys` must be the module's live syscall table.
-pub unsafe fn oci_init(sys: &SyscallTable, scratch: &mut [u8]) -> Result<(), OciError> {
+pub unsafe fn oci_init(
+    sys: &SyscallTable,
+    hold: &mut ReadHold,
+    scratch: &mut [u8],
+) -> Result<(), OciError> {
+    let absent = match get_named(sys, hold, KEY_INDEX, scratch) {
+        Ok(_) => false,
+        Err(BlobError::NotFound) => true,
+        Err(e) => return Err(e.into()),
+    };
     put_named(sys, KEY_LAYOUT, LAYOUT_BODY)?;
-    if get_named(sys, KEY_INDEX, scratch).is_err() {
+    if absent {
         put_named(sys, KEY_INDEX, EMPTY_INDEX)?;
     }
     Ok(())
@@ -400,10 +429,14 @@ pub unsafe fn oci_init(sys: &SyscallTable, scratch: &mut [u8]) -> Result<(), Oci
 /// `manifest_buf` receives the manifest JSON and `index_buf` the rewritten
 /// index; both are caller-owned so this core allocates nothing.
 ///
+/// The index is read FIRST, before any blob is written: a "not yet" returns
+/// `WouldBlock` with nothing written, and the caller asks again, same `hold`.
+///
 /// # Safety
 /// `sys` must be the module's live syscall table.
 pub unsafe fn oci_push(
     sys: &SyscallTable,
+    hold: &mut ReadHold,
     layers: &[Layer],
     tag: &[u8],
     provenance: &[u8],
@@ -418,6 +451,9 @@ pub unsafe fn oci_push(
     if layers.len() > MAX_LAYERS {
         return Err(OciError::TooMany);
     }
+    // 0. The current index, before anything is written (see above).
+    let ilen = get_named(sys, hold, KEY_INDEX, read_buf)?;
+
     // 1. Every layer becomes a blob under its own digest.
     let mut digests = [[0u8; 32]; MAX_LAYERS];
     for (i, l) in layers.iter().enumerate() {
@@ -455,9 +491,8 @@ pub unsafe fn oci_push(
     let mlen = w.finish()?;
     let manifest_digest = blob_put(sys, &manifest_buf[..mlen])?;
 
-    // 4. Rewrite index.json: drop any entry already holding this tag, then
-    //    append the new one. Digests are truth; tags move.
-    let ilen = get_named(sys, KEY_INDEX, read_buf)?;
+    // 4. Rewrite index.json (read in step 0): drop any entry already holding
+    //    this tag, then append the new one. Digests are truth; tags move.
     let idx = &read_buf[..ilen];
     let manifests_pos = obj_find(idx, 0, b"manifests").ok_or(OciError::Malformed)?;
     let mut elems = [0usize; MAX_INDEX_ENTRIES];
@@ -505,10 +540,11 @@ pub unsafe fn oci_push(
 /// `sys` must be the module's live syscall table.
 pub unsafe fn oci_resolve_tag(
     sys: &SyscallTable,
+    hold: &mut ReadHold,
     tag: &[u8],
     read_buf: &mut [u8],
 ) -> Result<[u8; 32], OciError> {
-    let ilen = get_named(sys, KEY_INDEX, read_buf)?;
+    let ilen = get_named(sys, hold, KEY_INDEX, read_buf)?;
     let idx = &read_buf[..ilen];
     let manifests_pos = obj_find(idx, 0, b"manifests").ok_or(OciError::Malformed)?;
     let mut elems = [0usize; MAX_INDEX_ENTRIES];
@@ -522,6 +558,27 @@ pub unsafe fn oci_resolve_tag(
     Err(OciError::NotFound)
 }
 
+/// A fetch in progress, kept across steps: whether the manifest is in
+/// `manifest_buf` (and how long), the next layer to read, and the read parked
+/// on a "not yet". A fetch that ends (answer or error) leaves it fresh.
+pub struct OciFetch {
+    pub hold: ReadHold,
+    mlen: usize,
+    have_manifest: bool,
+    next: usize,
+}
+
+impl OciFetch {
+    pub const fn new() -> Self {
+        Self {
+            hold: ReadHold::new(),
+            mlen: 0,
+            have_manifest: false,
+            next: 0,
+        }
+    }
+}
+
 /// Fetch a bundle by manifest digest, handing each layer to `on_layer` as
 /// `(media_type, name, bytes)`.
 ///
@@ -529,10 +586,43 @@ pub unsafe fn oci_resolve_tag(
 /// fails the content-address check here rather than being handed on — fetch
 /// VERIFIES, it does not merely read.
 ///
+/// `WouldBlock`: the fetch is held in `fetch` — layers already handed to
+/// `on_layer` are not handed again — and the caller asks again with the same
+/// `fetch`, digest and (untouched) `manifest_buf` on a later step.
+///
 /// # Safety
 /// `sys` must be the module's live syscall table.
 pub unsafe fn oci_fetch<F>(
     sys: &SyscallTable,
+    fetch: &mut OciFetch,
+    manifest_digest: &[u8; 32],
+    manifest_buf: &mut [u8],
+    layer_buf: &mut [u8],
+    on_layer: F,
+) -> Result<usize, OciError>
+where
+    F: FnMut(&[u8], &[u8], &[u8]),
+{
+    let r = oci_fetch_inner(
+        sys,
+        fetch,
+        manifest_digest,
+        manifest_buf,
+        layer_buf,
+        on_layer,
+    );
+    if !matches!(r, Err(OciError::WouldBlock)) {
+        fetch.hold.release(sys);
+        *fetch = OciFetch::new();
+    }
+    r
+}
+
+/// # Safety
+/// `sys` must be the module's live syscall table.
+unsafe fn oci_fetch_inner<F>(
+    sys: &SyscallTable,
+    fetch: &mut OciFetch,
     manifest_digest: &[u8; 32],
     manifest_buf: &mut [u8],
     layer_buf: &mut [u8],
@@ -541,7 +631,15 @@ pub unsafe fn oci_fetch<F>(
 where
     F: FnMut(&[u8], &[u8], &[u8]),
 {
-    let mlen = blob_get(sys, manifest_digest, manifest_buf)?;
+    if !fetch.have_manifest {
+        fetch.mlen = blob_get(sys, &mut fetch.hold, manifest_digest, manifest_buf)?;
+        fetch.have_manifest = true;
+        fetch.next = 0;
+    }
+    let mlen = fetch.mlen;
+    if mlen > manifest_buf.len() {
+        return Err(OciError::TooLarge);
+    }
     // Copy the layer descriptors out before `manifest_buf` is reused: offsets
     // into it stop being valid the moment a layer is read.
     let mut descs = [([0u8; 32], 0usize, 0usize, 0usize, 0usize); MAX_LAYERS];
@@ -568,7 +666,10 @@ where
 
     let mut media = [0u8; 64];
     let mut name = [0u8; 128];
-    for &(digest, ms, me, ns, ne) in descs.iter().take(ndesc) {
+    for (i, &(digest, ms, me, ns, ne)) in descs.iter().take(ndesc).enumerate() {
+        if i < fetch.next {
+            continue; // handed on in an earlier step
+        }
         let mlen2 = me - ms;
         let nlen2 = ne - ns;
         if mlen2 > media.len() || nlen2 > name.len() {
@@ -576,8 +677,9 @@ where
         }
         media[..mlen2].copy_from_slice(&manifest_buf[ms..me]);
         name[..nlen2].copy_from_slice(&manifest_buf[ns..ne]);
-        let blen = blob_get(sys, &digest, layer_buf)?; // verifies the address
+        let blen = blob_get(sys, &mut fetch.hold, &digest, layer_buf)?; // verifies the address
         on_layer(&media[..mlen2], &name[..nlen2], &layer_buf[..blen]);
+        fetch.next = i + 1;
     }
     Ok(ndesc)
 }

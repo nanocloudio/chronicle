@@ -26,6 +26,11 @@
 // state, but consistent. The reverse order would leave it pointing at bytes that
 // were never written, which is unrecoverable.
 //
+// A read that answers "not yet" (`WouldBlock`) decides nothing: it is not "no
+// checkpoint". The load is held where it was — the pointer already followed is
+// kept in [`CkptLoad`], the pending read's handle in its [`ReadHold`] — and the
+// caller asks again on a later step.
+//
 // Requires `blobstore_core` and a `SyscallTable`.
 
 /// Store key holding the digest of the most recent checkpoint.
@@ -38,8 +43,14 @@ pub enum CkptError {
     Store,
     /// The store took a write but has not decided it yet.
     Pending,
+    /// A read answered "not yet": nothing is decided. Hold the operation and
+    /// ask again on a later step; never read this as "no checkpoint".
+    WouldBlock,
     /// No checkpoint has been saved, or the one referenced is absent.
     NotFound,
+    /// The store refused a read for a reason other than absence (its errno).
+    /// Never "no checkpoint": the pointer or body may exist.
+    ReadFailed(i32),
     /// The caller's buffer cannot hold the checkpoint.
     TooLarge,
     /// The bytes read do not hash to the digest they were stored under.
@@ -53,7 +64,9 @@ impl From<BlobError> for CkptError {
         match e {
             BlobError::PutFailed => CkptError::Store,
             BlobError::Pending => CkptError::Pending,
+            BlobError::WouldBlock => CkptError::WouldBlock,
             BlobError::NotFound => CkptError::NotFound,
+            BlobError::ReadFailed(e) => CkptError::ReadFailed(e),
             BlobError::TooLarge => CkptError::TooLarge,
             BlobError::DigestMismatch => CkptError::DigestMismatch,
         }
@@ -74,43 +87,95 @@ pub unsafe fn ckpt_save(sys: &SyscallTable, snapshot: &[u8]) -> Result<[u8; 32],
     Ok(digest)
 }
 
+/// A `latest` load in progress, kept across steps: the pointer once followed,
+/// and the read parked on a "not yet". A load that ends (answer or error)
+/// leaves it fresh for the next.
+pub struct CkptLoad {
+    pub hold: ReadHold,
+    digest: [u8; 32],
+    have_digest: bool,
+}
+
+impl CkptLoad {
+    pub const fn new() -> Self {
+        Self {
+            hold: ReadHold::new(),
+            digest: [0u8; 32],
+            have_digest: false,
+        }
+    }
+}
+
 /// Read the checkpoint `latest` points at. Returns its length in `dst`.
+///
+/// `WouldBlock`: the load is held in `load` — the pointer, if already read,
+/// is not read again — and the caller asks again, same `load`, on a later step.
 ///
 /// # Safety
 /// `sys` must be the module's live syscall table.
 pub unsafe fn ckpt_load_latest(
     sys: &SyscallTable,
+    load: &mut CkptLoad,
     dst: &mut [u8],
 ) -> Result<(usize, [u8; 32]), CkptError> {
-    let mut hex = [0u8; 64];
-    let n = get_named(sys, KEY_LATEST, &mut hex)?;
-    if n != 64 {
-        return Err(CkptError::CorruptPointer);
+    let r = ckpt_load_latest_inner(sys, load, dst);
+    if !matches!(r, Err(CkptError::WouldBlock)) {
+        load.hold.release(sys);
+        load.have_digest = false;
     }
-    let digest = digest_of(&hex).ok_or(CkptError::CorruptPointer)?;
-    let len = blob_get(sys, &digest, dst)?; // verifies the content address
+    r
+}
+
+/// # Safety
+/// `sys` must be the module's live syscall table.
+unsafe fn ckpt_load_latest_inner(
+    sys: &SyscallTable,
+    load: &mut CkptLoad,
+    dst: &mut [u8],
+) -> Result<(usize, [u8; 32]), CkptError> {
+    if !load.have_digest {
+        let mut hex = [0u8; 64];
+        let n = get_named(sys, &mut load.hold, KEY_LATEST, &mut hex)?;
+        if n != 64 {
+            return Err(CkptError::CorruptPointer);
+        }
+        load.digest = digest_of(&hex).ok_or(CkptError::CorruptPointer)?;
+        load.have_digest = true;
+    }
+    let digest = load.digest;
+    let len = blob_get(sys, &mut load.hold, &digest, dst)?; // verifies the content address
     Ok((len, digest))
 }
 
 /// Read a specific checkpoint by digest, verifying content addressing.
+/// `WouldBlock`: ask again, same `hold`, on a later step.
 ///
 /// # Safety
 /// `sys` must be the module's live syscall table.
 pub unsafe fn ckpt_load(
     sys: &SyscallTable,
+    hold: &mut ReadHold,
     digest: &[u8; 32],
     dst: &mut [u8],
 ) -> Result<usize, CkptError> {
-    Ok(blob_get(sys, digest, dst)?)
+    Ok(blob_get(sys, hold, digest, dst)?)
 }
 
 /// Whether a checkpoint has ever been saved.
 ///
+/// `Err(WouldBlock)` is "not known yet" — neither yes nor no: ask again, same
+/// `hold`, on a later step. Only an absent pointer is `Ok(false)`; a read the
+/// store refused is `Err(ReadFailed)`, never "none".
+///
 /// # Safety
 /// `sys` must be the module's live syscall table.
-pub unsafe fn ckpt_has_latest(sys: &SyscallTable) -> bool {
+pub unsafe fn ckpt_has_latest(sys: &SyscallTable, hold: &mut ReadHold) -> Result<bool, CkptError> {
     let mut hex = [0u8; 64];
-    get_named(sys, KEY_LATEST, &mut hex) == Ok(64)
+    match get_named(sys, hold, KEY_LATEST, &mut hex) {
+        Ok(n) => Ok(n == 64),
+        Err(BlobError::NotFound) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn hex_of(digest: &[u8; 32], out: &mut [u8; 64]) {

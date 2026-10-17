@@ -196,6 +196,7 @@ use tc::{
     Branch,
     Builder,
     CkptError,
+    CkptLoad,
     Connector,
     DecisionSpec,
     Doc,
@@ -210,10 +211,12 @@ use tc::{
     ModuleSpec,
     NodeState,
     OciError,
+    OciFetch,
     OperatorSpec,
     PipelineSpec,
     PlanStage,
     PushBufs,
+    ReadHold,
     RegError,
     ReleaseError,
     ResourceBinding,
@@ -314,6 +317,11 @@ const _: () = assert!(OUT_BUF <= u16::MAX as usize);
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
 /// it early; an empty argv — no `--` — never arrives, so we fall through).
 const ARGV_WAIT: u32 = 2000;
+/// The exit code a command returns when a store read answered "not yet". Not
+/// an exit status: the command is HELD — its argv kept, its progress in `Work`
+/// — and asked again on the next step, so nothing is printed and nothing after
+/// the waiting read is written. No real exit status is negative.
+const WAIT: i32 = i32::MIN;
 
 /// Module state: the step's delivery bookkeeping, the argv record, and the
 /// command [`Work`] area. The argv record sits BESIDE `Work` rather than in
@@ -332,6 +340,8 @@ struct State {
     /// 1 once the command has run and produced (`out`, exit code). The command is
     /// side-effecting (`put`/`get`, OCI writes), so it runs EXACTLY once; delivery
     /// of its output and exit status then retries across steps without re-running it.
+    /// A command held on a read (`held`) has produced nothing yet: it is asked
+    /// again, and it does every read before its first write, so nothing repeats.
     result_ready: u8,
     /// The produced stdout length and how much of it has been delivered.
     res_olen: u16,
@@ -339,6 +349,11 @@ struct State {
     /// The produced exit code and whether it has been delivered.
     res_code: i32,
     exit_done: u8,
+    /// 1 while a command is held on a store read that answered "not yet":
+    /// its argv record (`arec[..held_alen]`) is kept and the command is asked
+    /// again next step instead of reading a new record.
+    held: u8,
+    held_alen: u32,
     arec: [u8; ARGV_BUF],
     w: Work,
 }
@@ -349,6 +364,19 @@ struct State {
 #[repr(C)]
 struct Work {
     syscalls: *const SyscallTable,
+    /// The store read a held command is parked on (`get`, `oci-init`,
+    /// `oci-push`, `oci-resolve`, `slot-verify`).
+    hold: ReadHold,
+    /// `ckpt-load`'s progress across a held read.
+    ckload: CkptLoad,
+    /// `oci-fetch`'s progress across a held read, and the stdout it has
+    /// written so far (layers already printed are not fetched again).
+    fetch: OciFetch,
+    fetch_p: usize,
+    fetch_overflowed: bool,
+    /// `slot-verify`'s verifier once the header is read: a held window read
+    /// resumes the stream where it stopped rather than rereading the image.
+    slot_v: Option<SlotVerifier>,
     /// Hex-decoded input: a `.uproc` document for `author`/`parse`, or a
     /// smaller artefact for the other subcommands.
     ir: [u8; UPROC_BUF],
@@ -811,18 +839,31 @@ fn cmd_slot_verify(s: &mut Work, arg: &[u8], abi_hex: &[u8]) -> (usize, i32) {
     // The header settles structure, epoch and the ABI pin after one small read,
     // so a mismatched image is refused before its payload is fetched at all.
     // SAFETY: `s.syscalls` is the live table installed by module_new.
-    let head = match unsafe { blob_range(&*s.syscalls, &digest, 0, &mut s.cont) } {
-        Ok(n) => n,
-        Err(_) => return (append(&mut s.out, 0, b"error: image not in the store\n"), 1),
-    };
-    let mut v = match SlotVerifier::begin(&s.cont[..head], &abi) {
-        Ok(v) => v,
-        Err(e) => {
-            let mut p = append(&mut s.out, 0, b"error: ");
-            p = append_slot_reason(&mut s.out, p, e);
-            p = append(&mut s.out, p, b"\n");
-            return (p, 1);
+    //
+    // A read that answers "not yet" holds the command (`WAIT`): the verifier
+    // and the parked read stay in `Work`, and the next step resumes the stream
+    // at the same window.
+    if s.slot_v.is_none() {
+        let head = match unsafe { blob_range(&*s.syscalls, &mut s.hold, &digest, 0, &mut s.cont) } {
+            Ok(n) => n,
+            Err(BlobError::WouldBlock) => return (0, WAIT),
+            Err(BlobError::NotFound) => {
+                return (append(&mut s.out, 0, b"error: image not in the store\n"), 1)
+            }
+            Err(e) => return (oci_err(&mut s.out, OciError::from(e)), 1),
+        };
+        match SlotVerifier::begin(&s.cont[..head], &abi) {
+            Ok(v) => s.slot_v = Some(v),
+            Err(e) => {
+                let mut p = append(&mut s.out, 0, b"error: ");
+                p = append_slot_reason(&mut s.out, p, e);
+                p = append(&mut s.out, p, b"\n");
+                return (p, 1);
+            }
         }
+    }
+    let Some(v) = s.slot_v.as_mut() else {
+        return (append(&mut s.out, 0, b"error: slot verifier lost\n"), 1);
     };
 
     // Stream the payload. `next_range` says exactly what is still wanted, so the
@@ -832,15 +873,18 @@ fn cmd_slot_verify(s: &mut Work, arg: &[u8], abi_hex: &[u8]) -> (usize, i32) {
         if want == 0 {
             break;
         }
-        let n = match unsafe { blob_range(&*s.syscalls, &digest, at as u64, &mut s.cont) } {
-            Ok(n) => n,
-            Err(_) => {
-                return (
-                    append(&mut s.out, 0, b"error: short read from the store\n"),
-                    1,
-                )
-            }
-        };
+        let n =
+            match unsafe { blob_range(&*s.syscalls, &mut s.hold, &digest, at as u64, &mut s.cont) }
+            {
+                Ok(n) => n,
+                Err(BlobError::WouldBlock) => return (0, WAIT),
+                Err(_) => {
+                    return (
+                        append(&mut s.out, 0, b"error: short read from the store\n"),
+                        1,
+                    );
+                }
+            };
         if n == 0 {
             // No progress: the store has less than the header promised.
             return (
@@ -861,6 +905,9 @@ fn cmd_slot_verify(s: &mut Work, arg: &[u8], abi_hex: &[u8]) -> (usize, i32) {
         }
     }
 
+    let Some(v) = s.slot_v.take() else {
+        return (append(&mut s.out, 0, b"error: slot verifier lost\n"), 1);
+    };
     match v.finish() {
         Ok(sum) => {
             let mut p = append(&mut s.out, 0, b"ok epoch ");
@@ -1244,8 +1291,11 @@ fn cmd_ckpt_save(s: &mut Work, hex: &[u8]) -> (usize, i32) {
 /// node takes on restart, when nobody is around to tell it a digest.
 fn cmd_ckpt_load(s: &mut Work) -> (usize, i32) {
     // SAFETY: `s.syscalls` is the live table installed by module_new.
-    match unsafe { ckpt_load_latest(&*s.syscalls, &mut s.scratch) } {
+    // A read that answers "not yet" holds the command: `ckload` keeps the
+    // pointer already followed and the parked read for the next step.
+    match unsafe { ckpt_load_latest(&*s.syscalls, &mut s.ckload, &mut s.scratch) } {
         Ok((n, _)) => emit_hex_buf(&s.scratch, n, &mut s.out),
+        Err(CkptError::WouldBlock) => (0, WAIT),
         Err(e) => (ckpt_err(&mut s.out, e), 1),
     }
 }
@@ -1264,7 +1314,15 @@ fn ckpt_err(out: &mut [u8], e: CkptError) -> usize {
             0,
             b"error: the store has not decided the write yet; repeating the command is safe\n",
         ),
+        CkptError::WouldBlock => {
+            append(out, 0, b"error: the store has not answered the read yet\n")
+        }
         CkptError::NotFound => append(out, 0, b"error: no checkpoint saved\n"),
+        // Never "no checkpoint": the store could not say.
+        CkptError::ReadFailed(errno) => {
+            let p = append_read_failed(out, errno);
+            append(out, p, b"; a checkpoint may exist\n")
+        }
         CkptError::TooLarge => append(out, 0, b"error: checkpoint too large for the buffers\n"),
         CkptError::DigestMismatch => append(
             out,
@@ -1449,8 +1507,11 @@ fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -
 /// if it is not already there. Idempotent.
 fn cmd_oci_init(s: &mut Work) -> (usize, i32) {
     // SAFETY: `s.syscalls` is the live table installed by module_new.
-    match unsafe { oci_init(&*s.syscalls, &mut s.scratch) } {
+    // "Not yet" on the index read holds the command with nothing written: a
+    // store that has not answered is never taken for one with no index.
+    match unsafe { oci_init(&*s.syscalls, &mut s.hold, &mut s.scratch) } {
         Ok(()) => (append(&mut s.out, 0, b"ok\n"), 0),
+        Err(OciError::WouldBlock) => (0, WAIT),
         Err(e) => (oci_err(&mut s.out, e), 1),
     }
 }
@@ -1472,6 +1533,7 @@ fn cmd_oci_push(s: &mut Work, hex: &[u8], tag: &[u8]) -> (usize, i32) {
     let r = unsafe {
         oci_push(
             &*s.syscalls,
+            &mut s.hold,
             &layers,
             tag,
             b"local-build",
@@ -1485,6 +1547,8 @@ fn cmd_oci_push(s: &mut Work, hex: &[u8], tag: &[u8]) -> (usize, i32) {
     };
     match r {
         Ok(d) => print_digest(&mut s.out, &d),
+        // The index read comes before any write, so a held push wrote nothing.
+        Err(OciError::WouldBlock) => (0, WAIT),
         Err(e) => (oci_err(&mut s.out, e), 1),
     }
 }
@@ -1492,8 +1556,9 @@ fn cmd_oci_push(s: &mut Work, hex: &[u8], tag: &[u8]) -> (usize, i32) {
 /// `oci-resolve <tag>`: print the bundle digest a tag currently points at.
 fn cmd_oci_resolve(s: &mut Work, tag: &[u8]) -> (usize, i32) {
     // SAFETY: `s.syscalls` is the live table installed by module_new.
-    match unsafe { oci_resolve_tag(&*s.syscalls, tag, &mut s.scratch) } {
+    match unsafe { oci_resolve_tag(&*s.syscalls, &mut s.hold, tag, &mut s.scratch) } {
         Ok(d) => print_digest(&mut s.out, &d),
+        Err(OciError::WouldBlock) => (0, WAIT),
         Err(e) => (oci_err(&mut s.out, e), 1),
     }
 }
@@ -1505,15 +1570,18 @@ fn cmd_oci_fetch(s: &mut Work, hex: &[u8]) -> (usize, i32) {
     if hex.len() != 64 || hex_decode(hex, &mut d) != Some(32) {
         return (append(&mut s.out, 0, b"error: need a 64-char digest\n"), 1);
     }
-    let mut p = 0usize;
+    // Kept in `Work` across a held read: the layers already printed stay
+    // printed and are not fetched again.
+    let mut p = s.fetch_p;
     // Set if any layer did not fit the output buffer. `append` clamps, so
     // without this a truncated line would read as a complete one.
-    let mut overflowed = false;
+    let mut overflowed = s.fetch_overflowed;
     let out = &mut s.out;
     // SAFETY: `s.syscalls` is the live table installed by module_new.
     let r = unsafe {
         oci_fetch(
             &*s.syscalls,
+            &mut s.fetch,
             &d,
             &mut s.cont,
             &mut s.code,
@@ -1530,6 +1598,11 @@ fn cmd_oci_fetch(s: &mut Work, hex: &[u8]) -> (usize, i32) {
         )
     };
     match r {
+        Err(OciError::WouldBlock) => {
+            s.fetch_p = p;
+            s.fetch_overflowed = overflowed;
+            (0, WAIT)
+        }
         Ok(_) if overflowed => (
             append(out, 0, b"error: a layer is larger than the output buffer\n"),
             1,
@@ -1537,6 +1610,17 @@ fn cmd_oci_fetch(s: &mut Work, hex: &[u8]) -> (usize, i32) {
         Ok(_) => (p, 0),
         Err(e) => (oci_err(out, e), 1),
     }
+}
+
+/// `error: the store failed the read (errno N)` — a refusal that is not
+/// absence (`EIO`, `ENOSPC`, `EACCES`, …). The caller finishes the line.
+fn append_read_failed(out: &mut [u8], errno: i32) -> usize {
+    let code = errno.unsigned_abs();
+    let mut d = [0u8; 4];
+    let dl = dec_u8(if code > 255 { 255 } else { code as u8 }, &mut d);
+    let mut p = append(out, 0, b"error: the store failed the read (errno ");
+    p = append(out, p, &d[..dl]);
+    append(out, p, b")")
 }
 
 /// Append an OCI failure reason. Written as appends inside the match rather than
@@ -1554,7 +1638,13 @@ fn oci_err(out: &mut [u8], e: OciError) -> usize {
             0,
             b"error: the store has not decided the write yet; repeating the command is safe\n",
         ),
+        OciError::WouldBlock => append(out, 0, b"error: the store has not answered the read yet\n"),
         OciError::NotFound => append(out, 0, b"error: not found\n"),
+        // Never "not found": the store could not say, and nothing was written.
+        OciError::ReadFailed(errno) => {
+            let p = append_read_failed(out, errno);
+            append(out, p, b"; nothing was written\n")
+        }
         OciError::TooLarge => append(out, 0, b"error: too large for the bounded buffers\n"),
         OciError::Malformed => append(out, 0, b"error: malformed index or manifest json\n"),
         OciError::DigestMismatch => append(
@@ -1596,8 +1686,10 @@ fn cmd_get(s: &mut Work, hex: &[u8]) -> (usize, i32) {
         );
     }
     // SAFETY: `s.syscalls` is the live table installed by module_new.
-    let r = unsafe { blob_get(&*s.syscalls, &digest, &mut s.cont) };
+    let r = unsafe { blob_get(&*s.syscalls, &mut s.hold, &digest, &mut s.cont) };
     match r {
+        // "Not yet" is not "not found": hold the command and ask again.
+        Err(BlobError::WouldBlock) => (0, WAIT),
         Ok(n) => {
             let mut p = append_hex(&mut s.out, 0, &s.cont[..n]);
             p = append(&mut s.out, p, b"\n");
@@ -1611,7 +1703,8 @@ fn cmd_get(s: &mut Work, hex: &[u8]) -> (usize, i32) {
             ),
             1,
         ),
-        Err(_) => (append(&mut s.out, 0, b"error: not found\n"), 1),
+        Err(BlobError::NotFound) => (append(&mut s.out, 0, b"error: not found\n"), 1),
+        Err(e) => (oci_err(&mut s.out, OciError::from(e)), 1),
     }
 }
 
@@ -1974,6 +2067,16 @@ pub extern "C" fn module_new(
         s.out_off = 0;
         s.res_code = 0;
         s.exit_done = 0;
+        s.held = 0;
+        s.held_alen = 0;
+        // No drop glue in any of these, so assigning over the arena's
+        // uninitialised bytes is a plain store.
+        s.w.hold = ReadHold::new();
+        s.w.ckload = CkptLoad::new();
+        s.w.fetch = OciFetch::new();
+        s.w.fetch_p = 0;
+        s.w.fetch_overflowed = false;
+        s.w.slot_v = None;
         0
     }
 }
@@ -2001,12 +2104,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Read the argv record (one NUL-separated record from cli_in). Retry a
             // bounded number of steps; an empty argv (no `--`) never arrives, so we
             // fall through to `help`.
-            let an = if s.args_chan >= 0 {
+            // A held command already has its argv record: ask it again
+            // rather than read a new one.
+            let an = if s.held != 0 {
+                s.held_alen as i32
+            } else if s.args_chan >= 0 {
                 (sys.channel_read)(s.args_chan, s.arec.as_mut_ptr(), s.arec.len())
             } else {
                 0
             };
-            if an <= 0 {
+            if an <= 0 && s.held == 0 {
                 s.waited += 1;
                 if s.waited < ARGV_WAIT {
                     return 0; // keep waiting for argv
@@ -2352,6 +2459,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             };
 
+            if code == WAIT {
+                // A store read answered "not yet". The command decided
+                // nothing and wrote nothing after that read; it is asked
+                // again on the next step — never within this one, since a
+                // store frees room only between steps.
+                s.held = 1;
+                s.held_alen = alen as u32;
+                return 0;
+            }
+            s.held = 0;
             s.res_olen = olen as u16;
             s.res_code = code;
             s.out_off = 0;
