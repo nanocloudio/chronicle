@@ -14,11 +14,19 @@
 // Work. Every phase is incremental and runs in caller-owned memory (`mem`, passed
 // to each call). `push` stores a record or reports the buffer full;
 // `step(mem, store, work)` does at most `work` units (heap sifts, records moved)
-// of sorting, spilling or merging; `next` hands out one record of the result. A
-// store read may answer `Pending` ("ask again"): the core keeps the request and
-// repeats it unchanged on the next call. Store writes are synchronous and bounded
-// by the store's write chunk; a store that cannot take one yet answers `ready`
-// false, and the step pauses with nothing lost.
+// of sorting, spilling or merging; `next` hands out one record of the result.
+//
+// Backpressure. Any store call may answer "not yet": a read `Read::Pending`, and
+// a run's create, a block chunk's write or a run's commit `Put::Pending` (over
+// `storage.object`: `PUT_STREAMED_OPEN` / `PUT_STREAMED_WRITE` `EAGAIN`, nothing
+// taken; `PUT_STREAMED_COMMIT` `EINPROGRESS`, ask again byte-identical). The sort
+// then parks exactly where it was — the run not yet created, the block flushed
+// up to the chunk refused, the run not yet sealed — and the call returns; the
+// next `step` (or `next`) asks the same thing again, ahead of anything after it.
+// So nothing is restarted, dropped or written twice, and nothing is asked twice
+// within one step: a store frees room only between steps. A store that persists
+// behind its calls can also answer `ready` false before a block is flushed; the
+// step pauses the same way.
 //
 // Runs. A run is a sequence of BLOCKS: `[payload_len: u32 LE][crc32c: u32 LE]
 // [payload]`, where the payload is whole, non-empty records. The sorter records
@@ -82,15 +90,35 @@ pub enum Read {
     Err(i32),
 }
 
+/// What a store write-path call (`create`, `write`, `commit`) answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Put {
+    /// Taken (for `write`: the whole chunk — there is no short count).
+    Done,
+    /// Not yet, and nothing moved: no run opened, no byte of the chunk taken,
+    /// or the commit not yet decided. The sort asks the same call again with
+    /// the same arguments on a later step, never within this one.
+    Pending,
+    /// Refused (the store's errno); the sort fails.
+    Err(i32),
+}
+
 /// Where runs live. Implemented by the consuming module over its storage
 /// grant (sector's `relop`: `storage.object` on a scratch volume), and in
 /// memory by the host tests. Run ids are small integers the core allocates.
 pub trait RunStore {
-    /// Largest single `write` the store accepts synchronously.
+    /// Largest single `write` the store accepts.
     fn write_chunk(&self) -> usize;
-    fn create(&mut self, run: u32) -> Result<(), i32>;
-    fn write(&mut self, run: u32, bytes: &[u8]) -> Result<(), i32>;
-    fn commit(&mut self, run: u32) -> Result<(), i32>;
+    /// Open run `run` for writing. `Pending`: no run was opened; the same id
+    /// is asked again later.
+    fn create(&mut self, run: u32) -> Put;
+    /// Append `bytes` (at most `write_chunk`) to the open run. All or
+    /// nothing: `Pending` took none of them, and the same bytes are sent
+    /// again before any later byte of the run.
+    fn write(&mut self, run: u32, bytes: &[u8]) -> Put;
+    /// Seal the run: every byte written is its content. `Pending`: not yet
+    /// decided; asked again, unchanged, until it is. No write follows it.
+    fn commit(&mut self, run: u32) -> Put;
     /// Read up to `buf.len()` bytes at `offset` of committed run `run`. A
     /// short read is legal: the sorter asks again at the offset after it.
     fn read_at(&mut self, run: u32, offset: u64, buf: &mut [u8]) -> Read;
@@ -400,6 +428,12 @@ pub struct Sorter {
     wrun: u32,
     wrun_open: bool,
     wrun_bytes: u64,
+    /// The write block at `m[0..block]` is being flushed: its header is
+    /// stamped and `flush_off` of its bytes are taken. The block is frozen
+    /// until the rest is, and a store that answered `Pending` gets the chunk
+    /// at `flush_off` again.
+    flushing: bool,
+    flush_off: usize,
     // runs
     runs: [RunInfo; EXT_MAX_RUNS],
     nruns: usize,
@@ -414,11 +448,14 @@ pub struct Sorter {
     final_runs: [u32; EXT_MAX_FANIN],
     nfinal: usize,
     reduce_out: u32,
+    /// The reduce pass's output run is created (its create may be pending).
+    reduce_open: bool,
     /// Records the reduce pass in progress has written to `reduce_out`.
     reduce_emitted: u64,
     /// A reduce pass runs while input is still arriving; resume filling after.
     reduce_then_fill: bool,
-    /// The store had no room for a block: `step` returns and resumes later.
+    /// The store had no room, or answered `Pending`: `step` returns and
+    /// resumes at the same point on the next call.
     blocked: bool,
     /// Only the first `limit` records of the result are wanted (0 = all).
     limit: u64,
@@ -528,6 +565,8 @@ impl Sorter {
             wrun: 0,
             wrun_open: false,
             wrun_bytes: 0,
+            flushing: false,
+            flush_off: 0,
             runs: [RunInfo {
                 id: 0,
                 live: false,
@@ -542,6 +581,7 @@ impl Sorter {
             final_runs: [0; EXT_MAX_FANIN],
             nfinal: 0,
             reduce_out: 0,
+            reduce_open: false,
             reduce_emitted: 0,
             reduce_then_fill: false,
             blocked: false,
@@ -770,13 +810,22 @@ impl Sorter {
         self.nrec = k;
     }
 
-    fn new_run<S: RunStore>(&mut self, store: &mut S) -> Result<u32, ExtErr> {
+    /// Create the next run. `Ok(None)`: the store answered `Pending` — nothing
+    /// is allocated, `blocked` is set, and the same id is asked for next step.
+    fn new_run<S: RunStore>(&mut self, store: &mut S) -> Result<Option<u32>, ExtErr> {
         if self.nruns >= EXT_MAX_RUNS {
             return Err(ExtErr::TooManyRuns);
         }
         let id = self.next_id;
+        match store.create(id) {
+            Put::Done => {}
+            Put::Pending => {
+                self.blocked = true;
+                return Ok(None);
+            }
+            Put::Err(e) => return Err(ExtErr::Store(e)),
+        }
         self.next_id += 1;
-        store.create(id).map_err(ExtErr::Store)?;
         self.runs[self.nruns] = RunInfo {
             id,
             live: true,
@@ -785,13 +834,39 @@ impl Sorter {
         self.nruns += 1;
         self.stats.runs_written += 1;
         self.wrun_bytes = 0;
-        Ok(id)
+        Ok(Some(id))
+    }
+
+    /// Seal run `run` (its last block flushed). `Ok(false)`: the commit is
+    /// pending — `blocked` is set and it is asked again next step.
+    fn commit_run<S: RunStore>(&mut self, store: &mut S, run: u32) -> Result<bool, ExtErr> {
+        match store.commit(run) {
+            Put::Done => {
+                self.sealed(run);
+                Ok(true)
+            }
+            Put::Pending => {
+                self.blocked = true;
+                Ok(false)
+            }
+            Put::Err(e) => Err(ExtErr::Store(e)),
+        }
     }
 
     /// Whether a record of `len` bytes can join the write block now — true
     /// unless it would flush a block the store has no room for (`usize::MAX`:
     /// the block is about to be flushed as it is). Sets `blocked` when not.
+    ///
+    /// A flush already under way asks for the bytes it has left.
     fn room_for<S: RunStore>(&mut self, store: &mut S, run: u32, len: usize) -> bool {
+        if self.flushing {
+            let left = EXT_BLOCK_HDR + self.wlen - self.flush_off;
+            if store.ready(run, left) {
+                return true;
+            }
+            self.blocked = true;
+            return false;
+        }
         let flushing = len == usize::MAX || EXT_BLOCK_HDR + self.wlen + len > self.block;
         if !flushing || self.wlen == 0 || store.ready(run, EXT_BLOCK_HDR + self.wlen) {
             return true;
@@ -801,7 +876,10 @@ impl Sorter {
     }
 
     /// Append the record at `m[at..at + len]` (in the fill area or a reader
-    /// block) to the write block at `m[0..block]`, flushing a full block first.
+    /// block) to the write block at `m[0..block]`, flushing a full block (or
+    /// finishing the flush under way) first. `Ok(false)`: the flush is
+    /// pending and the record was not taken — the caller offers it again
+    /// next step.
     fn emit<S: RunStore>(
         &mut self,
         m: &mut [u8],
@@ -809,41 +887,59 @@ impl Sorter {
         run: u32,
         at: usize,
         len: usize,
-    ) -> Result<(), ExtErr> {
-        if EXT_BLOCK_HDR + self.wlen + len > self.block {
-            self.flush_block(m, store, run)?;
+    ) -> Result<bool, ExtErr> {
+        if (self.flushing || EXT_BLOCK_HDR + self.wlen + len > self.block)
+            && !self.flush_block(m, store, run)?
+        {
+            return Ok(false);
         }
         let dst = EXT_BLOCK_HDR + self.wlen;
         ext_move(m, at, len, dst);
         self.wlen += len;
-        Ok(())
+        Ok(true)
     }
 
+    /// Write the block out, a chunk at a time, resuming a flush a pending
+    /// write parked. `Ok(true)`: the block is taken whole (or was empty);
+    /// `Ok(false)`: a chunk is pending — `blocked` is set, and the next call
+    /// sends that same chunk before any byte after it.
     fn flush_block<S: RunStore>(
         &mut self,
         m: &mut [u8],
         store: &mut S,
         run: u32,
-    ) -> Result<(), ExtErr> {
+    ) -> Result<bool, ExtErr> {
         if self.wlen == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let wlen = self.wlen;
-        let crc = crc32c(&m[EXT_BLOCK_HDR..EXT_BLOCK_HDR + wlen]);
-        m[0..4].copy_from_slice(&(wlen as u32).to_le_bytes());
-        m[4..8].copy_from_slice(&crc.to_le_bytes());
         let total = EXT_BLOCK_HDR + wlen;
-        let chunk = store.write_chunk().max(1);
-        let mut off = 0;
-        while off < total {
-            let n = chunk.min(total - off);
-            store.write(run, &m[off..off + n]).map_err(ExtErr::Store)?;
-            off += n;
+        if !self.flushing {
+            let crc = crc32c(&m[EXT_BLOCK_HDR..total]);
+            m[0..4].copy_from_slice(&(wlen as u32).to_le_bytes());
+            m[4..8].copy_from_slice(&crc.to_le_bytes());
+            self.flushing = true;
+            self.flush_off = 0;
         }
+        let chunk = store.write_chunk().max(1);
+        while self.flush_off < total {
+            let off = self.flush_off;
+            let n = chunk.min(total - off);
+            match store.write(run, &m[off..off + n]) {
+                Put::Done => self.flush_off += n,
+                Put::Pending => {
+                    self.blocked = true;
+                    return Ok(false);
+                }
+                Put::Err(e) => return Err(ExtErr::Store(e)),
+            }
+        }
+        self.flushing = false;
+        self.flush_off = 0;
         self.stats.bytes_spilled += total as u64;
         self.wrun_bytes += total as u64;
         self.wlen = 0;
-        Ok(())
+        Ok(true)
     }
 
     fn step_spill<S: RunStore>(
@@ -853,7 +949,10 @@ impl Sorter {
         budget: &mut u32,
     ) -> Result<(), ExtErr> {
         if !self.wrun_open && self.nrec > 0 {
-            self.wrun = self.new_run(store)?;
+            let Some(id) = self.new_run(store)? else {
+                return Ok(());
+            };
+            self.wrun = id;
             self.wrun_open = true;
         }
         let n = self.keep();
@@ -862,10 +961,9 @@ impl Sorter {
             let off = idx(m, self.back, self.spill_i);
             let len = rd_u32(m, off);
             let run = self.wrun;
-            if !self.room_for(store, run, len) {
+            if !self.room_for(store, run, len) || !self.emit(m, store, run, off, len)? {
                 return Ok(());
             }
-            self.emit(m, store, run, off, len)?;
             self.spill_i += 1;
         }
         if self.spill_i < n {
@@ -876,9 +974,11 @@ impl Sorter {
             return Ok(());
         }
         if self.wrun_open {
-            self.flush_block(m, store, run)?;
-            store.commit(run).map_err(ExtErr::Store)?;
-            self.sealed(run);
+            // A pending flush or commit leaves the run open and everything
+            // above unchanged, so the next step comes back here.
+            if !self.flush_block(m, store, run)? || !self.commit_run(store, run)? {
+                return Ok(());
+            }
             self.wrun_open = false;
         }
         // Buffer empty again.
@@ -893,12 +993,14 @@ impl Sorter {
             // serves the merge).
             if self.nruns + 1 >= EXT_MAX_RUNS {
                 self.reduce_then_fill = true;
-                return self.begin_reduce(store);
+                self.begin_reduce();
+                return Ok(());
             }
             self.phase = Phase::Filling;
             return Ok(());
         }
-        self.begin_merges(store)
+        self.begin_merges();
+        Ok(())
     }
 
     // ---- merging ----------------------------------------------------------------
@@ -921,7 +1023,7 @@ impl Sorter {
         n
     }
 
-    fn begin_merges<S: RunStore>(&mut self, store: &mut S) -> Result<(), ExtErr> {
+    fn begin_merges(&mut self) {
         let mut live = [0u32; EXT_MAX_RUNS];
         let n = self.live_runs(&mut live);
         let f = self.fanin();
@@ -930,23 +1032,23 @@ impl Sorter {
             self.final_runs[..n].clone_from_slice(&live[..n]);
             self.open_readers(&live[..n]);
             self.phase = if n == 0 { Phase::Done } else { Phase::Output };
-            return Ok(());
+            return;
         }
-        self.begin_reduce(store)
+        self.begin_reduce();
     }
 
-    /// Merge the first `F` live runs into one new run.
-    fn begin_reduce<S: RunStore>(&mut self, store: &mut S) -> Result<(), ExtErr> {
+    /// Merge the first `F` live runs into one new run, which `step_reduce`
+    /// creates first (that create may be pending, so it is asked there).
+    fn begin_reduce(&mut self) {
         let mut live = [0u32; EXT_MAX_RUNS];
         let n = self.live_runs(&mut live);
         let f = self.fanin().min(n);
         self.stats.merge_passes += 1;
         self.open_readers(&live[..f]);
-        self.reduce_out = self.new_run(store)?;
+        self.reduce_open = false;
         self.reduce_emitted = 0;
         self.wlen = 0;
         self.phase = Phase::Reducing;
-        Ok(())
     }
 
     fn open_readers(&mut self, runs: &[u32]) {
@@ -1103,6 +1205,13 @@ impl Sorter {
         store: &mut S,
         budget: &mut u32,
     ) -> Result<(), ExtErr> {
+        if !self.reduce_open {
+            let Some(id) = self.new_run(store)? else {
+                return Ok(());
+            };
+            self.reduce_out = id;
+            self.reduce_open = true;
+        }
         while *budget > 0 {
             *budget -= 1;
             // Under a limit, the merged run ends at the `limit`-th record: its
@@ -1122,10 +1231,11 @@ impl Sorter {
                     let at = rd.buf_at + rd.pos;
                     let len = rd_u32(m, at);
                     let out = self.reduce_out;
-                    if !self.room_for(store, out, len) {
+                    // A pending flush leaves the reader where it was: the
+                    // same record is picked and offered again next step.
+                    if !self.room_for(store, out, len) || !self.emit(m, store, out, at, len)? {
                         return Ok(());
                     }
-                    self.emit(m, store, out, at, len)?;
                     self.advance(m, r)?;
                     self.reduce_emitted += 1;
                 }
@@ -1134,9 +1244,10 @@ impl Sorter {
                     if !self.room_for(store, out, usize::MAX) {
                         return Ok(());
                     }
-                    self.flush_block(m, store, out)?;
-                    store.commit(out).map_err(ExtErr::Store)?;
-                    self.sealed(out);
+                    if !self.flush_block(m, store, out)? || !self.commit_run(store, out)? {
+                        return Ok(());
+                    }
+                    self.reduce_open = false;
                     // The inputs are consumed.
                     let mut i = 0;
                     while i < self.nreaders {
@@ -1152,7 +1263,8 @@ impl Sorter {
                         self.phase = Phase::Filling;
                         return Ok(());
                     }
-                    return self.begin_merges(store);
+                    self.begin_merges();
+                    return Ok(());
                 }
             }
         }
