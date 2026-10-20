@@ -78,12 +78,13 @@ include!("../../common/telemetry_core.rs");
 /// `max_record` per target, so the advertised ceiling and the buffer behind it are
 /// one number.
 ///
-/// Keyed on the arena rather than on `fluxor_abi` for two reasons. It says the
+/// Keyed on the target's memory class (`abi::config::TARGET_CLASS`, the SDK's
+/// coarse view of the arena) rather than on `fluxor_abi` for two reasons. It says the
 /// REASON — this is about how much memory there is, not which part — so a target
 /// added later inherits it without an edit. And it compiles under any toolchain: a
 /// `cfg` the build does not declare trips `unexpected_cfgs` under `-D warnings`,
 /// whereas `abi::config` is in scope in every module.
-const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const TINY: bool = abi::config::TARGET_CLASS == abi::config::target_class::TINY;
 const REC_BUF: usize = if TINY { 512 } else { 4096 };
 
 /// The decision param: the container itself, a `blob` written straight into

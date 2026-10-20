@@ -40,7 +40,7 @@ mod agg {
     // `AGG_CAP_*` note at the top of `agg_core.rs` for why the core does not
     // choose them itself).
     //
-    // Keyed on the ARENA, for the same reason this module's own buffers are: it
+    // Keyed on the target class, for the same reason this module's own buffers are: it
     // states why the number differs rather than which die it is for, so a target
     // added later inherits the right tier without an edit. They are the dominant
     // term in the module's state, because the emission queue and the snapshot
@@ -53,13 +53,13 @@ mod agg {
     // either size: `lane_overflows` and `pane_overflows` mean the same thing on an
     // RP2040 as on a Pi 5.
     //
-    // `super::ARENA` is the arena constant the module's own buffers are keyed on,
-    // named once at the crate root.
-    use super::ARENA;
-    const AGG_CAP_LANES: usize = if ARENA <= 64 * 1024 { 4 } else { 16 };
-    const AGG_CAP_PANES: usize = if ARENA <= 64 * 1024 { 4 } else { 8 };
-    const AGG_CAP_OPS: usize = if ARENA <= 64 * 1024 { 4 } else { 8 };
-    const AGG_CAP_COLL: usize = if ARENA <= 64 * 1024 { 4 } else { 16 };
+    // `super::TINY` is the tier the module's own buffers are keyed on, named
+    // once at the crate root.
+    use super::TINY;
+    const AGG_CAP_LANES: usize = if TINY { 4 } else { 16 };
+    const AGG_CAP_PANES: usize = if TINY { 4 } else { 8 };
+    const AGG_CAP_OPS: usize = if TINY { 4 } else { 8 };
+    const AGG_CAP_COLL: usize = if TINY { 4 } else { 16 };
 
     include!("../../common/vm_core.rs");
     include!("../../common/pipeline_core.rs");
@@ -86,19 +86,22 @@ use agg::{
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
 
-/// Capacity tier, from the state arena the target actually has rather than from
-/// a die name — the same derivation `decision` and `pipeline` use.
+/// Capacity tier, from the SDK's coarse memory class of the target rather than
+/// from a die name — the same derivation `decision` and `pipeline` use. The
+/// kernel's arena size is kernel capacity, not ABI, so modules key on
+/// `abi::config::TARGET_CLASS`: TINY is a state arena of 64 KiB or less, SMALL
+/// one of 512 KiB or less.
 ///
 /// Three tiers rather than two, because this module's buffers span two orders of
 /// magnitude and the middle one carries its own answer: at the full capacities the
 /// engine asks 312,576 B, which exceeds RP2350's 245,760 B arena as well as
 /// RP2040's 65,536 B. A single MCU tier would therefore have to be the smallest
 /// one, and an RP2350 would hold a fraction of what its arena can afford.
-const ARENA: usize = abi::config::kernel::STATE_ARENA_SIZE;
+///
 /// RP2040 class: the whole arena is 64 KiB.
-const TINY: bool = ARENA <= 64 * 1024;
-/// RP2350 class: an MCU, but not that one.
-const SMALL: bool = ARENA <= 512 * 1024;
+const TINY: bool = abi::config::TARGET_CLASS == abi::config::target_class::TINY;
+/// RP2350 class: an MCU, but not that one (or the tiny one).
+const SMALL: bool = abi::config::TARGET_CLASS <= abi::config::target_class::SMALL;
 
 /// Pick a capacity for this target's tier.
 ///

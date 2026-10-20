@@ -53,7 +53,7 @@
 // untestable, and capacity arithmetic is the last thing that should be untested.
 //
 // So each mounting site declares them from what it knows: the engine derives them
-// from `abi::config::kernel::STATE_ARENA_SIZE`, and the harness states the
+// from `abi::config::TARGET_CLASS`, and the harness states the
 // capacities its boundary assertions are written against. The names are
 // deliberately prefixed and deliberately unlike the public aliases below, so a
 // mount that omits one gets an unresolved-name error rather than a silent

@@ -58,7 +58,7 @@ use exchange::{
 const DEC_SCRATCH: usize = if TINY { 1024 } else { 3 * REC_BUF };
 
 /// Arena class: an MCU, but not the smallest. Exchange tables scale with it.
-const SMALL: bool = abi::config::kernel::STATE_ARENA_SIZE <= 512 * 1024;
+const SMALL: bool = abi::config::TARGET_CLASS <= abi::config::target_class::SMALL;
 /// One exchange record as read or written: the contract's whole record, or
 /// what a tiny target's ports declare.
 const XREC: usize = if TINY { 1024 } else { RECORD_MAX };
@@ -768,7 +768,7 @@ const ENC_BUF: usize = REC_BUF;
 /// one channel family, so a node that admitted more than its downstream would
 /// pass records that node must then refuse. `limit_register.md` records the
 /// coupling and the gate holds the three to one derivation.
-const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const TINY: bool = abi::config::TARGET_CLASS == abi::config::target_class::TINY;
 const REC_BUF: usize = if TINY { 512 } else { 4096 };
 /// Backing buffer for the version table (holds every loaded version's program;
 /// mutable for hot reload). Larger than one program so several versions coexist.

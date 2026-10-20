@@ -31,20 +31,22 @@ runs.
 
 ## Arena tiers
 
-A ceiling that varies by target is keyed on the state arena the target actually
-has, never on a die name. The arena is the reason the bound differs, so it is what
-the expression tests; a target added later inherits the right tier without an
-edit, and the constant compiles under any toolchain because
-`abi::config::kernel::STATE_ARENA_SIZE` is in scope in every module.
+A ceiling that varies by target is keyed on the memory the target actually has,
+never on a die name. The arena is the reason the bound differs, so it is what the
+expression tests — through the SDK's coarse `abi::config::TARGET_CLASS`
+(`target_class::{TINY, SMALL, HOST}`), which is in scope in every module and
+compiles under any toolchain. The kernel's own `STATE_ARENA_SIZE` is kernel
+capacity, not ABI: fluxor keeps it out of the SDK so raising it moves no ABI
+epoch, and no module reads it.
 
-| Tier | Predicate | Targets | `STATE_ARENA_SIZE` |
+| Tier | Predicate | Targets | Kernel state arena |
 |---|---|---|---|
-| full | neither below | bcm2712 | 256 MiB |
-| small | `ARENA <= 512 KiB` | rp2350 | 240 KiB |
-| tiny | `ARENA <= 64 KiB` | rp2040 | 64 KiB |
+| full | neither below (`HOST`) | bcm2712, linux | 1 GiB |
+| small | `TARGET_CLASS <= SMALL` (arena ≤ 512 KiB) | rp2350 | 240 KiB |
+| tiny | `TARGET_CLASS == TINY` (arena ≤ 64 KiB) | rp2040 | 64 KiB |
 
-These are the arenas the kernel allocates on each target, and what the predicates
-read. A deployment may additionally declare a lower capacity for itself — the
+These are the arenas the kernel allocates on each target, and the classes the
+predicates read. A deployment may additionally declare a lower capacity for itself — the
 composer writes the graph's demand into the image and the kernel's resource ledger
 holds the pool to it — and the lower of the two binds at load. Tier selection is a
 compile-time choice, so it uses the figure above.
@@ -258,10 +260,10 @@ MAX_OPS | modules/common/agg_core.rs | AGG_CAP_OPS
 MAX_WIN_PER_EVENT | modules/common/agg_core.rs | AGG_CAP_PANES
 COLL_CAP | modules/common/agg_core.rs | AGG_CAP_COLL
 KEY_CAP | modules/common/agg_core.rs | 48
-AGG_CAP_LANES | modules/app/aggregation/mod.rs | if ARENA <= 64 * 1024 { 4 } else { 16 }
-AGG_CAP_PANES | modules/app/aggregation/mod.rs | if ARENA <= 64 * 1024 { 4 } else { 8 }
-AGG_CAP_OPS | modules/app/aggregation/mod.rs | if ARENA <= 64 * 1024 { 4 } else { 8 }
-AGG_CAP_COLL | modules/app/aggregation/mod.rs | if ARENA <= 64 * 1024 { 4 } else { 16 }
+AGG_CAP_LANES | modules/app/aggregation/mod.rs | if TINY { 4 } else { 16 }
+AGG_CAP_PANES | modules/app/aggregation/mod.rs | if TINY { 4 } else { 8 }
+AGG_CAP_OPS | modules/app/aggregation/mod.rs | if TINY { 4 } else { 8 }
+AGG_CAP_COLL | modules/app/aggregation/mod.rs | if TINY { 4 } else { 16 }
 MAX_NODE_STAGES | modules/common/pipeline_core.rs | 8
 KEY_BUF | modules/app/pipeline/mod.rs | if TINY { 64 } else { KEY_MAX }
 XREC | modules/app/pipeline/mod.rs | if TINY { 1024 } else { RECORD_MAX }

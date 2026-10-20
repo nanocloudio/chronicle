@@ -70,7 +70,8 @@ include!("../../common/telemetry_core.rs");
 /// `max_record` per target, so the advertised ceiling and the buffer behind it are
 /// one number.
 ///
-/// Keyed on the arena rather than on `fluxor_abi` because it says the REASON —
+/// Keyed on the target's memory class (`abi::config::TARGET_CLASS`) rather than
+/// on `fluxor_abi` because it says the REASON —
 /// how much memory there is, not which part — so a target added later inherits it
 /// without an edit, and because `abi::config` is in scope in every module while an
 /// undeclared `cfg` would trip `unexpected_cfgs` under `-D warnings`.
@@ -80,7 +81,7 @@ include!("../../common/telemetry_core.rs");
 /// admitted more than the `decision` downstream would pass records that node must
 /// then refuse. `limit_register.md` records the coupling and the gate holds the
 /// three to one derivation.
-const TINY: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+const TINY: bool = abi::config::TARGET_CLASS == abi::config::target_class::TINY;
 const REC_BUF: usize = if TINY { 512 } else { 4096 };
 const CODE_BUF: usize = 512;
 
