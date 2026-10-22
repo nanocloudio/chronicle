@@ -1,0 +1,57 @@
+# AN ANSWERING NODE ANSWERS EVEN WHEN ITS RECORD FAILS.
+#
+# `reply` answers the exchange its record names (`answer: 1`, the id in field
+# 1). Its record arrives on `record_in`, not as a collected request, so the
+# exchange is named only by the record itself. A record that fails in the
+# stages still owes that exchange an outcome: `reply` answers it 500, and the
+# requester turns that into an answer record rather than waiting out a
+# deadline.
+#
+#   stdin ─▶ ask ─request─▶ front ─record─▶ reply ─response─▶ ask ─▶ stdout
+#
+# `ask` asks for each stdin record (method field 2, target field 3); `front`
+# collects the request and emits it as a record with the exchange id in field
+# 1. `reply`'s one stage is the decision from `examples/decision/`, which
+# compares field 1 with an integer: here field 1 is the 14-byte exchange id, so
+# every record fails it.
+#
+#   {2: 1, 3: "/x", 4: ""}  ->  {253: 500}
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+modules:
+  - name: ask
+    type: pipeline
+    params:
+      method_field: 2
+      target_field: 3
+  - name: front
+    type: pipeline
+    params:
+      id_field: 1
+      method_field: 2
+      target_field: 3
+  - name: reply
+    type: pipeline
+    params:
+      id_field: 1
+      answer: 1
+      # The decision from examples/decision/, run as a stage.
+      ir_stages: {hex: "01ff4300014000000012000100020100000010e8030000000000002400400000000f00106400000000000000400100000041400000000f00100000000000000000400100000041"}
+      stage_kinds: {hex: "01"}
+wiring:
+  - from: cli_in.stdin_out
+    to: ask.record_in
+  - from: ask.request_out
+    to: front.request_in
+  - from: front.result_out
+    to: reply.record_in
+  - from: front.response_out
+    to: reply.response_in
+  - from: reply.response_out
+    to: ask.response_in
+  - from: ask.result_out
+    to: cli_out.bytes_in

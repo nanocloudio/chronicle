@@ -13,7 +13,7 @@
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no release "fluxor modules build failed"; finish; exit; }
 
-build_graph packaging/cli/linux.yaml || { no release "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no release "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 
 # Two distinct programs, so their digests must differ.

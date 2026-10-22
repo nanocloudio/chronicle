@@ -1,7 +1,7 @@
 //! Pipeline executor — Fluxor `.fmod` app module.
 //!
 //! PARAM-DRIVEN: the stage table is NOT baked — it arrives as an `ir_stages`
-//! module param (hex-encoded), lowered at load into a serialized
+//! blob param, lowered at load into a serialized
 //! `[nstages]` then per stage `[route:u8][cost:u32][len:u16][code]` container. So
 //! one pipeline binary runs ANY Pipeline: the compiler emits each
 //! stage's bytecode, a config packs the container, and this module threads a
@@ -101,11 +101,21 @@ unsafe fn record_failed(s: &mut ModuleState, sys: &SyscallTable) {
 }
 
 /// The exchange whose record just resolved. A request whose record failed is
-/// answered here, 500, so its requester is never left waiting. Otherwise a
+/// answered here, 500, so its requester is never left waiting; so is the
+/// exchange an answering node's record names, when that record fails before
+/// its answer is written. Otherwise a
 /// collected request is answered here with its status (`ack`), already
 /// answered by its own record (`answer`), or left for the node downstream that
 /// answers it; either way its slot is free.
 unsafe fn resolve_request(s: &mut ModuleState, sys: &SyscallTable, ok: bool) {
+    if s.owed_open {
+        s.owed_open = false;
+        if !ok {
+            s.requests_refused = s.requests_refused.wrapping_add(1);
+            let id = s.owed_id;
+            respond_status(s, sys, &id, exchange::status::FAILED);
+        }
+    }
     if s.relay_open {
         s.relay_open = false;
         if !ok {
@@ -863,6 +873,10 @@ struct ModuleState {
     relay_credit: u32,
     relay_body_at: u16,
     relay_body_len: u16,
+    /// The exchange an answering node's admitted record names, owed an
+    /// outcome until the record resolves.
+    owed_id: ExchangeId,
+    owed_open: bool,
     /// The program that turns an answer body into a record. Without it an
     /// answer body must be one record frame.
     rdec_in: BlobIn,
@@ -1095,6 +1109,8 @@ pub extern "C" fn module_new(
         s.resp_box = ExchangeOutbox::new();
         s.relay_id = ExchangeId::NONE;
         s.relay_open = false;
+        s.owed_id = ExchangeId::NONE;
+        s.owed_open = false;
         s.relay_flags = 0;
         s.relay_method = 0;
         s.relay_credit = 0;
@@ -1533,6 +1549,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         let frame_in = core::slice::from_raw_parts(frame_ptr, frame_bytes);
+        // An answering node's record names the exchange it answers. Should the
+        // record fail before its answer is written, that exchange is still
+        // owed one, and it is read here, before any stage can lose it.
+        if s.answer && s.in_slot < 0 && s.map.id != 0 {
+            if let Some(Ok(id)) =
+                frame_field_bytes(frame_in, s.map.id).map(<[u8; exchange::ID_LEN]>::try_from)
+            {
+                s.owed_id = ExchangeId(id);
+                s.owed_open = true;
+            }
+        }
 
         // 4. Resolve the version for this record and thread it through that version's
         //    stages, or emit the fail-closed VERSION_UNAVAILABLE frame.

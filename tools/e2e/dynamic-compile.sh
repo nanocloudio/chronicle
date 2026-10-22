@@ -16,7 +16,7 @@
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no dynamic "fluxor modules build failed"; finish; exit; }
 
-build_graph packaging/cli/linux.yaml || { no dynamic "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no dynamic "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 
 SCHEMA='Order{customer_id:str@2,total:int@3};Receipt{id:str@1,amount:int@2};'

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DURABLE LOCAL CHECKPOINT BACKEND (`state.local.checkpoint.v1`) on device.
 #
-# `durable-state-e2e.sh` proves the state TRANSITION — checkpoint, store,
+# `tools/e2e/durable-state.sh` proves the state TRANSITION — checkpoint, store,
 # restore, resume identically. But it hands the digest from one run to the next,
 # which a crashed node has no one to do for it. This proves the RECOVERY path:
 #
@@ -15,7 +15,7 @@ modules_ready || { no ckpt "fluxor modules build failed"; finish; exit; }
 export FLUXOR_STORE_DIR="$PWD/$E2E_GEN/store"
 mkdir -p "$FLUXOR_STORE_DIR"
 
-build_graph packaging/cli/linux.yaml || { no ckpt "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no ckpt "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 
 # Before anything is saved, recovery must say so rather than invent a state.

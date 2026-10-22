@@ -134,7 +134,7 @@ The pipeline also meets the exchange contract, in the role its wired ports
 choose: a provider (`request_in` + `response_out`) takes each request as a
 record and, with `ack`, answers it once that record's output is accepted
 downstream; an answering node (`response_out` with `answer`) makes its result
-the response; a requester (`request_out` + `response_in`) makes its result a
+the response, and answers 500 for a record that fails; a requester (`request_out` + `response_in`) makes its result a
 request and each answer a record; a relay passes an exchange on under its own
 id. The parts of an exchange other than its body map to data fields (see
 [connectors.md](connectors.md#the-pipeline-on-the-surface)).

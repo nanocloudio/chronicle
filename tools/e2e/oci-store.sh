@@ -14,15 +14,14 @@
 # NOTE those are KEYS, not necessarily paths. `storage.object` abstracts where
 # bytes live: on Linux with FLUXOR_STORE_DIR the backend is a versioned KV log,
 # so nothing appears as a file on disk. The key namespace is the OCI image
-# layout's, which is what lets a registry serve the store unchanged
-# (examples/oci_registry). This script proves the code path on the real runtime
-# over a real provider.
+# layout's, which is what lets a registry serve the store unchanged. This
+# script proves the code path on the real runtime over a real provider.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no oci "fluxor modules build failed"; finish; exit; }
 
 use_store
 
-build_graph packaging/cli/linux.yaml || { no oci "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no oci "cli build"; finish; exit; }
 
 BODY=48656c6c6f2062756e646c65   # "Hello bundle"
 BODY2=5365636f6e642062756e646c65 # "Second bundle"

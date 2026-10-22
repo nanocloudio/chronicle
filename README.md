@@ -6,10 +6,11 @@
 
 Chronicle is a **fluxor-native** deterministic dataplane engine, structured like
 its sibling nanocloud projects (`../quantum`, `../lattice`, `../clustor`): a
-Cargo/fluxor workspace of host crates plus a set of on-device `.fmod` modules.
+fluxor project of on-device `.fmod` modules, with a host harness that tests the
+cores they share.
 
-It implements the **Unified Deterministic Processing** model, absorbing what were
-three separate concerns into one engine:
+It implements the **Unified Deterministic Processing** model, which unifies
+three concerns in one engine:
 
 - **Orchestration & effects** — connectors, pipelines, retries, compensation,
   telemetry (the **Pipeline** and **Resource** surfaces).
@@ -59,7 +60,7 @@ so one `.uproc` goes **authored → compiled → param → running on device**. 
 bounded VM — the evaluator, the byte-serializer, the byte-deserializer, the staged
 pipeline, and the aggregation engine — is fuzz-tested to **never panic** on
 malformed input (a hard requirement for freestanding `.fmod` code); see
-[`modules/app/aggregation/tests/robustness.rs`](modules/app/aggregation/tests/robustness.rs).
+`tests/harness/tests/aggregation_suites/robustness.rs`.
 
 ## The seven artefacts
 
@@ -78,18 +79,19 @@ malformed input (a hard requirement for freestanding `.fmod` code); see
 - `modules/common/` — the shared device cores: evaluator, staged pipeline,
   aggregation kernel, decision driver, byte codecs, version table, IR lowerer and
   the CEL front end. `include!`d verbatim by the modules **and** by the host
-  crates, so there is one source of truth and no host/device drift.
-- `modules/app/` — the param-driven on-device `.fmod`s (built for `bcm2712`):
-  `expression`, `pipeline`, `decision`, `aggregation`, and `chronicle_cli` (the
-  toolchain applet). No protocol is baked into a module; protocol I/O comes from
+  harness, so there is one source of truth and no host/device drift.
+- `modules/app/` — the param-driven on-device `.fmod`s (built for `bcm2712`,
+  `rp2350` and `rp2040`): `expression`, `pipeline`, `decision`, `aggregation`,
+  `sensor_intake`, and `chronicle_cli` (the toolchain applet, `bcm2712` only). No protocol is baked into a module; protocol I/O comes from
   sibling-owned providers composed as graph nodes.
 - `tools/lib.sh`, `tools/support/` — the shared E2E harness the gates and
-  drivers both source.
+  drivers both source. It resolves the nearest `fluxor.toml` as the project,
+  so an application project's drivers source it and run against their own pins.
 - `proto/unified/v1/` — the artefact schemas: the **7** canonical artefacts plus
   two support protos (`common`, `resource`) that are explicitly *not* artefacts.
   Package `unified.v1` is the **spec** type-namespace (the Unified Deterministic
-  Processing model that unifies orchestration, deterministic state, and runtime distribution); the `chronicle-*` crates
-  are the implementation. The two names are deliberate: `chronicle` = engine,
+  Processing model that unifies orchestration, deterministic state, and runtime
+  distribution); the chronicle modules are the implementation. The two names are deliberate: `chronicle` = engine,
   `unified.v1` = spec types.
 - `examples/` — runnable graphs.
 - `tools/ci/` — structural gates (what the tree must BE).
@@ -99,8 +101,9 @@ malformed input (a hard requirement for freestanding `.fmod` code); see
 ## Connectors
 
 A connector is three things: **encode** (record → wire request), **transport**
-(send/receive), **decode** (reply → record) — and all three are param-driven, no
-protocol module anywhere.
+(send/receive), **decode** (reply → record). Encode and decode are param-driven
+bytecode in the pipeline; transport is a provider module another project owns,
+so chronicle carries no protocol module.
 
 - **Encode & decode are symmetric byte VMs.** Building a request is bytecode
   ([`ser_core`](modules/common/ser_core.rs) — literals, field
@@ -113,9 +116,9 @@ protocol module anywhere.
 - **Protocols are not bytecode.** Framing a message is in scope; speaking a
   protocol is not. Connectors are provider `.fmod`s owned by the domain projects —
   lattice (Redis/Postgres/MySQL/Mongo/Cassandra), quantum (MQTT/Kafka/AMQP/NATS),
-  wave (HTTP/WebSocket/RTP/SIP/SMTP), loam (S3) — pinned from the Fluxor OCI store
-  and composed as graph nodes. Each is proven standalone in its owning repo
-  against a real backend. See [connectors.md](docs/architecture/connectors.md).
+  wave (HTTP/WebSocket/RTP/SIP/SMTP/S3) — pinned from the Fluxor OCI store by the
+  project that composes them, and composed as graph nodes. Each is proven
+  standalone in its owning repo against a real backend. See [connectors.md](docs/architecture/connectors.md).
 
 ## Build & run
 
@@ -127,7 +130,7 @@ place, so there is nothing to reinstall.
 ```bash
 make ci          # fluxor ci — the full gate (lints, tests, strict module build)
 protoc -I proto --include_imports -o /dev/null proto/unified/v1/*.proto   # schemas compile
-make test        # module harnesses + the 22 graph E2Es (what CI runs)
+make test        # the host harness + the graph E2Es (what CI runs)
 make build       # the .fmod modules — this project has no cargo crate
 tools/e2e/expression.sh   # one graph E2E on its own → cust-42
 

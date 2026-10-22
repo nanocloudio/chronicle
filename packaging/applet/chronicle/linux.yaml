@@ -1,7 +1,7 @@
 # The chronicle CLI as a fluxor cli-applet: one PIC module (chronicle_cli)
 # dispatches every chronicle subcommand over the cli host surface (`help` lists
-# them). Install + run:
-#   fluxor install packaging/cli/workload.toml
+# them). Install from the project root, then run:
+#   fluxor install chronicle
 #   fluxor exec chronicle -- check <ir_hex>
 target: linux
 tick_us: 100

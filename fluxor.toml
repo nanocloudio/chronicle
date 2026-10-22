@@ -10,33 +10,27 @@ version = "0.0.1"
 # target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
 [dependencies]
 fluxor = "0.0.1"
-# wave owns the protocol modules (http, s3, ws_stream, rtp, websocket).
-# `examples/grpc_h2/` composes `http` in client and server mode, and
-# `examples/oci_registry/` signs its storage requests with `s3`.
+# These pins serve the conformance graphs in `examples/`, each of which composes
+# one provider through a contract and checks that chronicle's side holds.
+# Chronicle's engines depend on none of them; an application that composes the
+# engines is its own fluxor project and pins what it composes.
+#
+# wave owns the protocol modules. `examples/grpc_h2/`, `examples/http_exchange/`
+# and `examples/exchange_carry/` compose `http` in client and server mode;
+# `examples/smtp_sink/` composes `smtp`.
 wave = "0.0.1"
-# kagi owns the identity protocols. `examples/identity_provider/` composes its
-# modules: the IdP is chronicle's generic engines routing to kagi's, and
-# without this pin the graph names modules the store cannot resolve.
-kagi = "0.0.1"
 # MQTT/Kafka/AMQP messaging is Quantum's domain. `examples/pipeline_egress/`
 # composes quantum's `mqtt_sink`, an ordered-ack provider, so the pipeline
 # publishes through the contract and names no protocol.
 quantum = "0.0.1"
-# loam supplies the storage tier the registry stores into: the `loam-s3`
-# service bundle, an S3 endpoint over one loam storage node.
-loam = "0.0.1"
-# lattice supplies `pg_client`, the reverser's SQL connector, plus the
-# reverser's storage-tier graph (pg_edge_anchor, cdc_pump, …); clustor is that
-# tier's consensus/WAL substrate. The REVERSER'S composition point is here:
-# lattice must not depend on quantum, so the application project
-# that composes lattice's pump with quantum's mqtt_sink pins all three.
-lattice = "0.0.1"
+# clustor is the consensus/WAL substrate. `examples/aggregation/` checkpoints
+# window state through its `consensus` and `durability` modules.
 clustor = "0.0.1"
 
 [ci]
 # Module targets `fluxor modules build --all` will produce artefacts for.
 # Every engine but `chronicle_cli` builds for all three: the CLI is a host
-# authoring tool and asks a 394 KB arena, which no MCU has.
+# authoring tool whose state is ~390 KiB, which no MCU arena holds.
 #
 # The RP shelves are not optional. Chronicle ships modules for them, so CI has to
 # build them or the per-target figures in docs/architecture/resource_summary.md go
@@ -55,21 +49,21 @@ targets = ["bcm2712", "rp2350", "rp2040"]
 # file is unregistered.
 limit_register_coverage = "fail"
 
-# No [ci.cargo]: this project has no cargo crate. Every unit test lives in a
-# module harness, run by `fluxor ci`'s own `module-tests` phase — so a crate-less
-# project cannot summarise GREEN having run no unit tests at all
-# (standards/make.md §5 — the loam trap).
+# No [ci.cargo]: this project has no cargo crate. Every unit test lives in the
+# host harness under `tests/harness/`, which `fluxor ci`'s `cargo-test (harness)`
+# phase runs — so a crate-less project cannot summarise GREEN having run no unit
+# tests at all (standards/make.md §5 — the loam trap).
 
 [ci.test]
 # The graph E2E gate: each script builds an example graph bundle and drives the
-# built .fmod artefacts through the fluxor-linux runtime, asserting real output
-# (exact frames for the on-device engines; a live SMTP sink, an MQTT broker, and
-# an h2c body for the network compositions — all local Python support processes,
-# no containers). This is the layer cargo tests cannot cover — it catches a
-# stale/blank artefact in target/, a param-schema drift between compiler and
-# module, and broken example configs,
-# each of which otherwise surfaces as a runtime mystery. `fluxor ci` runs these
-# after the strict module build.
+# built .fmod artefacts through the fluxor-linux runtime, asserting real output:
+# exact frames for the on-device engines, and for the network compositions what
+# a live counterparty received — an SMTP sink, an MQTT broker or an HTTP echo
+# (local Python support processes, no containers), or an h2c server graph. This
+# is the layer host tests cannot cover — it catches a stale/blank artefact in
+# target/, a param-schema drift between compiler and module, and broken example
+# configs, each of which otherwise surfaces as a runtime mystery. `fluxor ci`
+# runs these after the strict module build.
 scripts = [
   # Structural gates: what the tree must BE, checkable without running anything.
   # Module harness tests are NOT here; `fluxor ci` runs those itself.
@@ -87,14 +81,14 @@ scripts = [
 
 [ci.hygiene]
 # `modules/**` are no_std PIC objects that cannot host a test harness, so inline
-# tests there are a real error. Tests belong in `modules/app/*/tests/`, which
-# `fluxor test` builds as ordinary std crates. The rule is unconditional: there
-# is no host crate in this project for an inline test to belong to.
+# tests there are a real error. Tests belong in `tests/harness/`, a std
+# workspace that mounts the same cores. The rule is unconditional: there is no
+# host crate in this project for an inline test to belong to.
 forbid_inline_tests = ["modules"]
 mode                = "strict"
 
-# The five engines relax `dead_code` / `unused_imports` / `unreachable_patterns`
-# at the crate root, which `lints.md` §4 otherwise forbids in favour of a
+# The engines relax `dead_code` / `unused_imports` / `unreachable_patterns`
+# at the crate root, which `lints.md` §3 otherwise forbids in favour of a
 # call-site `#[expect]`. Declared here with the reason rather than suppressed,
 # on the same grounds fluxor's own `modules/` prefix carries: a PIC module
 # `include!`s the whole of `target/fluxor/fluxor-abi/sdk/*` AND the shared
@@ -120,7 +114,6 @@ so there is no call site to put an #[expect] on."""
 id_table_dirs = [
   "../fluxor/modules",
   "../wave/modules",
-  "../lattice/modules",
   "../clustor/modules",
   "../quantum/modules",
 ]

@@ -5,10 +5,14 @@ run.err
 .context
 .claude
 
-# Generated fluxor graphs (emitted by chronicle_authoring::deploy from .uproc)
-examples/authoring/generated/
-
 # Shadow-tracked (standards/test-tracking.md) — versioned in .git-shadow/,
 # never pushed to this repo's GitHub-facing remote.
 /tests/
 /.git-shadow/
+# Application projects: each is its own fluxor project that composes
+# chronicle's published engines and pins only what it composes. The
+# conformance graphs elsewhere in `examples/` stay primary-tracked.
+/examples/oci_registry/
+/examples/identity_provider/
+/examples/reverser/
+/examples/http_bench/

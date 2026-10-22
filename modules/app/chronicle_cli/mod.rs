@@ -287,14 +287,14 @@ const ARGV_BUF: usize = 2 * UPROC_BUF;
 /// message set, decision and pipeline. `ARGV_BUF` is twice this, because the
 /// argv record is the document as hex.
 ///
-/// Splitting a document is the alternative and it is worse: it breaks the
-/// four-file application shape the examples establish. Moving configuration
+/// Splitting a document is the alternative and it is worse: an application's
+/// whole dispatch stops reading as one document. Moving configuration
 /// into referenced params helps but does not reach far enough on its own,
 /// since a dispatch-only document still needs a decision per junction —
 /// authorize, redeem, token, refresh, revoke, introspect, userinfo, logout,
-/// consent. The cost is module state on a device that has plenty:
-/// `chronicle_cli`, `pipeline` and `decision` are all
-/// `hardware_targets = ["bcm2712"]`.
+/// consent. The cost is module state in this applet alone, which runs only
+/// where there is plenty (`hardware_targets = ["bcm2712", "linux"]`); the
+/// engines it authors for carry the compiled programs, never the document.
 ///
 /// The sizing case is one request path carrying discovery, authn, mTLS,
 /// authz, admission and CRUD — an API plane's whole protocol surface in a
@@ -446,7 +446,7 @@ fn cmd_help(out: &mut [u8]) -> usize {
           \x20 chronicle digest <hex>                 sha256 content digest (version identity)\n\
           \x20 chronicle author <uproc_hex>          compile a .uproc document to sealed artefacts\n\
           \x20 chronicle parse <uproc_hex>           parse a .uproc module document\n\
-          \x20 chronicle graph <uproc_hex> <pipeline> [target]\n\
+          \x20 chronicle graph <uproc_hex> <pipeline> [target] [bindings]\n\
           \x20                                        lower a pipeline to runnable graph YAML\n\
           \x20 chronicle compile-source <schema> <param> <type> <source>\n\
           \x20                                        type-check source at runtime -> ir hex\n\

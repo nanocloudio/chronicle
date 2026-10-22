@@ -77,9 +77,9 @@ Used by `resource-summary.sh` (`docs/architecture/resource_summary.md`) and
 Where a register is written by hand and checked against source, this shape
 derives the whole document from source — manifests, graph wiring — into a
 temporary file and diffs it against the committed copy. Identical passes;
-different fails and prints the diff. The script defaults to `--check` and
-regenerates in place when run with no argument, so the fix for a failure is to
-run the gate itself and commit what it writes.
+different fails and prints the diff. The script defaults to `--check`, and
+`--write` regenerates the document in place, so the fix for a failure is to
+run the gate with `--write` and commit what it writes.
 
 Use this where the document has no editorial content: a per-module table of
 record capacities and instrument counts is a projection of the manifests, and a

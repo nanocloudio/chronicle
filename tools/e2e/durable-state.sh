@@ -39,7 +39,7 @@ if [ -z "$snap" ]; then
 fi
 
 # --- 3. persist it content-addressed, then read it back -------------------
-build_graph packaging/cli/linux.yaml || { no durable "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no durable "cli build"; finish; exit; }
 digest=$(cli put "$snap" 2>/dev/null | head -1)
 restored=$(cli get "$digest" 2>/dev/null | head -1)
 if [ "$restored" != "$snap" ]; then

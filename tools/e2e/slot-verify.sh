@@ -3,7 +3,7 @@
 #
 #   chronicle slot-verify <image_digest_hex> [abi_surface_hex]
 #
-# BUILDING a slot image stays fluxor's job: it compiles the graph's modules and
+# BUILDING a slot image is fluxor's job: it compiles the graph's modules and
 # self-supplies the ABI-surface pin, which only the target fluxor build can
 # compute. Nothing in chronicle tries to construct one.
 #
@@ -18,16 +18,16 @@
 # SPLIT OF PROOF, because this script cannot carry all of it:
 #   * here — the whole CLI path end to end (store read, streaming loop, verdict)
 #     over a small image a shell can actually load into the store;
-#   * `device_slot.rs` — the same verifier over a REAL 512 KB `fluxor build --emit=slot`
-#     output, streamed in 2 KiB windows, plus every malformed-header case.
+#   * `tests/harness/tests/slot.rs` — the same verifier over images built in
+#     memory, whole and streamed in chunks, plus every malformed-header case.
 # There is no shell path to ingest half a megabyte into the object store, and
-# inventing one purely to lengthen this script would prove nothing the
-# differential does not already.
+# inventing one purely to lengthen this script would prove nothing the host
+# suite does not already.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no slot "fluxor modules build failed"; finish; exit; }
 
 use_store
-build_graph packaging/cli/linux.yaml || { no slot "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no slot "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 
 # A small image with the layout fluxor emits: header, then modules, then config

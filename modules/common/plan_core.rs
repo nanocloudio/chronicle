@@ -33,9 +33,9 @@
 // and `graph_core` (the `GraphError` vocabulary and the layout it defines).
 
 /// Default version tag for a sibling-owned provider. Providers publish under
-/// `<silicon>/<module>:<version>` in the fluxor OCI store; the deploy driver
-/// pins that reference so the build resolves the module from the store rather
-/// than from a Chronicle-owned `.fmod`.
+/// `<abi>/<module>:<version>` in the fluxor OCI store; the composing project
+/// pins that reference, so the build resolves the module from the store —
+/// Chronicle owns no provider `.fmod`.
 ///
 /// This is only the FALLBACK. Siblings release independently, so one constant
 /// for every provider is wrong as soon as any of them cuts a version — the pin
@@ -94,8 +94,8 @@ impl Connector<'_> {
         gput(out, 0, self.provider)
     }
 
-    /// The store pin to record so the build composes this capability's
-    /// provider from the OCI store, scoped to the module ABI `abi`:
+    /// The store pin the build needs to compose this capability's provider
+    /// from the OCI store, scoped to the module ABI `abi`:
     /// `<abi>/<module>:<version>`.
     pub fn provider_pin(&self, abi: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
         let mut p = gput(out, 0, abi)?;
@@ -690,8 +690,10 @@ fn put_hex(out: &mut [u8], p: usize, bytes: &[u8]) -> Result<usize, GraphError> 
 
 /// The provider store pins a plan needs, deduplicated and in stage order.
 ///
-/// The deploy driver records these into the project's `fluxor.lock` before
-/// building, so slot-image resolves each provider module from the OCI store.
+/// The composing project's `fluxor.lock` must hold these before building —
+/// each provider's project a declared dependency, whose modules `fluxor update`
+/// pins — so the graph-image build resolves each provider module from the OCI
+/// store.
 /// Pure: a function of the plan and the module ABI the pins are tagged with —
 /// the pin-side mirror of the graph itself.
 ///

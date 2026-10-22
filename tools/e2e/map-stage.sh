@@ -15,7 +15,7 @@
 #     (`over_bound`), nothing emitted
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no map "fluxor modules build failed"; finish; exit; }
-build_graph packaging/cli/linux.yaml >/dev/null || { no map "cli graph build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml >/dev/null || { no map "cli graph build"; finish; exit; }
 
 SRC=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' examples/map_stage/selector.uproc)
 yaml="$E2E_GEN/map-stage-$E2E_RUN.yaml"

@@ -27,11 +27,13 @@ the opcode constants below and written into the param as its hex (`{hex: "…"}`
 the packer hands the module the bytes) — see
 [`tests/harness/tests/pipeline_suites/ser.rs`](../../tests/harness/tests/pipeline_suites/ser.rs)
 and [`deser.rs`](../../tests/harness/tests/pipeline_suites/deser.rs) for worked
-programs, and `examples/identity_provider/chronicle_authorize.yaml` for both in
-service: its `encode` renders kagi's `MSG_AUTHORIZE_REQ` envelope — length
-prefixes and a length-framed payload region — as the body of an exchange
-request, and its `decode` and `reply_decode` read a newline-separated HTTP
-body and kagi's answer envelope back into fields.
+programs. In service, `examples/http_exchange/linux.yaml` carries both
+directions: its `encode` writes a record's body field as the body of an
+exchange request, and its `reply_decode` reads the answer's body back into a
+field. `examples/wire_frame/linux.yaml` nests the region kinds in one `encode`
+— a u32 length around a CRC-32C around a varint-length header — and turns each
+record into a binary envelope; a richer envelope is the same params with more
+opcodes, and nothing in the engine changes.
 
 ## `ser` — record → bytes
 
@@ -42,7 +44,7 @@ A program is terminated by `ser::FINISH`.
 | `LIT` | `len:u16`, bytes | append a literal |
 | `VAL` | — | pop a value → append (bytes raw, int decimal, bool `0`/`1`) |
 | `INT` | `width:u8`, `endian:u8` | pop an int → append as a binary integer |
-| `VARINT` | — | pop an int → append as a zig-zag varint |
+| `VARINT` | — | pop an int → append as a varint (an `Int` zig-zagged, a `Uint` unsigned) |
 | `LEN` | — | pop bytes/str → push `Int(byte length)` |
 | `RGN_BEGIN` | — | open a region; the matching closer frames it |
 | `RGN_END` | — | close: merge into the parent region, no prefix |

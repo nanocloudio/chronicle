@@ -7,14 +7,14 @@
 # rather than assemble artefacts one CLI call at a time.
 #
 # The parser's structure is held to recorded answers by the uproc corpus in
-# `tests/harness/tests/chronicle_cli.rs`. This proves the same parser runs on
+# `tests/harness/tests/chronicle_cli_suites/corpus.rs`. This proves the same parser runs on
 # the device runtime, and that a malformed document fails with a POSITION rather
 # than a crash — a parser that cannot say where it gave up is not usable for
 # authoring.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no uproc "fluxor modules build failed"; finish; exit; }
 
-build_graph packaging/cli/linux.yaml || { no uproc "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no uproc "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 
 hex_of() { python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$1"; }

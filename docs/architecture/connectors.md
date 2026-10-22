@@ -5,7 +5,9 @@
 A connector is a **provider `.fmod` owned by the domain project**, composed into a
 Chronicle graph as a node. Chronicle does not implement protocols: an effect in a
 pipeline lowers to a binding on a sibling-owned module, pinned from the Fluxor OCI
-store and wired into the emitted graph.
+store and wired into the emitted graph. The pin belongs to the project that
+composes the graph: the engines depend on no provider, and an application pins
+chronicle's published engines beside exactly the providers it wires to them.
 
 | Protocol family | Owner | Modules |
 |---|---|---|
@@ -68,12 +70,14 @@ on `response_out`.
 
 The planner ([`plan_core.rs`](../../modules/common/plan_core.rs)) turns each
 binding into a `Connector` — the graph node's `type:`, its store pin
-`<silicon>/<provider>:<version>`, its method and its params. Each binding
-carries its own version tag because siblings release independently.
-`plan_provider_pins` computes the pins, the driver records them in `fluxor.lock`
-and composes `fluxor slot-image`, which resolves them from the OCI store and
-emits the OTA bundle, and
-[`graph_core.rs`](../../modules/common/graph_core.rs) renders the wired graph.
+`<abi>/<provider>:<version>`, its method and its params. Each binding carries
+its own version tag because siblings release independently.
+`plan_provider_pins` lists the pins a plan needs: the module artifacts the
+composing project's `fluxor.lock` must hold, which it holds by declaring each
+provider's project under `[dependencies]` (`fluxor update` pins a dependency's
+modules). [`graph_core.rs`](../../modules/common/graph_core.rs) renders the
+wired graph, and `fluxor build --emit image` resolves its modules from the OCI
+store into the graph image an OTA device pulls.
 
 An effect is a request the pipeline node before it asks. That node becomes the
 **requester** (`method:` set, `request_out` to the provider's `request_in`,
@@ -179,7 +183,10 @@ ever reads or writes a body.
 - **Answer** (`response_out` with `answer`). The result record is the response
   to the exchange its id field names: status and content type from the mapped
   fields (or 200 and the `content_type` param), body through `encode` or the
-  record frame itself.
+  record frame itself. The exchange is named by the record alone, so the id
+  is read as the record is admitted: a record that fails before its answer is
+  written is answered 500 under that id (`requests_refused`), and its
+  requester is never left waiting.
 - **Requester** (`request_out` + `response_in`). The result record is a request
   this node opens under an id of its own, asking `method` unless a mapped field
   names one. Its **carry** (field 254, [the frame](dataplane.md#the-typed-record-frame))

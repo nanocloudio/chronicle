@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""A minimal ESMTP submission sink — the counterparty for smtp-e2e.sh.
+"""A minimal ESMTP submission sink — the counterparty for
+`tools/e2e/smtp.sh`.
 
 Chronicle composes wave's `smtp` module; this proves a message authored by a
 graph reaches a server and arrives intact. A full mail server (MailHog in a

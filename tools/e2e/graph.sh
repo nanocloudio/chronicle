@@ -2,19 +2,19 @@
 # AUTHORING TO RUNNABLE GRAPH, ENTIRELY ON DEVICE — a `.uproc` document in, the
 # graph YAML a fluxor runtime boots out:
 #
-#   chronicle graph <uproc_hex> <pipeline> [target]
+#   chronicle graph <uproc_hex> <pipeline> [target] [bindings]
 #
-# This is the last hop that used to need a Linux build host. `author-e2e.sh`
-# proves a device can SEAL a document's artefacts; this proves it can DEPLOY
-# one — resolve the named pipeline, compile each stage against the document's
-# own schema (`registry_core`), pack the results into the params a module loads
-# (`pack_core`), and lower the whole thing to graph YAML (`plan_core`).
+# `tools/e2e/author.sh` proves a device can SEAL a document's artefacts; this
+# proves it can DEPLOY one — resolve the named pipeline, compile each stage
+# against the document's own schema (`registry_core`), pack the results into the
+# params a module loads (`pack_core`), and lower the whole thing to graph YAML
+# (`plan_core`), each effect bound to the provider its binding names.
 #
 # Nothing here shells out to cargo. The entire chain runs inside a `.fmod`.
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no graph "fluxor modules build failed"; finish; exit; }
 
-build_graph packaging/cli/linux.yaml || { no graph "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no graph "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 hex_of() { python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$1"; }
 

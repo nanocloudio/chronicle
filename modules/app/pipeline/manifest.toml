@@ -50,7 +50,9 @@ buffer_size  = { default = 4096, thumbv6m = 512 }
 #   provider   request_in + response_out   each request collected whole becomes
 #              a record; `ack` answers it with its status once the record
 #              resolves, otherwise a node downstream answers it by its id
-#   answer     response_out + `answer`     the result is the response
+#   answer     response_out + `answer`     the result is the response to the
+#              exchange its id field names; a record that fails is
+#              answered 500 under that id
 #   requester  request_out + response_in   the result is a request this node
 #              correlates; each answer becomes a record on `result_out`, with
 #              the request's carry (254) restored and its status at 253
@@ -121,7 +123,8 @@ metrics = [
     # above, answers turned into records and answers that could not be,
     # requests sent again after a LINK_DOWN, and LINK_DOWN signals seen.
     "inflight", "refused", "answers", "answers_failed", "replayed", "link_downs",
-    # Provider: requests answered as a sink, and requests refused.
+    # Provider and answering node: requests answered as a sink, and requests
+    # refused.
     "answered", "requests_refused",
     # Records forwarded untouched as a relay; records whose carry did not fit;
     # records refused for exceeding the field table or a map stage's maximum.

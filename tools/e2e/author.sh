@@ -12,7 +12,7 @@
 . "$(dirname "$0")/../lib.sh"
 modules_ready || { no author "fluxor modules build failed"; finish; exit; }
 
-build_graph packaging/cli/linux.yaml || { no author "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no author "cli build"; finish; exit; }
 cli() { run_text "" 10 -- "$@"; }
 hex_of() { python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$1"; }
 

@@ -1,0 +1,33 @@
+# REGION FRAMING ON THE WIRE — a record leaves as a framed binary envelope,
+# three region kinds nested in one `encode` program:
+#
+#   [len:u32 BE] ─ the whole envelope
+#     [crc32c BE] ─ over everything after it
+#       [varint len] ─ the header
+#         [magic 0x02][amount: field 1, i64 BE]
+#       [body: field 2's bytes]
+#
+# This is how a binary request envelope is built without a module that knows
+# the protocol: length prefixes and checksums are regions the encoder closes,
+# not arithmetic a stage does. The pipeline runs no stages; `encode` alone
+# turns each record into its envelope on `result_out`.
+#
+#   {1: 258, 2: "hi"}  ->  00000010 29aa79ca 09 02 0000000000000102 6869
+#
+#   printf '\x02\x01\x01\x08\x00\x02\x01\x00\x00\x00\x00\x00\x00\x02\x00\x02\x00hi' \
+#     | fluxor run examples/wire_frame/linux.yaml | xxd
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: pipeline
+    params:
+      # RGN_BEGIN ×3, LIT 02, field 1, INT 8 BE, RGN_VARINT, field 2, VAL,
+      # RGN_CRC, RGN_LEN 4 BE +0, FINISH (a field is LOAD_PARAM 0, GET_FIELD n).
+      encode: {hex: "656565600100020100020100000062080068010002020000006169670400006a"}
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

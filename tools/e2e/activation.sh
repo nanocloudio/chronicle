@@ -28,7 +28,7 @@ DEP=0303030303030303030303030303030303030303030303030303030303030303
 CAP=pipeline.effects.v1
 BIND=resources.orders_store
 
-build_graph packaging/cli/linux.yaml || { no activation "cli build"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no activation "cli build"; finish; exit; }
 
 # Everything present -> activates, and reports what it resolved.
 got=$(cli activate "$MODULE" "$KEY" "$CAP" "$PIPE" "$DEP" "$BIND" 2>/dev/null | head -1)

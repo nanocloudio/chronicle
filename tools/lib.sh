@@ -30,8 +30,11 @@ set -u
 # and the shell's "Killed" notices for them are noise, not signal.
 set +m
 # Walk up to the project root by MARKER, not by relative depth. Callers sit at
-# different depths (`tools/ci/`, `tools/e2e/`), and a `cd ../..` that silently
-# lands one level off would leave every relative path in every script wrong.
+# different depths (`tools/ci/`, `tools/e2e/`, an application project's own
+# root), and a `cd ../..` that silently lands one level off would leave every
+# relative path in every script wrong. The nearest `fluxor.toml` is the
+# caller's project: an application that sources this file builds into, and
+# runs from, its own `target/`, against its own pins.
 _root=$(cd "$(dirname "$0")" && while [ ! -f fluxor.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 [ -f "$_root/fluxor.toml" ] || { echo "lib.sh: no fluxor.toml above $0" >&2; exit 1; }
 cd "$_root"
@@ -44,10 +47,11 @@ E2E_GEN=target/e2e/$E2E_RUN
 E2E_PIDS=""
 
 # LEAK GUARD: `fluxor run` spawns fluxor-linux as a CHILD; killing only the
-# parent orphans the child, which runs its scheduler loop forever holding a
-# ~100 MB arena. (The CLI now also sets PR_SET_PDEATHSIG on the child, so this
-# is belt-and-braces for older CLIs.) Reap the child FIRST — `pkill -P` only
-# works while the parent still exists; after it dies the child reparents.
+# parent orphans the child, which runs its scheduler loop forever holding its
+# full state arena. The CLI arms PR_SET_PDEATHSIG on the child, and this reaps
+# it explicitly as well, so cleanup does not rest on one mechanism. Reap the
+# child FIRST — `pkill -P` only works while the parent still exists; after it
+# dies the child reparents.
 reap_graph() { # <pid of the fluxor CLI>
   pkill -TERM -P "$1" 2>/dev/null
   kill "$1" 2>/dev/null
@@ -72,7 +76,14 @@ finish() { echo "== $pass passed, $fail failed =="; [ "$fail" -eq 0 ]; }
 
 # The .fmod artefacts must exist and be current — a stale/cleaned target dir
 # presents as a runtime "module not found" or, worse, runs old behaviour.
-modules_ready() { timeout 900 "$FLX" modules build --target bcm2712 >/dev/null 2>&1; }
+#
+# An application project builds no modules: it composes published ones by the
+# digests in its `fluxor.lock`, which `fluxor sync` has already materialised.
+# There is nothing to make current, so there is nothing to build.
+modules_ready() {
+  [ -d modules ] || return 0
+  timeout 900 "$FLX" modules build --target bcm2712 >/dev/null 2>&1
+}
 
 # A free TCP port, taken from the kernel rather than picked from a constant so
 # two runs cannot choose the same one. Prefer a helper that binds port 0 and
@@ -144,7 +155,7 @@ run_text() {
 
 # `chronicle <args…>` against the built CLI applet graph (argv after `--`,
 # exactly as `cli_in` delivers it). Build it first with
-# `build_graph packaging/cli/linux.yaml`.
+# `build_graph packaging/applet/chronicle/linux.yaml`.
 cli() { run_text "" 10 -- "$@"; }
 
 # Route storage.object at a per-run directory, so concurrent runs never share
@@ -156,8 +167,8 @@ use_store() {
 }
 
 # Wait for a TCP port to accept, bounded. Readiness must be the port itself:
-# a container's control tool (rabbitmqctl, kafka-topics) reports up before the
-# listener binds, and that gap reads as a protocol failure.
+# a process is up before its listener binds, and that gap reads as a protocol
+# failure.
 wait_port() { # <port> <secs>
   timeout "${2:-60}" bash -c "until (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; do sleep 0.5; done"
 }

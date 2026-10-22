@@ -15,7 +15,7 @@
 modules_ready || { no cli "fluxor modules build failed"; finish; exit; }
 
 use_store
-build_graph packaging/cli/linux.yaml || { no cli "applet graph build failed"; finish; exit; }
+build_graph packaging/applet/chronicle/linux.yaml || { no cli "applet graph build failed"; finish; exit; }
 
 IR=02ff190005000101000000120100000005000103000000120200000013ff2f000500010100000012010000000500010200000012020000000500010200000001020000000000000011120300000013
 REC=03010003006f2d3102000600637573742d3903010800fa00000000000000
