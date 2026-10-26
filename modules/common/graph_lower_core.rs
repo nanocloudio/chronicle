@@ -1,0 +1,736 @@
+// Pipeline -> module graph lowering, on device.
+//
+// This is the layer that removes judgment from graph construction. Given an
+// ordered list of graph stages — each pure COMPUTE, a MAP, a DECISION, or a connector
+// EFFECT — the graph is a PURE FUNCTION of the stage kinds. No human decides
+// what becomes a node; the policy is fixed:
+//
+//   * a maximal run of consecutive COMPUTE and MAP stages collapses into ONE
+//     `pipeline` node whose `ir_stages` param runs them as a bytecode chain
+//     (a `stage_kinds` param names the maps), so pure compute never touches a
+//     channel;
+//   * a DECISION becomes its own node (the VM cannot branch), which also breaks
+//     the surrounding compute run;
+//   * each EFFECT becomes a genuine connector node — the provider module its
+//     binding names — wired into the transport;
+//   * dataflow is threaded in stage order, `cli_in -> ... -> cli_out` on a host
+//     profile, ends left open on an embedded one.
+//
+// The same stages always yield byte-identical YAML, so a graph is
+// content-addressable exactly like the bytecode it carries.
+//
+// WHY THIS EMITS YAML DIRECTLY rather than building a `graph_core::GraphSpec`:
+// a GraphSpec borrows its names, params and wires, and every one of those
+// strings has to be BUILT here (node suffixes, hex params, `node.port` wire
+// endpoints). Handing back a GraphSpec would mean a struct holding both an arena
+// and slices into that same arena — self-referential, and not expressible safely.
+// The cost is that the YAML layout has two writers, so
+// `lowering_matches_graph_core_emission` pins them together: it lowers a stage list and
+// asserts the result equals what `graph_to_yaml` produces for the equivalent
+// hand-built spec. If the two ever drift, that test fails.
+//
+// Requires `pack_core` (the `ir_stages` container), `hex_core` (param encoding)
+// and `graph_core` (the `GraphError` vocabulary and the layout it defines).
+
+/// Default version tag for a sibling-owned provider. Providers publish under
+/// `<abi>/<module>:<version>` in the fluxor OCI store; the composing project
+/// pins that reference, so the build resolves the module from the store —
+/// Chronicle owns no provider `.fmod`.
+///
+/// This is only the FALLBACK. Siblings release independently, so one constant
+/// for every provider is wrong as soon as any of them cuts a version — the pin
+/// would resolve to an artifact that exists under a different tag, or to
+/// nothing. A binding's `version` field gives each provider its own.
+pub const PROVIDER_VERSION: &[u8] = b"0.1.0";
+
+/// A connector effect binding: which capability a Resource effect realizes, plus
+/// its endpoint and params.
+///
+/// Every field arrives from the deployment's binding — the effect -> capability
+/// -> provider choice is DATA, not judgment.
+#[derive(Clone, Copy)]
+pub struct Connector<'a> {
+    /// The DOCUMENT's word for this effect (`b"kafka"`), used as the base node
+    /// instance name and its `<kind>N` suffix. Not the provider's name.
+    pub kind: &'a [u8],
+    /// The provider module that realizes the capability — the node's `type:`.
+    /// A deployment's pin, not a choice made here.
+    pub provider: &'a [u8],
+    /// The version tag that provider publishes under. Per provider, because
+    /// siblings release independently and one shared constant mispins the
+    /// moment two of them diverge.
+    pub version: &'a [u8],
+    /// The exchange method each request asks the provider: the exchange
+    /// contract's code (`METHOD_PUBLISH` for a durable destination). Every
+    /// provider takes requests on `request_in` and answers on `response_out`,
+    /// so the method is the one thing about the call a binding chooses.
+    pub method: u8,
+    /// The node's params, in the provider manifest's order: `(name, value,
+    /// quoted)`. `quoted = false` emits the value bare, which a numeric param
+    /// requires — a provider's `u32` decoder rejects `"167772161"`.
+    ///
+    /// The NAMES ARE THE PROVIDER'S and they arrive from the caller. That is
+    /// the point of this shape: nothing here knows what any provider calls
+    /// its params, so binding a new destination is a deployment change, not a
+    /// code change in this file.
+    pub params: &'a [(&'a [u8], &'a [u8], bool)],
+}
+
+impl Connector<'_> {
+    /// The connector's kind tag — the base node INSTANCE name.
+    ///
+    /// Appends into a caller buffer rather than returning a `&'static [u8]`:
+    /// a match returning static references compiles to a table of
+    /// (pointer, len) pairs, and static pointer tables do not relocate in a
+    /// PIC module. Every field here is caller-supplied for the same reason —
+    /// a descriptor TABLE would not survive loading, but a slice the caller
+    /// owns does.
+    pub fn kind(&self, out: &mut [u8]) -> Result<usize, GraphError> {
+        gput(out, 0, self.kind)
+    }
+
+    /// The sibling-owned provider module that realizes this capability.
+    pub fn provider_module(&self, out: &mut [u8]) -> Result<usize, GraphError> {
+        gput(out, 0, self.provider)
+    }
+
+    /// The store pin the build needs to compose this capability's provider
+    /// from the OCI store, scoped to the module ABI `abi`:
+    /// `<abi>/<module>:<version>`.
+    pub fn provider_pin(&self, abi: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
+        let mut p = gput(out, 0, abi)?;
+        p = gput(out, p, b"/")?;
+        p = gput(out, p, self.provider)?;
+        p = gput(out, p, b":")?;
+        gput(out, p, self.version)
+    }
+}
+
+/// One deployment-supplied binding: which provider realizes a document's
+/// named `resource`.
+///
+/// A `.plan` declares `resource orders_store required;` and never says what
+/// serves it — "binding supplied at deploy time", which is the whole point of
+/// the declaration. This is that supply. The document names WHAT it needs; a
+/// deployment names WHICH provider, and the two meet here.
+#[derive(Clone, Copy)]
+pub struct ResourceBinding<'a> {
+    /// The `resource` name as the document spells it.
+    pub resource: &'a [u8],
+    /// The provider bound to it.
+    pub connector: Connector<'a>,
+}
+
+/// Find the binding for a named resource, or `None` when the deployment
+/// supplied none — which is a deployment error, not a document error.
+pub fn resolve_binding<'a>(
+    bindings: &'a [ResourceBinding<'a>],
+    resource: &[u8],
+) -> Option<&'a Connector<'a>> {
+    let mut i = 0;
+    while i < bindings.len() {
+        if bindings[i].resource == resource {
+            return Some(&bindings[i].connector);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// One resolved stage of a pipeline, ready to lower.
+#[derive(Clone, Copy)]
+pub enum GraphStage<'a> {
+    /// Pure compute: one stage's flat checked IR.
+    Compute { stage_ir: &'a [u8] },
+    /// A decision's pre-packed container.
+    Decision { container: &'a [u8] },
+    /// A map stage's container (`pipeline_core::MAP_HEADER` + its lowered
+    /// predicate). It does not branch, so it joins the surrounding compute
+    /// run in one pipeline node, named by that node's `stage_kinds`.
+    Map { container: &'a [u8] },
+    /// A connector effect.
+    Effect(Connector<'a>),
+}
+
+/// What the graph is being lowered FOR: the fluxor target, the connector
+/// transport, and whether the chain is `cli`-bracketed.
+///
+/// The node policy is profile-independent — the profile only decides the target,
+/// the transport node the connectors reach the network through, and whether the
+/// chain's ends are wired to a CLI or left open for a surrounding graph.
+#[derive(Clone, Copy)]
+pub struct TargetProfile<'a> {
+    pub target: &'a [u8],
+    pub transport: &'a [u8],
+    pub host_cli: bool,
+}
+
+impl<'a> TargetProfile<'a> {
+    /// The host profile: `linux` target, `linux_net` transport, `cli`-bracketed.
+    pub fn host() -> TargetProfile<'a> {
+        TargetProfile {
+            target: b"linux",
+            transport: b"linux_net",
+            host_cli: true,
+        }
+    }
+
+    /// An embedded profile: the chain's ends are left open for the surrounding
+    /// graph to wire, so no `cli` edges and no `cli` platform capability.
+    pub fn embedded(target: &'a [u8]) -> TargetProfile<'a> {
+        TargetProfile {
+            target,
+            transport: b"ip",
+            host_cli: false,
+        }
+    }
+}
+
+/// The largest chain this can lower — nodes are named `<kind>N`, and the stages are
+/// walked twice (once for modules, once for wiring), so the chain is recorded
+/// rather than rebuilt.
+pub const MAX_CHAIN: usize = 32;
+
+/// Longest node name plus port, e.g. `pipeline12.result_out`.
+const NAME_CAP: usize = 48;
+
+/// One node in the dataflow chain: its instance name and the ports the previous
+/// and next stages connect to.
+#[derive(Clone, Copy)]
+struct ChainNode {
+    name: [u8; NAME_CAP],
+    name_len: u8,
+    in_port: [u8; NAME_CAP],
+    in_len: u8,
+    out_port: [u8; NAME_CAP],
+    out_len: u8,
+}
+
+impl ChainNode {
+    fn blank() -> Self {
+        ChainNode {
+            name: [0u8; NAME_CAP],
+            name_len: 0,
+            in_port: [0u8; NAME_CAP],
+            in_len: 0,
+            out_port: [0u8; NAME_CAP],
+            out_len: 0,
+        }
+    }
+    fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+    fn in_port(&self) -> &[u8] {
+        &self.in_port[..self.in_len as usize]
+    }
+    fn out_port(&self) -> &[u8] {
+        &self.out_port[..self.out_len as usize]
+    }
+}
+
+fn set(dst: &mut [u8; NAME_CAP], len: &mut u8, s: &[u8]) -> Result<(), GraphError> {
+    if s.len() > NAME_CAP {
+        return Err(GraphError::TooLarge);
+    }
+    dst[..s.len()].copy_from_slice(s);
+    *len = s.len() as u8;
+    Ok(())
+}
+
+/// `<base>` for the first instance of a kind, `<base><n+1>` after that — the
+/// stable-unique naming.
+fn instance_name(base: &[u8], n: usize, out: &mut [u8]) -> Result<usize, GraphError> {
+    let p = gput(out, 0, base)?;
+    if n == 0 {
+        return Ok(p);
+    }
+    gput_u32(out, p, (n + 1) as u32)
+}
+
+/// Emit `  <key>: "<value>"\n` — a quoted scalar param, at the module indent.
+fn emit_param(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usize, GraphError> {
+    let mut p = gput(out, p, b"      ")?;
+    p = gput(out, p, key)?;
+    p = gput(out, p, b": \"")?;
+    p = gput(out, p, value)?;
+    gput(out, p, b"\"\n")
+}
+
+/// Emit a connector node's params, in the order the caller gave them.
+///
+/// One loop, no provider knowledge. Every param name, value and quoting
+/// decision arrives on the binding — which is what makes adding a
+/// destination a deployment change rather than an edit here, and what keeps
+/// a provider's param rename from silently breaking chronicle: a graph naming
+/// a param the provider does not accept builds fine and is refused at load,
+/// so the names must come from the deployment that knows the provider.
+fn emit_connector_params(out: &mut [u8], p: usize, c: &Connector) -> Result<usize, GraphError> {
+    let mut p = p;
+    for (key, value, quoted) in c.params {
+        // An empty value means "not set": omitted so the provider's own
+        // default applies, rather than emitting an empty string it would
+        // have to interpret.
+        if value.is_empty() {
+            continue;
+        }
+        p = if *quoted {
+            emit_param(out, p, key, value)?
+        } else {
+            emit_param_raw(out, p, key, value)?
+        };
+    }
+    Ok(p)
+}
+
+/// Emit one param with the value unquoted, `  key: 1234`.
+///
+/// A numeric param needs this: a provider's `u32` decoder rejects
+/// `"167772161"`, and whether a value is numeric is the provider's fact, so
+/// it rides on the binding rather than being inferred from the bytes.
+fn emit_param_raw(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usize, GraphError> {
+    let mut p = gput(out, p, b"      ")?;
+    p = gput(out, p, key)?;
+    p = gput(out, p, b": ")?;
+    p = gput(out, p, value)?;
+    gput(out, p, b"\n")
+}
+
+/// Emit one `wiring:` edge, `  - from: <a>\n    to: <b>\n`.
+fn emit_wire(
+    out: &mut [u8],
+    p: usize,
+    from_node: &[u8],
+    from_port: &[u8],
+    to_node: &[u8],
+    to_port: &[u8],
+) -> Result<usize, GraphError> {
+    let mut p = gput(out, p, b"  - from: ")?;
+    p = gput(out, p, from_node)?;
+    p = gput(out, p, b".")?;
+    p = gput(out, p, from_port)?;
+    p = gput(out, p, b"\n    to: ")?;
+    p = gput(out, p, to_node)?;
+    p = gput(out, p, b".")?;
+    p = gput(out, p, to_port)?;
+    gput(out, p, b"\n")
+}
+
+/// Lower `stages` into fluxor graph YAML for the host profile.
+pub fn lower_pipeline(
+    stages: &[GraphStage],
+    target: &[u8],
+    tick_us: u32,
+    out: &mut [u8],
+    scratch: &mut [u8],
+) -> Result<usize, GraphError> {
+    let mut profile = TargetProfile::host();
+    profile.target = target;
+    lower_pipeline_with(stages, &profile, tick_us, out, scratch)
+}
+
+/// Lower `stages` into fluxor graph YAML for `profile`.
+///
+/// `scratch` holds the packed `ir_stages` container for the largest compute run
+/// before it is hex-encoded; it must be at least as large as that container.
+/// Pure and deterministic: identical inputs render identical bytes.
+pub fn lower_pipeline_with(
+    stages: &[GraphStage],
+    profile: &TargetProfile,
+    tick_us: u32,
+    out: &mut [u8],
+    scratch: &mut [u8],
+) -> Result<usize, GraphError> {
+    let mut chain = [ChainNode::blank(); MAX_CHAIN];
+    let mut n_chain = 0usize;
+    let mut needs_net = false;
+
+    // Per-kind instance counts, so repeated nodes get stable unique names.
+    let (mut pipe_n, mut decision_n) = (0usize, 0usize);
+    // Per-KIND instance counters, keyed by the document's own word for the
+    // effect: a second `redis` is `redis2`, while the first `kafka` starts
+    // fresh. The kinds are whatever the bindings name, so the table is
+    // discovered as the stages are walked.
+    let mut kind_names = [[0u8; NAME_CAP]; MAX_CHAIN];
+    let mut kind_lens = [0usize; MAX_CHAIN];
+    let mut kind_counts = [0usize; MAX_CHAIN];
+    let mut kinds_seen = 0usize;
+
+    // Modules are emitted as the stages are walked; wiring needs the whole chain, so
+    // it is emitted afterwards from `chain`.
+    let mut p = gput(out, 0, b"target: ")?;
+    p = gput(out, p, profile.target)?;
+    p = gput(out, p, b"\ntick_us: ")?;
+    p = gput_u32(out, p, tick_us)?;
+    p = gput(out, p, b"\n")?;
+    // `accept_cycles` depends on whether any effect appears, which is not known
+    // until the walk finishes — so the walk runs first and the rest of the
+    // document is assembled after it, from here.
+    let header_end = p;
+
+    // ---- pass 1: walk the stages, recording the chain ----
+    //
+    // Two passes, because `scheduler.accept_cycles` and the `net` platform
+    // capability both depend on whether ANY effect appears, and both are emitted
+    // before the modules. Rather than buffer the module text somewhere and move
+    // it, the walk records what each node is and pass 2 renders it.
+    let mut effects = [None::<Connector>; MAX_CHAIN];
+    // Per pipeline node: the provider node it asks, when it carries an effect.
+    let mut requester_of = [None::<usize>; MAX_CHAIN];
+    let mut ir_spans = [(0usize, 0usize); MAX_CHAIN];
+    // Per chain NODE (not per stage): 0 pipeline, 1 decision, 2 effect.
+    let mut kinds = [0u8; MAX_CHAIN];
+    let mut decisions = [&[] as &[u8]; MAX_CHAIN];
+    // Per pipeline node: its stages' kinds (`STAGE_KIND_COMPUTE` or
+    // `STAGE_KIND_MAP`), and whether any is a map — only then does the node
+    // carry a `stage_kinds` param.
+    let mut run_kinds = [[0u8; MAX_NODE_STAGES]; MAX_CHAIN];
+    let mut run_lens = [0usize; MAX_CHAIN];
+    let mut run_maps = [false; MAX_CHAIN];
+
+    // The packed ir_stages containers for each compute run live end to end in
+    // `scratch`; `ir_spans` records where each one is.
+    let mut scratch_used = 0usize;
+
+    let mut i = 0usize;
+    while i < stages.len() {
+        if n_chain >= MAX_CHAIN {
+            return Err(GraphError::TooLarge);
+        }
+        match &stages[i] {
+            GraphStage::Compute { .. } | GraphStage::Map { .. } => {
+                // Collapse the maximal run of consecutive compute (and map)
+                // stages into one pipeline node — the policy that keeps pure
+                // compute off the wire. A map's container rides in its stage
+                // slot verbatim; `stage_kinds` tells the node which it is.
+                let mut run = [&[] as &[u8]; MAX_NODE_STAGES];
+                let mut n_run = 0usize;
+                loop {
+                    let (bytes, kind) = match stages.get(i) {
+                        Some(GraphStage::Compute { stage_ir }) => (*stage_ir, STAGE_KIND_COMPUTE),
+                        Some(GraphStage::Map { container }) => (*container, STAGE_KIND_MAP),
+                        _ => break,
+                    };
+                    if n_run >= MAX_NODE_STAGES {
+                        return Err(GraphError::RunTooLong);
+                    }
+                    run[n_run] = bytes;
+                    run_kinds[n_chain][n_run] = kind;
+                    run_maps[n_chain] |= kind == STAGE_KIND_MAP;
+                    n_run += 1;
+                    i += 1;
+                }
+                run_lens[n_chain] = n_run;
+                let packed = pack_ir_stages(&mut scratch[scratch_used..], &run[..n_run], &[])
+                    .map_err(|_| GraphError::TooLarge)?;
+                ir_spans[n_chain] = (scratch_used, packed);
+                scratch_used += packed;
+
+                let mut name = [0u8; NAME_CAP];
+                let nl = instance_name(b"pipeline", pipe_n, &mut name)?;
+                pipe_n += 1;
+                kinds[n_chain] = 0;
+                let c = &mut chain[n_chain];
+                set(&mut c.name, &mut c.name_len, &name[..nl])?;
+                set(&mut c.in_port, &mut c.in_len, b"record_in")?;
+                set(&mut c.out_port, &mut c.out_len, b"result_out")?;
+                n_chain += 1;
+            }
+            GraphStage::Decision { container } => {
+                let mut name = [0u8; NAME_CAP];
+                let nl = instance_name(b"decision", decision_n, &mut name)?;
+                decision_n += 1;
+                kinds[n_chain] = 1;
+                decisions[n_chain] = container;
+                let c = &mut chain[n_chain];
+                set(&mut c.name, &mut c.name_len, &name[..nl])?;
+                set(&mut c.in_port, &mut c.in_len, b"record_in")?;
+                set(&mut c.out_port, &mut c.out_len, b"result_out")?;
+                n_chain += 1;
+                i += 1;
+            }
+            GraphStage::Effect(binding) => {
+                needs_net = true;
+                // The effect is a request the pipeline node before it asks:
+                // that node becomes the requester, and the answer continues
+                // the chain from its `result_out`. With no pipeline node to
+                // carry it — the effect comes first, follows a
+                // decision, or follows another effect — a node with no stages
+                // is placed to carry it.
+                let carrier_free =
+                    n_chain > 0 && kinds[n_chain - 1] == 0 && requester_of[n_chain - 1].is_none();
+                if !carrier_free {
+                    if n_chain >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
+                    let mut name = [0u8; NAME_CAP];
+                    let nl = instance_name(b"pipeline", pipe_n, &mut name)?;
+                    pipe_n += 1;
+                    kinds[n_chain] = 0;
+                    run_lens[n_chain] = 0;
+                    let c = &mut chain[n_chain];
+                    set(&mut c.name, &mut c.name_len, &name[..nl])?;
+                    set(&mut c.in_port, &mut c.in_len, b"record_in")?;
+                    set(&mut c.out_port, &mut c.out_len, b"result_out")?;
+                    n_chain += 1;
+                    if n_chain >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
+                }
+                let carrier = n_chain - 1;
+
+                let mut base = [0u8; NAME_CAP];
+                let bl = binding.kind(&mut base)?;
+
+                // Find this kind's counter, or start one.
+                let mut slot = kinds_seen;
+                let mut k = 0usize;
+                while k < kinds_seen {
+                    if kind_lens[k] == bl && kind_names[k][..bl] == base[..bl] {
+                        slot = k;
+                        break;
+                    }
+                    k += 1;
+                }
+                if slot == kinds_seen {
+                    if kinds_seen >= MAX_CHAIN {
+                        return Err(GraphError::TooLarge);
+                    }
+                    kind_names[slot][..bl].copy_from_slice(&base[..bl]);
+                    kind_lens[slot] = bl;
+                    kinds_seen += 1;
+                }
+
+                let mut name = [0u8; NAME_CAP];
+                let nl = instance_name(&base[..bl], kind_counts[slot], &mut name)?;
+                kind_counts[slot] += 1;
+
+                // The provider is a side node: it answers its requester and is
+                // not a link in the record chain.
+                kinds[n_chain] = 2;
+                effects[n_chain] = Some(*binding);
+                requester_of[carrier] = Some(n_chain);
+                let c = &mut chain[n_chain];
+                set(&mut c.name, &mut c.name_len, &name[..nl])?;
+                set(&mut c.in_port, &mut c.in_len, b"request_in")?;
+                set(&mut c.out_port, &mut c.out_len, b"response_out")?;
+                n_chain += 1;
+                i += 1;
+            }
+        }
+    }
+
+    // ---- pass 2: the document, now that `needs_net` is known ----
+    let mut p = header_end;
+    if needs_net {
+        p = gput(out, p, b"scheduler:\n  accept_cycles: true\n")?;
+    }
+
+    // An EMPTY section is an explicit empty collection, never a bare key. A bare
+    // `platform:` parses as null ("must be a mapping") and `wiring` is required
+    // outright — an embedded compute-only graph has both empty, and fluxor
+    // refuses either as a bare key.
+    if !profile.host_cli && !needs_net {
+        p = gput(out, p, b"\nplatform: {}\n")?;
+    } else {
+        p = gput(out, p, b"\nplatform:\n")?;
+        if profile.host_cli {
+            p = gput(out, p, b"  cli: {}\n")?;
+        }
+        if needs_net {
+            p = gput(out, p, b"  net: {}\n")?;
+        }
+    }
+
+    if n_chain == 0 {
+        p = gput(out, p, b"\nmodules: []\n")?;
+    } else {
+        p = gput(out, p, b"\nmodules:\n")?;
+    }
+    for k in 0..n_chain {
+        p = gput(out, p, b"  - name: ")?;
+        p = gput(out, p, chain[k].name())?;
+        p = gput(out, p, b"\n")?;
+        match kinds[k] {
+            0 => {
+                // `type:` only when the instance name is not the module name.
+                // The first compute node is `pipeline`, so the name implies the
+                // type; a second run is `pipeline2`, and without an explicit
+                // type fluxor looks for a module by that name and refuses the
+                // graph. Same rule as the decision arm below.
+                if chain[k].name() != b"pipeline" {
+                    p = gput(out, p, b"    type: pipeline\n")?;
+                }
+                p = gput(out, p, b"    params:\n")?;
+                if run_lens[k] > 0 {
+                    p = gput(out, p, b"      ir_stages: {hex: \"")?;
+                    let (off, len) = ir_spans[k];
+                    p = put_hex(out, p, &scratch[off..off + len])?;
+                    p = gput(out, p, b"\"}\n")?;
+                }
+                if let Some(e) = requester_of[k] {
+                    let c = effects[e].ok_or(GraphError::EffectUnbound)?;
+                    p = gput(out, p, b"      method: ")?;
+                    p = gput_u32(out, p, c.method as u32)?;
+                    p = gput(out, p, b"\n")?;
+                }
+                if run_maps[k] {
+                    p = gput(out, p, b"      stage_kinds: {hex: \"")?;
+                    p = put_hex(out, p, &run_kinds[k][..run_lens[k]])?;
+                    p = gput(out, p, b"\"}\n")?;
+                }
+            }
+            1 => {
+                // `type:` only when the instance name is NOT the module name —
+                // the first decision node is called `decision`, so the name
+                // implies the type and it is omitted.
+                if chain[k].name() != b"decision" {
+                    p = gput(out, p, b"    type: decision\n")?;
+                }
+                p = gput(out, p, b"    params:\n      decision: {hex: \"")?;
+                p = put_hex(out, p, decisions[k])?;
+                p = gput(out, p, b"\"}\n")?;
+            }
+            _ => {
+                let c = effects[k].ok_or(GraphError::EffectUnbound)?;
+                let mut m = [0u8; NAME_CAP];
+                let ml = c.provider_module(&mut m)?;
+                p = gput(out, p, b"    type: ")?;
+                p = gput(out, p, &m[..ml])?;
+                p = gput(out, p, b"\n    params:\n")?;
+                p = emit_connector_params(out, p, &c)?;
+            }
+        }
+    }
+    // ---- wiring: source edge, inter-stage edges, sink edge, exchange edges,
+    //      transport edges ----
+    //
+    // The record chain is every node but the providers, which hang off their
+    // requesters. A single node on an embedded profile has NO edges at all: the
+    // ends are left open for the surrounding graph. Emitting a bare `wiring:`
+    // key there would be refused ("wiring must be a list"), so the section is
+    // counted first and only opened if something goes in it.
+    let mut links = [0usize; MAX_CHAIN];
+    let mut n_links = 0usize;
+    for (k, kind) in kinds.iter().enumerate().take(n_chain) {
+        if *kind != 2 {
+            links[n_links] = k;
+            n_links += 1;
+        }
+    }
+    let n_effects = n_chain - n_links;
+    let mut n_wires = 4 * n_effects;
+    if n_links > 0 {
+        if profile.host_cli {
+            n_wires += 2;
+        }
+        n_wires += n_links - 1;
+    }
+    if n_wires == 0 {
+        p = gput(out, p, b"\nwiring: []\n")?;
+    } else {
+        p = gput(out, p, b"\nwiring:\n")?;
+    }
+    if n_links > 0 {
+        let first = chain[links[0]];
+        let last = chain[links[n_links - 1]];
+        if profile.host_cli {
+            p = emit_wire(
+                out,
+                p,
+                b"cli_in",
+                b"stdin_out",
+                first.name(),
+                first.in_port(),
+            )?;
+        }
+        for w in 0..n_links - 1 {
+            let (a, b) = (chain[links[w]], chain[links[w + 1]]);
+            p = emit_wire(out, p, a.name(), a.out_port(), b.name(), b.in_port())?;
+        }
+        if profile.host_cli {
+            p = emit_wire(
+                out,
+                p,
+                last.name(),
+                last.out_port(),
+                b"cli_out",
+                b"bytes_in",
+            )?;
+        }
+    }
+    // Each requester's exchange with its provider, in node order.
+    for k in 0..n_chain {
+        let Some(e) = requester_of[k] else {
+            continue;
+        };
+        let (r, v) = (chain[k].name(), chain[e].name());
+        p = emit_wire(out, p, r, b"request_out", v, b"request_in")?;
+        p = emit_wire(out, p, v, b"response_out", r, b"response_in")?;
+    }
+    // Transport edges last, in node order — the canonical order.
+    for k in 0..n_chain {
+        if kinds[k] != 2 {
+            continue;
+        }
+        let name = chain[k].name();
+        p = emit_wire(out, p, name, b"net_out", profile.transport, b"net_in")?;
+        p = emit_wire(out, p, profile.transport, b"net_out", name, b"net_in")?;
+    }
+    Ok(p)
+}
+
+/// Append lowercase hex of `bytes` at `p`.
+fn put_hex(out: &mut [u8], p: usize, bytes: &[u8]) -> Result<usize, GraphError> {
+    if p + bytes.len() * 2 > out.len() {
+        return Err(GraphError::TooLarge);
+    }
+    let n = hex_encode(bytes, &mut out[p..]).ok_or(GraphError::TooLarge)?;
+    Ok(p + n)
+}
+
+/// The provider store pins a stage list needs, deduplicated and in stage order.
+///
+/// The composing project's `fluxor.lock` must hold these before building —
+/// each provider's project a declared dependency, whose modules `fluxor update`
+/// pins — so the graph-image build resolves each provider module from the OCI
+/// store.
+/// Pure: a function of the stages and the module ABI the pins are tagged with —
+/// the pin-side mirror of the graph itself.
+///
+/// Writes each pin into `out[i]`, returning how many were written.
+pub fn graph_provider_pins(
+    stages: &[GraphStage],
+    abi: &[u8],
+    out: &mut [&mut [u8]],
+    lens: &mut [usize],
+) -> Result<usize, GraphError> {
+    let mut n = 0usize;
+    for st in stages {
+        let GraphStage::Effect(binding) = st else {
+            continue;
+        };
+        let mut pin = [0u8; 96];
+        let pl = binding.provider_pin(abi, &mut pin)?;
+
+        let mut seen = false;
+        for k in 0..n {
+            if lens[k] == pl && out[k][..pl] == pin[..pl] {
+                seen = true;
+                break;
+            }
+        }
+        if seen {
+            continue;
+        }
+        if n >= out.len() || n >= lens.len() {
+            return Err(GraphError::TooLarge);
+        }
+        if out[n].len() < pl {
+            return Err(GraphError::TooLarge);
+        }
+        out[n][..pl].copy_from_slice(&pin[..pl]);
+        lens[n] = pl;
+        n += 1;
+    }
+    Ok(n)
+}

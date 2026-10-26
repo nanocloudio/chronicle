@@ -67,7 +67,7 @@ pub enum LowerError {
     /// hand the reader a short program and then decode the tail of this one as
     /// the header of the next. Reachable only through an output buffer of
     /// 64 KiB or more, which callers do supply (`chronicle_cli` lowers into a
-    /// `UPROC_BUF`-sized buffer) — so this is the caller's bound checked here,
+    /// `PLAN_BUF`-sized buffer) — so this is the caller's bound checked here,
     /// where the narrowing happens, instead of trusted from another file.
     ProgramTooLong,
     /// Bytes follow the last stage the container declares. The format has no

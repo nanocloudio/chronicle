@@ -1,8 +1,8 @@
-// Turning a parsed `.uproc` document into the inputs the compiler and sealer
-// need — the step between `uproc_core` (structure) and `celc_core` +
+// Turning a parsed `.plan` document into the inputs the compiler and sealer
+// need — the step between `plan_core` (structure) and `celc_core` +
 // `artefact_core` (bytecode + identity).
 //
-// `uproc_core` gives declarations as spans. `celc_core` wants its type
+// `plan_core` gives declarations as spans. `celc_core` wants its type
 // environment as TEXT: `Name{field:ty@N,...};Other{...};ENUM=n`, with the
 // parameter binding as `name:Type`. This builds those strings from the document,
 // so a device can compile an artefact body without a host ever having assembled
@@ -19,7 +19,7 @@
 // other name is passed through as a message name deliberately rather than by
 // accident.
 //
-// Requires `uproc_core`.
+// Requires `plan_core`.
 
 /// Why lowering a document to compiler inputs failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,10 +98,10 @@ pub fn schema_type_name(dsl: &[u8]) -> &[u8] {
 /// byte for byte as the pinned digests require. Declaration order is preserved, so the same
 /// document always yields the same text, and therefore the same bytecode and the
 /// same digests.
-pub fn uproc_schema_text(
+pub fn plan_schema_text(
     src: &[u8],
     doc: &Doc,
-    arena: &UprocArena,
+    arena: &PlanArena,
     out: &mut [u8],
 ) -> Result<usize, LowerDocError> {
     let mut p = 0usize;
@@ -136,7 +136,7 @@ pub fn uproc_schema_text(
 }
 
 /// Build the compiler's parameter binding `name:Type` into `out`.
-pub fn uproc_params_text(
+pub fn plan_params_text(
     src: &[u8],
     param_name: Span,
     param_type: Span,
@@ -159,7 +159,7 @@ pub fn param_message_name(param_type: &[u8]) -> &[u8] {
 }
 
 /// The fully-qualified name of a declaration: `package.symbol`, or the bare
-/// symbol when the module has no package.
+/// symbol when the plan has no package.
 pub fn qualify(package: &[u8], symbol: &[u8], out: &mut [u8]) -> Result<usize, LowerDocError> {
     if package.is_empty() {
         return put(out, 0, symbol);
@@ -169,7 +169,7 @@ pub fn qualify(package: &[u8], symbol: &[u8], out: &mut [u8]) -> Result<usize, L
     put(out, p, symbol)
 }
 
-/// Split a module's qualified name into `(package, symbol)` at the last dot.
+/// Split a plan's qualified name into `(package, symbol)` at the last dot.
 pub fn split_qname(qualified: &[u8]) -> (&[u8], &[u8]) {
     let mut i = qualified.len();
     while i > 0 {
@@ -188,14 +188,14 @@ pub fn split_qname(qualified: &[u8]) -> (&[u8], &[u8]) {
 /// int field per operator (numbered in operator order, matching the engine's
 /// state layout), and the window bounds. Those three messages do not appear in
 /// the document, so they are synthesized here, named after the aggregation so
-/// two aggregations in one module cannot collide.
+/// two aggregations in one plan cannot collide.
 ///
 /// `base_len` is the length of the schema text already in `out`; the context is
 /// appended after it, in a fixed order (State, Window, EmitCtx).
-pub fn uproc_agg_emit_schema(
+pub fn plan_agg_emit_schema(
     src: &[u8],
     agg: &AggregationDecl,
-    arena: &UprocArena,
+    arena: &PlanArena,
     package: &[u8],
     out: &mut [u8],
     base_len: usize,
@@ -234,7 +234,7 @@ pub fn uproc_agg_emit_schema(
 }
 
 /// The parameter binding for an aggregation's `emit`: `ctx:<package>.<agg>.EmitCtx`.
-pub fn uproc_agg_emit_params(
+pub fn plan_agg_emit_params(
     src: &[u8],
     agg: &AggregationDecl,
     package: &[u8],

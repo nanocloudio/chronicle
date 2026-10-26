@@ -10,7 +10,7 @@
 //
 // Effect-free, so `chronicle graph` can lower it with nothing supplied from
 // outside.
-module t.split {
+plan t.split {
 
   message t.Item {
     id: string = 1;

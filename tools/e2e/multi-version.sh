@@ -15,7 +15,7 @@ got=$(run_text 01020108000a00000000000000 4)
 
 # selector field 255 = "v2" -> pinned v2 doubles -> "20\n"
 got=$(run_text 02020108000a00000000000000ff0002007632 4)
-[ "$got" = "20" ] && ok "X-Module-Version pin selects v2 (amount*2)" \
+[ "$got" = "20" ] && ok "X-Pipeline-Version pin selects v2 (amount*2)" \
   || no "mv pin v2" "got='$got'"
 
 # unknown "v9" fails CLOSED, not through some default

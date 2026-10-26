@@ -199,7 +199,7 @@ pub fn remove_version_msg(out: &mut [u8], tag: &[u8]) -> Result<usize, ReleaseEr
 /// SHAPE of the convergence: how many messages, how many were adds, and whether
 /// the default moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReconcilePlan {
+pub struct ReconcileOutcome {
     pub revision: u64,
     pub n_messages: usize,
     pub n_added: usize,
@@ -285,7 +285,7 @@ impl Reconciler {
         loaded: &dyn Fn(&[u8]) -> bool,
         out: &mut [&mut [u8]],
         lens: &mut [usize],
-    ) -> Result<Option<ReconcilePlan>, ReleaseError> {
+    ) -> Result<Option<ReconcileOutcome>, ReleaseError> {
         if revision <= self.applied_revision && self.has_default {
             return Ok(None);
         }
@@ -332,7 +332,7 @@ impl Reconciler {
         self.has_default = true;
         self.applied_revision = revision;
 
-        Ok(Some(ReconcilePlan {
+        Ok(Some(ReconcileOutcome {
             revision,
             n_messages: n,
             n_added,

@@ -2,7 +2,7 @@
 // the requirements are a repeated field of the record, each a nested message
 // its producer has paired with the pod's value for its key, and the stage
 // counts which requirements hold.
-module t.selector {
+plan t.selector {
   message t.Req {
     key: string = 1;
     op: string = 2;

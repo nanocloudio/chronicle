@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# AUTHORING END TO END ON DEVICE — a `.uproc` document in, sealed artefacts out:
+# AUTHORING END TO END ON DEVICE — a `.plan` document in, sealed artefacts out:
 #
-#   chronicle author <uproc_hex>   -> "<name> <digest>" per artefact
+#   chronicle author <plan_hex>   -> "<name> <digest>" per artefact
 #
-# Every step runs on device: parse the document (`uproc_core`), assemble the
-# type environment from its own declarations (`uproc_lower_core`), compile each
+# Every step runs on device: parse the document (`plan_core`), assemble the
+# type environment from its own declarations (`plan_lower_core`), compile each
 # body (`celc_core`), lower it, and seal it (`artefact_core`). No host is
 # involved. Every digest is pinned below: sealing is content-addressed, so a
 # change to parsing, lowering or encoding that alters one byte fails here rather
@@ -16,7 +16,7 @@ build_graph packaging/applet/chronicle/linux.yaml || { no author "cli build"; fi
 cli() { run_text "" 10 -- "$@"; }
 hex_of() { python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$1"; }
 
-DOC=$(hex_of examples/authoring/process_order.uproc)
+DOC=$(hex_of examples/authoring/process_order.plan)
 
 # The document declares `is_large`; sealing it must yield a 64-char digest.
 got=$(cli author "$DOC" 2>/dev/null | head -1)
@@ -50,8 +50,8 @@ fi
 # decision and a pipeline — one of every kind it uses.
 names=$(cli author "$DOC" 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
 lines=$(cli author "$DOC" 2>/dev/null | grep -c .)
-if [ "$names" = "is_large normalize route process MODULE " ]; then
-  ok "every kind is sealed, then the MODULE that contains them"
+if [ "$names" = "is_large normalize route process PLAN " ]; then
+  ok "every kind is sealed, then the PLAN that contains them"
 else
   no author "got '$names'"
 fi
@@ -68,7 +68,7 @@ fi
 # Aggregations seal too, including the `emit` expression — which reads a
 # SYNTHESIZED context (operator state + window bounds) that appears nowhere in
 # the document, so sealing one exercises the whole lowering path.
-agg=$(cli author "$(hex_of examples/authoring/customer_totals.uproc)" 2>/dev/null | head -1)
+agg=$(cli author "$(hex_of examples/authoring/customer_totals.plan)" 2>/dev/null | head -1)
 aggname=${agg%% *}
 aggdigest=${agg##* }
 PINNED_AGG=09f2d3c2a61cce57ee695af86402ec1cee5c013ba035018ad0b210b12d69c005
@@ -88,7 +88,7 @@ fi
 # a real statement about the whole path, not a coincidence.
 #
 # A pinned digest changes only when sealing is meant to change. Regenerate it
-# from `chronicle author <uproc_hex>` and review the difference before pinning.
+# from `chronicle author <plan_hex>` and review the difference before pinning.
 PINNED_IS_LARGE=e3d22a05ad69b7499282c461cabac4b090b342da76910361d998dedec53a0bea
 PINNED_NORMALIZE=0d3d0186abf2c3e0e3627a836f0b56d14a6879fdc1e26179620ba5e0068aa020
 PINNED_ROUTE=b27737f28f24177c561f05d62714465db8644bce50521006e72dbb4442a9112d
@@ -119,23 +119,23 @@ PINNED_PROCESS_D=49b9d6c69a1c6ae6ee4fa3a7b3877c90692bf64fef1bed989ab5199f487aa08
   && ok "the pipeline digest matches its pinned digest" \
   || no author "pipeline: dev=$dev_process want=$PINNED_PROCESS_D"
 
-# The MODULE is the deployment unit: refs to every contained artefact, the
+# The PLAN is the deployment unit: refs to every contained artefact, the
 # resource bindings the deployment must satisfy, and the entry points. Pinning
-# it means one document always seals to one module, so a registry reference to
-# that module stays valid.
-PINNED_MODULE=0cbf93128cbba6727388112f30017ea09b5b7c33ba515374d6b19f4e6733bb06
-dev_module=$(echo "$dev_all" | awk '$1=="MODULE"{print $2}')
-[ "$dev_module" = "$PINNED_MODULE" ] \
-  && ok "the sealed MODULE digest matches its pinned digest" \
-  || no author "module: dev=$dev_module want=$PINNED_MODULE"
+# it means one document always seals to one plan, so a registry reference to
+# that plan stays valid.
+PINNED_PLAN=0cbf93128cbba6727388112f30017ea09b5b7c33ba515374d6b19f4e6733bb06
+dev_plan=$(echo "$dev_all" | awk '$1=="PLAN"{print $2}')
+[ "$dev_plan" = "$PINNED_PLAN" ] \
+  && ok "the sealed PLAN digest matches its pinned digest" \
+  || no author "plan: dev=$dev_plan want=$PINNED_PLAN"
 
-# ...and for the aggregation document too, whose module contains an Aggregation
+# ...and for the aggregation document too, whose plan contains an Aggregation
 # ref rather than a pipeline — a different ref field in the sealed encoding.
-PINNED_AGG_MODULE=40c3ac7e38c8023649e3748bc42a95ec3e35358584766caab7eca09f7a8bb4ea
-dev_agg_module=$(cli author "$(hex_of examples/authoring/customer_totals.uproc)" 2>/dev/null | awk '$1=="MODULE"{print $2}')
-[ "$dev_agg_module" = "$PINNED_AGG_MODULE" ] \
-  && ok "the aggregation module digest matches its pinned digest" \
-  || no author "agg module: dev=$dev_agg_module want=$PINNED_AGG_MODULE"
+PINNED_AGG_PLAN=40c3ac7e38c8023649e3748bc42a95ec3e35358584766caab7eca09f7a8bb4ea
+dev_agg_plan=$(cli author "$(hex_of examples/authoring/customer_totals.plan)" 2>/dev/null | awk '$1=="PLAN"{print $2}')
+[ "$dev_agg_plan" = "$PINNED_AGG_PLAN" ] \
+  && ok "the aggregation plan digest matches its pinned digest" \
+  || no author "agg plan: dev=$dev_agg_plan want=$PINNED_AGG_PLAN"
 
 # A run of compute stages lowers to ONE pipeline node, which runs at most eight
 # stages, so `author` refuses the pipeline `graph` could not lower. A run of
@@ -150,7 +150,7 @@ calls = "    call s0 = normalize(order);\n" + "".join(
     f"    call s{i} = surcharge(s{i - 1});\n" for i in range(1, n))
 if len(sys.argv) > 2:
     calls += f"    call big = is_big(s{n - 1});\n"
-doc = f"""module t.chain {{
+doc = f"""plan t.chain {{
   message t.Order {{ id: string = 1; total: int = 2; }}
   transformation normalize(order: t.Order) -> t.Order {{ t.Order {{ id: order.id, total: order.total }} }}
   transformation surcharge(o: t.Order) -> t.Order {{ t.Order {{ id: o.id, total: o.total + 1 }} }}
@@ -178,7 +178,7 @@ case "$expr" in
 esac
 
 # A malformed document still reports a position rather than crashing.
-BAD=$(printf 'module a.b {\n  nonsense foo;\n}' | python3 -c 'import sys;print(sys.stdin.buffer.read().hex())')
+BAD=$(printf 'plan a.b {\n  nonsense foo;\n}' | python3 -c 'import sys;print(sys.stdin.buffer.read().hex())')
 got=$(cli author "$BAD" 2>/dev/null | head -1)
 case "$got" in
   *"at line 2"*) ok "a malformed document reports its position" ;;

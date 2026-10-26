@@ -1,6 +1,6 @@
 # gRPC unary over the GENUINE HTTP/2 transport — chronicle graph composing
 # fluxor's http.fmod in gRPC client mode (mode=1, protocol=1 h2c, grpc=1). Unlike
-# the codec path (examples/authoring/grpc_connector.uproc), which hand-rolls the
+# the codec path (examples/authoring/grpc_connector.plan), which hand-rolls the
 # whole HTTP/2 request as encode bytecode over the stateless tcp_client, this uses
 # fluxor's real HTTP/2 connection state machine (preface, SETTINGS + ACK, HPACK,
 # DATA, flow control, trailers). The `grpc: 1` flag makes the client send

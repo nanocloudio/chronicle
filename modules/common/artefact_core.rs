@@ -20,7 +20,7 @@ pub const KIND_TRANSFORMATION: i32 = 3;
 pub const KIND_DECISION: i32 = 4;
 pub const KIND_AGGREGATION: i32 = 5;
 pub const KIND_PIPELINE: i32 = 6;
-pub const KIND_MODULE: i32 = 7;
+pub const KIND_PLAN: i32 = 7;
 
 /// `ProvenanceClass` — how the artefact was produced.
 pub const PROVENANCE_LOCAL_BUILD: i32 = 1;
@@ -325,9 +325,9 @@ pub fn seal_decision(
     Ok((sealed, digest))
 }
 
-// ---- Module: the deployment unit ------------------------------------------
+// ---- Plan: the deployment unit --------------------------------------------
 //
-// A Module is what distribution actually moves: it names the artefacts it
+// A Plan is what distribution actually moves: it names the artefacts it
 // contains by digest, the capabilities it needs, its entry points and its
 // provenance, and carries DETACHED signatures. Sealing one on device is what
 // lets a node publish work it authored itself.
@@ -351,20 +351,20 @@ pub fn pb_artefact_ref(
     w.close(m)
 }
 
-/// One artefact a Module contains: which repeated field it belongs to is
-/// decided by its `kind` (see [`module_field_for_kind`]).
+/// One artefact a Plan contains: which repeated field it belongs to is
+/// decided by its `kind` (see [`plan_field_for_kind`]).
 #[derive(Clone, Copy)]
-pub struct ModuleRef<'a> {
+pub struct PlanEntry<'a> {
     pub package: &'a [u8],
     pub symbol: &'a [u8],
     pub kind: i32,
     pub digest: &'a [u8],
 }
 
-/// The Module field number a contained artefact of `kind` is listed under.
+/// The Plan field number a contained artefact of `kind` is listed under.
 /// Schemas=2, expressions=3, transformations=4, decisions=5, aggregations=6,
 /// pipelines=7.
-pub fn module_field_for_kind(kind: i32) -> Option<u32> {
+pub fn plan_field_for_kind(kind: i32) -> Option<u32> {
     match kind {
         KIND_SCHEMA => Some(2),
         KIND_EXPRESSION => Some(3),
@@ -376,7 +376,7 @@ pub fn module_field_for_kind(kind: i32) -> Option<u32> {
     }
 }
 
-/// A resource a module REQUIRES the deployment to bind. `required` is the
+/// A resource a plan REQUIRES the deployment to bind. `required` is the
 /// difference between "activation fails without this" and "nice to have".
 #[derive(Clone, Copy)]
 pub struct BindingSpec<'a> {
@@ -385,7 +385,7 @@ pub struct BindingSpec<'a> {
     pub required: bool,
 }
 
-/// An activatable surface: a name bound to one of the module's pipelines.
+/// An activatable surface: a name bound to one of the plan's pipelines.
 #[derive(Clone, Copy)]
 pub struct EntrySpec<'a> {
     pub name: &'a [u8],
@@ -403,14 +403,14 @@ pub struct SignatureSpec<'a> {
     pub signer: &'a [u8],
 }
 
-/// A Module's non-repeated payload.
-pub struct ModuleSpec<'a> {
+/// A Plan's non-repeated payload.
+pub struct PlanSpec<'a> {
     pub source_revision: &'a [u8],
     pub build_toolchain: &'a [u8],
     pub provenance_class: i32,
 }
 
-/// `Module { header = 1, <contained refs> = 2..7, capabilities = 11,
+/// `Plan { header = 1, <contained refs> = 2..7, capabilities = 11,
 /// entry_points = 12, provenance = 13, signatures = 14 }`.
 ///
 /// Refs MUST arrive grouped by kind in ascending field order (schemas first,
@@ -419,15 +419,15 @@ pub struct ModuleSpec<'a> {
 /// differently-identified — encoding.
 #[allow(
     clippy::too_many_arguments,
-    reason = "a Module aggregates six independent declaration sets; grouping them would only move the list"
+    reason = "a Plan aggregates six independent declaration sets; grouping them would only move the list"
 )]
-pub fn encode_module(
+pub fn encode_plan(
     out: &mut [u8],
     header: &HeaderSpec,
-    refs: &[ModuleRef],
+    refs: &[PlanEntry],
     bindings: &[BindingSpec],
     entries: &[EntrySpec],
-    spec: &ModuleSpec,
+    spec: &PlanSpec,
     signatures: &[SignatureSpec],
     digest: Option<&[u8]>,
 ) -> Result<usize, PbError> {
@@ -439,7 +439,7 @@ pub fn encode_module(
     let mut field = 2u32;
     while field <= 7 {
         for r in refs {
-            if module_field_for_kind(r.kind) == Some(field) {
+            if plan_field_for_kind(r.kind) == Some(field) {
                 pb_artefact_ref(&mut w, field, r.package, r.symbol, r.kind, r.digest)?;
             }
         }
@@ -481,26 +481,26 @@ pub fn encode_module(
     Ok(w.len())
 }
 
-/// Seal a Module. Unlike the other artefacts the digest excludes BOTH the
+/// Seal a Plan. Unlike the other artefacts the digest excludes BOTH the
 /// header's digest field AND every signature — a signature signs the digest, so
 /// including it would make identity unrecomputable.
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors encode_module's declaration sets"
+    reason = "mirrors encode_plan's declaration sets"
 )]
-pub fn seal_module(
+pub fn seal_plan(
     out: &mut [u8],
     scratch: &mut [u8],
     header: &HeaderSpec,
-    refs: &[ModuleRef],
+    refs: &[PlanEntry],
     bindings: &[BindingSpec],
     entries: &[EntrySpec],
-    spec: &ModuleSpec,
+    spec: &PlanSpec,
     signatures: &[SignatureSpec],
 ) -> Result<(usize, [u8; 32]), PbError> {
-    let n = encode_module(scratch, header, refs, bindings, entries, spec, &[], None)?;
+    let n = encode_plan(scratch, header, refs, bindings, entries, spec, &[], None)?;
     let digest = sha256(&scratch[..n]);
-    let sealed = encode_module(
+    let sealed = encode_plan(
         out,
         header,
         refs,

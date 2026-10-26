@@ -119,7 +119,7 @@ MAX_BUILD_FIELDS <= u8::MAX as usize | modules/common/vm_core.rs
 
 | Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
 |---|---|---|---|---|---|---|---|---|---|
-| `MAX_NODE_STAGES` | 8 | st | per record | capacity | the graph lowering refuses a compute/map run past it (`GraphError::RunTooLong`) and `author` refuses the pipeline first; a stage container past it reaching a node anyway → `inputs_failed`, never truncated (consumed) | 8 × `Stage` descriptor on the step | the stages one pipeline node runs, which a compute run lowers into; the pipeline module and the CLI's stage assembly both size their tables by it | larger variant | `plan::a_compute_run_longer_than_a_node_runs_is_refused`; `tools/e2e/author.sh` (a run of eight authors, a ninth is refused) |
+| `MAX_NODE_STAGES` | 8 | st | per record | capacity | the graph lowering refuses a compute/map run past it (`GraphError::RunTooLong`) and `author` refuses the pipeline first; a stage container past it reaching a node anyway → `inputs_failed`, never truncated (consumed) | 8 × `Stage` descriptor on the step | the stages one pipeline node runs, which a compute run lowers into; the pipeline module and the CLI's stage assembly both size their tables by it | larger variant | `graph_lowering::a_compute_run_longer_than_a_node_runs_is_refused`; `tools/e2e/author.sh` (a run of eight authors, a ninth is refused) |
 | `DECISION_STAGE_COST` | 100_000 | vmi | per decision stage | policy default | n/a — recorded, not consulted | none | the `max_cost` field the stage format requires; a decision stage's real bounds are the per-program costs inside its own container, enforced by `run_decision` | tracks the format | `tools/e2e/inline-decision.sh` |
 | `MAX_CALL_ARITY_BOUND` | `u8::MAX as u64` (255) | op | per `CALL` | proof bound | n/a — not a refusal point; it sizes a compile-time assertion | none | the widest argument count a `CALL` could add to a program's static cost. With code capped at `u16::MAX` bytes by its length prefix and every op adding one unit plus this at most, the cost cannot exceed `u32::MAX`, which is what lets every wire site narrow the `u64` cost to the container's `u32` field unchecked. Held at a `u8`'s width rather than the table's actual maximum (three) so a builtin gaining arguments cannot outgrow the proof without the assertion saying so | tracks the `[cost:u32]` wire field; widening the field retires it | `lower_core` const assert — a violation fails the build |
 | `XREC` | `if TINY { 1024 } else { RECORD_MAX }` — 8192 / 8192 / 1024 | B | per exchange record | capacity | a record that would frame larger is refused before the send (`inputs_failed`); one arriving larger than the port declares is refused by the channel | two outboxes and one intake record | one whole exchange record at the contract's `RECORD_MAX`, what each exchange port declares as `max_record`; a tiny target's ports declare 1024 | tracks the contract | `exchange::a_request_maps_to_fields_and_back_to_a_head` |
@@ -189,8 +189,8 @@ memory is the consumer's budget, not a constant; these are the ceilings inside i
 
 | Limit | Value | Dim | Scope | Kind | Failure (input consumed?) | Memory/work | Rationale | Change rule | Tests |
 |---|---|---|---|---|---|---|---|---|---|
-| `UPROC_BUF` | 65536 | B | per document | capacity | `.uproc` source > 64 KiB → refused before author (does not hang) | source staging | one document carrying a whole protocol surface: discovery, authn, mTLS, authz, admission and CRUD on one request path | larger variant, in state | none — pinned by the `limit-register` gate; no suite exercises the boundary |
-| `ARGV_BUF` | `2 * UPROC_BUF` (131072) | B | per invocation | capacity | argv record past the buffer → bounded retry then ERROR, applet gets no argv | argv staging | the hex of a max document as one argv record; DERIVED so the two cannot drift apart and leave a document that compiles but never reaches the applet | tracks `UPROC_BUF` (2x) | none — pinned by the `limit-register` gate; no suite exercises the boundary |
+| `PLAN_BUF` | 65536 | B | per document | capacity | `.plan` source > 64 KiB → refused before author (does not hang) | source staging | one document carrying a whole protocol surface: discovery, authn, mTLS, authz, admission and CRUD on one request path | larger variant, in state | none — pinned by the `limit-register` gate; no suite exercises the boundary |
+| `ARGV_BUF` | `2 * PLAN_BUF` (131072) | B | per invocation | capacity | argv record past the buffer → bounded retry then ERROR, applet gets no argv | argv staging | the hex of a max document as one argv record; DERIVED so the two cannot drift apart and leave a document that compiles but never reaches the applet | tracks `PLAN_BUF` (2x) | none — pinned by the `limit-register` gate; no suite exercises the boundary |
 | `MAX_RULE` | 32 | rec | per decision (author) | capacity | 33rd rule arm → author reject | 2 × 16 KiB in module STATE (`RuleCode`), not the stack | a state machine's arm count follows its states: entry and exit conditions over a handful of states reach the twenties without padding | raise with the buffers in state, never on a PIC frame | none — pinned by the `limit-register` gate; no suite exercises the boundary |
 | `RULE_CODE` | 512 | B | per rule program (author) | capacity | a `when` or outcome compiling past 512 B → author reject | `2 × MAX_RULE × RULE_CODE` = 32 KiB in state | one arm's predicate or constructed outcome; the outcome is the long one, since a pass-through arm sets every field of its record | larger variant, in state | none — pinned by the `limit-register` gate; no suite exercises the boundary |
 | `BIN_BUF` | 16384 | B | per artefact (author) | capacity | artefact past the buffer → author reports and refuses | 3 work buffers in module state | one sealed artefact: its container, its lowered code, and the digest-free encoding the two-pass seal needs | larger variant, in state | none — pinned by the `limit-register` gate; no suite exercises the boundary |
@@ -200,7 +200,7 @@ memory is the consumer's budget, not a constant; these are the ceilings inside i
 
 ## Authoring document and CLI ceilings
 
-Ceilings on what one `.uproc` document may declare and what the authoring CLI
+Ceilings on what one `.plan` document may declare and what the authoring CLI
 accepts. Every one refuses: a document past a ceiling is rejected with a named
 error and compiles to nothing, so a deployment unit is never a truncated version
 of the document that produced it.
@@ -321,8 +321,8 @@ SNAPSHOT_LANE_BYTES | modules/app/aggregation/mod.rs | 1 + 2 + KEY_CAP + 8 + 1
 SNAPSHOT_PANE_BYTES | modules/app/aggregation/mod.rs | 1 + 8 + 16 * MAX_OPS + 4 + 1 + 8 * COLL_CAP
 VBIN_BUF | modules/app/pipeline/mod.rs | if TINY { 3072 } else { 8192 }
 PROG_BUF | modules/app/pipeline/mod.rs | 2048
-ARGV_BUF | modules/app/chronicle_cli/mod.rs | 2 * UPROC_BUF
-UPROC_BUF | modules/app/chronicle_cli/mod.rs | 65536
+ARGV_BUF | modules/app/chronicle_cli/mod.rs | 2 * PLAN_BUF
+PLAN_BUF | modules/app/chronicle_cli/mod.rs | 65536
 OUT_BUF | modules/app/chronicle_cli/mod.rs | 2 * tc::BIN_BUF + 4096
 CONT_BUF | modules/app/decision/mod.rs | if TINY { dec::MAX_CONTAINER_BIN } else { dec::MAX_CONTAINER_BIN_FULL }
 TLM_INTERVAL_MS | modules/common/telemetry_core.rs | 5000

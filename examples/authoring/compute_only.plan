@@ -1,7 +1,7 @@
 // A pipeline with no effects — the case a document can lower to a runnable graph
 // entirely on its own.
 //
-// `process_order.uproc` is the fuller example, but its pipeline has an `effect`
+// `process_order.plan` is the fuller example, but its pipeline has an `effect`
 // on a `resource`, and a connector binding names an endpoint and credentials
 // that live nowhere in the document. This one is deliberately bindings-free, so
 // `chronicle graph` can take it all the way from source to bootable YAML with
@@ -9,7 +9,7 @@
 //
 // Two consecutive `call` stages, so the compute-run collapse is observable: the
 // graph must contain ONE pipeline node, not two.
-module commerce.compute_only {
+plan commerce.compute_only {
 
   // ---- Type environment ----
   message commerce.Money {

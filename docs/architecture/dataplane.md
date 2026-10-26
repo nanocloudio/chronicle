@@ -74,7 +74,7 @@ input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶
   program that parses the bytes arriving — a raw chunk on `record_in`, or a
   collected request's body — into a record frame before the stages.
   `reply_decode` does the same for a requester's answer bodies.
-- **version select**: the record's `X-Module-Version` selector (field 255) resolves
+- **version select**: the record's `X-Pipeline-Version` selector (field 255) resolves
   to one of the loaded [versions](versioning.md); unknown ⇒ fail closed.
 - **stages**: an ordered chain of stage programs (see [stage kinds](#stage-kinds)).
   Each stage's constructed message is *serialized* as the next stage's input
@@ -124,8 +124,8 @@ message's frame — at most the declared `max` of them (more refuses the stage,
 producer pairs before the stage. The predicate reads `(element, record)` and
 answers true, false or unknown; the driver
 counts the three into declared int fields, so "every element holds" is
-`false == 0 && unknown == 0` in whatever follows. Authored as a `.uproc`
-`map` (see `examples/map_stage/selector.uproc`), sealed as an Expression plus
+`false == 0 && unknown == 0` in whatever follows. Authored as a `.plan`
+`map` (see `examples/map_stage/selector.plan`), sealed as an Expression plus
 the calling Stage's `MapSpec`, and lowered into the surrounding compute run's
 node — a map does not branch, so it is a stage, not a node. Its body is copied
 verbatim like a decision's; see `MAP_STAGE_COST`.

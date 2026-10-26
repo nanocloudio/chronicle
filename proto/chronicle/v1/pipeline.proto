@@ -3,9 +3,9 @@
 // is a `call` to a named artefact or an `effect` on a named Resource.
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
-import "unified/v1/common.proto";
+import "chronicle/v1/common.proto";
 
 message Pipeline {
   ArtefactHeader header = 1;

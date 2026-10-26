@@ -1,8 +1,8 @@
-// The spec's commerce.customer_totals aggregation, authored in the .uproc DSL.
+// The spec's commerce.customer_totals aggregation, authored in the .plan DSL.
 // `chronicle author` seals it as an Aggregation artefact: a pane-aligned
 // event-time window with monoid operators, a watermark, bounded lanes, and a
 // typed emit.
-module commerce.metrics {
+plan commerce.metrics {
 
   message commerce.Money { units: int = 1; }
   message commerce.Order {

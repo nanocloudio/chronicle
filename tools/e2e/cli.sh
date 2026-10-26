@@ -168,15 +168,15 @@ else
 fi
 
 # Refs are given OUT of kind order on purpose: the encoder must group them into
-# ascending fields, as prost emits repeated fields, or the Module identity moves.
-got=$(cli seal-module 'commerce' 'orders' 'abc123' 'rustc-1.81' \
+# ascending fields, as prost emits repeated fields, or the Plan identity moves.
+got=$(cli seal-plan 'commerce' 'orders' 'abc123' 'rustc-1.81' \
         pipeline 'commerce.process' 2222222222222222222222222222222222222222222222222222222222222222 \
         expression 'commerce.customer_key' 1111111111111111111111111111111111111111111111111111111111111111 \
         2>/dev/null | head -1)
 if [ "$got" = "4e4efeb1ce545f3c245ee598bdb3505b6d120ea7ee6536299c8164a7f903a84e" ]; then
-  ok "cli seal-module produces the pinned Module digest"
+  ok "cli seal-plan produces the pinned Plan digest"
 else
-  no "cli seal-module" "digest='$got'"
+  no "cli seal-plan" "digest='$got'"
 fi
 
 # CONTENT-ADDRESSED STORAGE ON DEVICE — the other half of self-hosting: a node

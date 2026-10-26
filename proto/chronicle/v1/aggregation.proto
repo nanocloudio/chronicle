@@ -4,9 +4,9 @@
 // (spec). Stateful operators are standardized aggregation operators (monoids).
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
-import "unified/v1/common.proto";
+import "chronicle/v1/common.proto";
 
 message Aggregation {
   ArtefactHeader header = 1;

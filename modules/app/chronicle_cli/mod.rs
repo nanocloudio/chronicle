@@ -14,7 +14,7 @@
 //!   chronicle decide <dec_hex> <record_hex> dry-run a record through a decision
 //!   chronicle seal <schema> <params> <src> …   seal an Expression artefact
 //!   chronicle seal-tf …                     seal a Transformation artefact
-//!   chronicle seal-module <pkg> <sym> …     seal a Module (the deployment unit)
+//!   chronicle seal-plan <pkg> <sym> …     seal a Plan (the deployment unit)
 //!   chronicle digest <hex>                  sha256 content digest (version identity)
 //!   chronicle help
 //!
@@ -74,18 +74,18 @@ mod tc {
     include!("../../common/blobstore_core.rs");
     include!("../../common/oci_core.rs");
     include!("../../common/ckptstore_core.rs");
-    include!("../../common/uproc_core.rs");
-    include!("../../common/uproc_lower_core.rs");
-    include!("../../common/modsig_core.rs");
+    include!("../../common/plan_core.rs");
+    include!("../../common/plan_lower_core.rs");
+    include!("../../common/plansig_core.rs");
     include!("../../common/activation_core.rs");
     include!("../../common/barrier_core.rs");
     // The deployment half of authoring: pack a compiled artefact into the param
-    // container a module loads, resolve a document's pipeline into plan stages,
+    // container a module loads, resolve a document's pipeline into graph stages,
     // and lower those to the graph YAML a runtime boots. With these the whole
     // chain — source to runnable graph — happens inside fluxor.
     include!("../../common/pack_core.rs");
     include!("../../common/graph_core.rs");
-    include!("../../common/plan_core.rs");
+    include!("../../common/graph_lower_core.rs");
     include!("../../common/registry_core.rs");
     // The release control plane: author a versions param and the hot-reload
     // messages that converge a running fleet onto it.
@@ -105,7 +105,7 @@ mod tc {
     include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
     // Authoring orchestration + shared CLI helpers, mounted last so it
-    // sees every core it composes (celc/lower/uproc/artefact).
+    // sees every core it composes (celc/lower/plan/artefact).
     include!("../../common/author_core.rs");
 }
 use tc::{
@@ -114,10 +114,10 @@ use tc::{
     append,
     append_celc_err,
     append_hex,
+    append_plan_reason,
     append_release_reason,
     append_slot_reason,
     append_u32,
-    append_uproc_reason,
     author_document,
     blob_get,
     blob_put,
@@ -146,7 +146,6 @@ use tc::{
     lower_flat,
     lower_pipeline_with,
     lower_stages,
-    module_verify,
     oci_fetch,
     oci_init,
     oci_push,
@@ -154,20 +153,27 @@ use tc::{
     param_message_name,
     parse_bindings,
     parse_i64,
-    plan_activation,
+    plan_agg_emit_params,
+    plan_agg_emit_schema,
+    plan_line_col,
+    plan_params_text,
+    plan_parse,
+    plan_schema_text,
+    plan_verify,
     print_digest,
     put_ir_prog,
     put_prog,
     release_from_argv,
     remove_version_msg,
+    resolve_activation,
     run_decision_metered,
     run_stages,
     scan_decision_container,
     seal_aggregation,
     seal_decision,
     seal_expression,
-    seal_module,
     seal_pipeline,
+    seal_plan,
     seal_transformation,
     set_default_msg,
     sha256,
@@ -181,12 +187,6 @@ use tc::{
     split_qualified,
     stage_at,
     stage_count,
-    uproc_agg_emit_params,
-    uproc_agg_emit_schema,
-    uproc_line_col,
-    uproc_params_text,
-    uproc_parse,
-    uproc_schema_text,
     version_digest,
     ActivationError,
     AggregationSpec,
@@ -203,18 +203,20 @@ use tc::{
     EntrySpec,
     ExpressionSpec,
     Field,
+    GraphStage,
     HeaderSpec,
     Layer,
     ManifestRef,
     Message,
-    ModuleRef,
-    ModuleSpec,
     NodeState,
     OciError,
     OciFetch,
     OperatorSpec,
     PipelineSpec,
-    PlanStage,
+    PlanArena,
+    PlanEntry,
+    PlanErrorKind,
+    PlanSpec,
     PushBufs,
     ReadHold,
     RegError,
@@ -230,8 +232,6 @@ use tc::{
     StageSpec as ArtStageSpec,
     TargetProfile,
     TransformationSpec,
-    UprocArena,
-    UprocErrorKind,
     Value,
     VerifyError,
     VersionRef,
@@ -240,8 +240,8 @@ use tc::{
     KIND_AGGREGATION,
     KIND_DECISION,
     KIND_EXPRESSION,
-    KIND_MODULE,
     KIND_PIPELINE,
+    KIND_PLAN,
     KIND_SCHEMA,
     KIND_TRANSFORMATION,
     MAX_ARGV,
@@ -252,7 +252,7 @@ use tc::{
     MAX_PIPE_FIELDS,
     MAX_SET,
     MAX_VERSIONS,
-    MEDIA_TYPE_MODULE,
+    MEDIA_TYPE_PLAN,
     OP_AVG,
     OP_COUNT,
     OP_DISTINCT,
@@ -263,7 +263,7 @@ use tc::{
     OP_TOPK,
     PROVENANCE_LOCAL_BUILD,
     ROUTE_NONE,
-    // The deployment half: document -> plan -> graph, all on device.
+    // The deployment half: document -> graph stages -> graph, all on device.
     STAGE_EFFECT,
     STAGE_KIND_COMPUTE,
     STAGE_SCRATCH_CAP,
@@ -274,12 +274,12 @@ const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
 const STEP_DONE: i32 = 1;
 
-// Sized as 2 x UPROC_BUF: a `.uproc` travels as ONE hex argument, so the
+// Sized as 2 x PLAN_BUF: a `.plan` travels as ONE hex argument, so the
 // argv record is twice the document plus the subcommand. The two constants
 // move TOGETHER or an over-bound document stops being a compile error and
 // becomes an argv record the channel never delivers.
-const ARGV_BUF: usize = 2 * UPROC_BUF;
-/// Largest `.uproc` document this CLI will author, in bytes of source.
+const ARGV_BUF: usize = 2 * PLAN_BUF;
+/// Largest `.plan` document this CLI will author, in bytes of source.
 ///
 /// Sized for a whole protocol surface rather than a single operation: the
 /// reference identity provider carries introspect, token, authorization-code
@@ -303,7 +303,7 @@ const ARGV_BUF: usize = 2 * UPROC_BUF;
 /// bound exists to prevent: a document that clears the compile check but
 /// becomes an argv record the channel never delivers, leaving the applet to
 /// print its help and exit 0.
-const UPROC_BUF: usize = 65536;
+const PLAN_BUF: usize = 65536;
 /// The CLI's stdout buffer, in module state.
 ///
 /// Every artefact prints as HEX — twice its bytes — and `graph` wraps its
@@ -377,12 +377,12 @@ struct Work {
     /// `slot-verify`'s verifier once the header is read: a held window read
     /// resumes the stream where it stopped rather than rereading the image.
     slot_v: Option<SlotVerifier>,
-    /// Hex-decoded input: a `.uproc` document for `author`/`parse`, or a
+    /// Hex-decoded input: a `.plan` document for `author`/`parse`, or a
     /// smaller artefact for the other subcommands.
-    ir: [u8; UPROC_BUF],
+    ir: [u8; PLAN_BUF],
     /// Compiled program, or the schema text `author` generates from a
     /// document — which scales with the document.
-    prog: [u8; UPROC_BUF],
+    prog: [u8; PLAN_BUF],
     record: [u8; 512],
     buf_a: [u8; 512],
     buf_b: [u8; 512],
@@ -393,7 +393,7 @@ struct Work {
     scratch: [u8; BIN_BUF],
     frame: [u8; 512],
     out: [u8; OUT_BUF],
-    // `.uproc` declaration arena. In module state, not on the stack: the
+    // `.plan` declaration arena. In module state, not on the stack: the
     // arrays total several KiB and a PIC frame cannot hold them alongside the
     // compile buffers each artefact kind needs.
     //
@@ -439,14 +439,14 @@ fn cmd_help(out: &mut [u8]) -> usize {
           \x20                                        -> content digest + sealed Expression artefact\n\
           \x20 chronicle seal-tf <schema> <params> <src> <pkg> <sym> <in_ty> <out_ty>\n\
           \x20                                        -> a sealed Transformation artefact\n\
-          \x20 chronicle seal-module <pkg> <sym> <rev> <toolchain> [<kind> <pkg.sym> <digest>]...\n\
-          \x20                                        -> a sealed Module (the deployment unit)\n\
+          \x20 chronicle seal-plan <pkg> <sym> <rev> <toolchain> [<kind> <pkg.sym> <digest>]...\n\
+          \x20                                        -> a sealed Plan (the deployment unit)\n\
           \x20 chronicle put <hex>                    store a blob under its own sha256\n\
           \x20 chronicle get <digest_hex>             read it back, verifying the content address\n\
           \x20 chronicle digest <hex>                 sha256 content digest (version identity)\n\
-          \x20 chronicle author <uproc_hex>          compile a .uproc document to sealed artefacts\n\
-          \x20 chronicle parse <uproc_hex>           parse a .uproc module document\n\
-          \x20 chronicle graph <uproc_hex> <pipeline> [target] [bindings]\n\
+          \x20 chronicle author <plan_hex>            compile a .plan document to sealed artefacts\n\
+          \x20 chronicle parse <plan_hex>             parse a .plan document\n\
+          \x20 chronicle graph <plan_hex> <pipeline> [target] [bindings]\n\
           \x20                                        lower a pipeline to runnable graph YAML\n\
           \x20 chronicle compile-source <schema> <param> <type> <source>\n\
           \x20                                        type-check source at runtime -> ir hex\n\
@@ -460,9 +460,9 @@ fn cmd_help(out: &mut [u8]) -> usize {
           \x20                                        stream-check a stored OTA slot image\n\
           \x20 chronicle ckpt-save <hex>              persist a checkpoint, move `latest` to it\n\
           \x20 chronicle ckpt-load                    read back the latest checkpoint (recovery)\n\
-          \x20 chronicle activate <module_hex> <key_hex> <caps> <artefacts> <modules> <bindings>\n\
+          \x20 chronicle activate <plan_hex> <key_hex> <caps> <artefacts> <plans> <bindings>\n\
           \x20                                        full activation sequence ('-' for an empty list)\n\
-          \x20 chronicle verify <module_hex> <trusted_pubkey_hex>...\n\
+          \x20 chronicle verify <plan_hex> <trusted_pubkey_hex>...\n\
           \x20                                        recompute the digest + check a trusted signature\n\
           \x20 chronicle oci-init                     create an OCI image layout in the store\n\
           \x20 chronicle oci-push <hex> <tag>         publish a bundle, print its manifest digest\n\
@@ -662,23 +662,18 @@ fn cmd_seal_tf(
     }
 }
 
-/// `seal-module <pkg> <sym> <rev> <toolchain> [<kind> <pkg.sym> <digest_hex>]…`
+/// `seal-plan <pkg> <sym> <rev> <toolchain> [<kind> <pkg.sym> <digest_hex>]…`
 ///
 /// Seals the DEPLOYMENT UNIT: the artefact that names what it contains by
 /// digest and carries provenance. A node that can do this can publish work it
 /// authored itself, with an identity every consumer resolves to the same bytes.
-fn cmd_seal_module(
-    s: &mut Work,
-    arec: &[u8],
-    argv: &[(usize, usize)],
-    argc: usize,
-) -> (usize, i32) {
+fn cmd_seal_plan(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -> (usize, i32) {
     if argc < 5 || !(argc - 5).is_multiple_of(3) {
         return (
             append(
                 &mut s.out,
                 0,
-                b"error: seal-module needs <pkg> <sym> <rev> <toolchain> \
+                b"error: seal-plan needs <pkg> <sym> <rev> <toolchain> \
                   [<kind> <pkg.sym> <digest_hex>]...\n",
             ),
             1,
@@ -708,7 +703,7 @@ fn cmd_seal_module(
             );
         }
     }
-    let mut refs = [ModuleRef {
+    let mut refs = [PlanEntry {
         package: &[],
         symbol: &[],
         kind: 0,
@@ -717,7 +712,7 @@ fn cmd_seal_module(
     for (k, (r, d)) in refs.iter_mut().zip(dbuf.iter()).enumerate().take(nrefs) {
         let (ns, ne) = argv[6 + k * 3];
         let (pkg, sym) = split_qualified(&arec[ns..ne]);
-        *r = ModuleRef {
+        *r = PlanEntry {
             package: pkg,
             symbol: sym,
             kind: kinds[k],
@@ -730,15 +725,15 @@ fn cmd_seal_module(
     let header = HeaderSpec {
         package: &arec[p1.0..p1.1],
         symbol: &arec[p2.0..p2.1],
-        kind: KIND_MODULE,
+        kind: KIND_PLAN,
         capability: b"",
     };
-    let spec = ModuleSpec {
+    let spec = PlanSpec {
         source_revision: &arec[r1.0..r1.1],
         build_toolchain: &arec[t1.0..t1.1],
         provenance_class: PROVENANCE_LOCAL_BUILD,
     };
-    match seal_module(
+    match seal_plan(
         &mut s.cont,
         &mut s.scratch,
         &header,
@@ -753,7 +748,7 @@ fn cmd_seal_module(
     }
 }
 
-/// `author <uproc_hex>`: compile a whole `.uproc` document to SEALED artefacts,
+/// `author <plan_hex>`: compile a whole `.plan` document to SEALED artefacts,
 /// printing one `<name> <digest>` line per artefact.
 ///
 /// This is authoring end to end on device: parse the document, assemble the type
@@ -763,7 +758,7 @@ fn cmd_author(s: &mut Work, hex: &[u8]) -> (usize, i32) {
     let Some(n) = hex_decode(hex, &mut s.ir) else {
         return (append(&mut s.out, 0, b"error: not valid hex\n"), 1);
     };
-    let mut arena = UprocArena {
+    let mut arena = PlanArena {
         messages: &mut s.u_messages,
         fields: &mut s.u_fields,
         enums: &mut s.u_enums,
@@ -1023,7 +1018,7 @@ fn cmd_release_ctl(
 /// over at RUNTIME and emit the `ir` param a module loads.
 ///
 /// The dynamic delivery path — "POST source, no build step" — as opposed to
-/// compiling a `.uproc` document. A node holds a schema and checks source it has
+/// compiling a `.plan` document. A node holds a schema and checks source it has
 /// never seen against it, emitting the same shippable checked IR the modules
 /// lower at load. The target then proves it can run the result by lowering it,
 /// so there is no opaque bytecode and no out-of-band agreement on the opcode set.
@@ -1134,7 +1129,7 @@ fn cmd_compile_stages(
     }
 }
 
-/// `graph <uproc_hex> <pipeline> [target]`: lower a document's pipeline all the
+/// `graph <plan_hex> <pipeline> [target]`: lower a document's pipeline all the
 /// way to the fluxor graph YAML a runtime boots.
 ///
 /// This is the last hop of authoring: parse the document, compile each stage's
@@ -1159,7 +1154,7 @@ fn cmd_graph(
     let Some(n) = hex_decode(hex, &mut s.ir) else {
         return (append(&mut s.out, 0, b"error: not valid hex\n"), 1);
     };
-    let mut arena = UprocArena {
+    let mut arena = PlanArena {
         messages: &mut s.u_messages,
         fields: &mut s.u_fields,
         enums: &mut s.u_enums,
@@ -1208,7 +1203,7 @@ fn cmd_graph(
     )
 }
 
-/// `parse <uproc_hex>`: parse a `.uproc` module document and summarise it.
+/// `parse <plan_hex>`: parse a `.plan` document and summarise it.
 ///
 /// Hex-encoded because argv is NUL-separated and a document contains newlines
 /// and quotes.
@@ -1219,7 +1214,7 @@ fn cmd_parse(s: &mut Work, hex: &[u8]) -> (usize, i32) {
     // Declaration arrays live in module state, not on the PIC stack — the
     // same arena `author`/`graph` use, so `parse` validates exactly the
     // documents they accept rather than a smaller subset.
-    let mut arena = UprocArena {
+    let mut arena = PlanArena {
         messages: &mut s.u_messages,
         fields: &mut s.u_fields,
         enums: &mut s.u_enums,
@@ -1236,10 +1231,10 @@ fn cmd_parse(s: &mut Work, hex: &[u8]) -> (usize, i32) {
         entries: &mut s.u_entries,
         maps: &mut s.u_maps,
     };
-    match uproc_parse(&s.ir[..n], &mut arena) {
+    match plan_parse(&s.ir[..n], &mut arena) {
         Ok(doc) => {
-            let mut p = append(&mut s.out, 0, b"module ");
-            p = append(&mut s.out, p, doc.module.of(&s.ir[..n]));
+            let mut p = append(&mut s.out, 0, b"plan ");
+            p = append(&mut s.out, p, doc.name.of(&s.ir[..n]));
             p = append(&mut s.out, p, b" messages=");
             p = append_u32(&mut s.out, p, doc.n_messages as u32);
             p = append(&mut s.out, p, b" expressions=");
@@ -1262,9 +1257,9 @@ fn cmd_parse(s: &mut Work, hex: &[u8]) -> (usize, i32) {
             (p, 0)
         }
         Err(e) => {
-            let (line, col) = uproc_line_col(&s.ir[..n], e.offset);
+            let (line, col) = plan_line_col(&s.ir[..n], e.offset);
             let mut p = append(&mut s.out, 0, b"error: ");
-            p = append_uproc_reason(&mut s.out, p, e.kind);
+            p = append_plan_reason(&mut s.out, p, e.kind);
             p = append(&mut s.out, p, b" at line ");
             p = append_u32(&mut s.out, p, line as u32);
             p = append(&mut s.out, p, b" column ");
@@ -1333,7 +1328,7 @@ fn ckpt_err(out: &mut [u8], e: CkptError) -> usize {
     }
 }
 
-/// `activate <module_hex> <trusted_key_hex> <caps> <artefacts> <modules> <bindings>`
+/// `activate <plan_hex> <trusted_key_hex> <caps> <artefacts> <plans> <bindings>`
 ///
 /// Runs the full activation sequence: verify, then resolve dependencies,
 /// artefacts, capabilities and bindings against what this node holds. The four
@@ -1344,17 +1339,14 @@ fn cmd_activate(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize)
             append(
                 &mut s.out,
                 0,
-                b"error: activate needs <module_hex> <key_hex> <caps> <artefacts> <modules> <bindings> ('-' for none)\n",
+                b"error: activate needs <plan_hex> <key_hex> <caps> <artefacts> <plans> <bindings> ('-' for none)\n",
             ),
             1,
         );
     }
     let (a, b) = argv[1];
     let Some(mlen) = hex_decode(&arec[a..b], &mut s.ir) else {
-        return (
-            append(&mut s.out, 0, b"error: module is not valid hex\n"),
-            1,
-        );
+        return (append(&mut s.out, 0, b"error: plan is not valid hex\n"), 1);
     };
     let (ka, kb) = argv[2];
     let mut key = [0u8; 32];
@@ -1378,10 +1370,10 @@ fn cmd_activate(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize)
         return (append(&mut s.out, 0, b"error: bad artefact digest\n"), 1);
     };
 
-    let mut mods = [[0u8; 32]; MAX_SET];
+    let mut plans = [[0u8; 32]; MAX_SET];
     let (ma, mb) = argv[5];
-    let Some(nmods) = split_digests(&arec[ma..mb], &mut mods) else {
-        return (append(&mut s.out, 0, b"error: bad module digest\n"), 1);
+    let Some(nplans) = split_digests(&arec[ma..mb], &mut plans) else {
+        return (append(&mut s.out, 0, b"error: bad plan digest\n"), 1);
     };
 
     let mut binds = [b"".as_slice(); MAX_SET];
@@ -1394,10 +1386,10 @@ fn cmd_activate(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize)
     let node = NodeState {
         capabilities: &caps[..ncaps],
         artefacts: &arts[..narts],
-        modules: &mods[..nmods],
+        plans: &plans[..nplans],
         bound_contracts: &binds[..nbinds],
     };
-    match plan_activation(&s.ir[..mlen], &[key], &node, &mut s.scratch) {
+    match resolve_activation(&s.ir[..mlen], &[key], &node, &mut s.scratch) {
         Ok(p) => {
             let mut o = append(&mut s.out, 0, b"ok: activate deps=");
             o = append_u32(&mut s.out, o, p.dependencies as u32);
@@ -1427,16 +1419,16 @@ fn cmd_activate(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize)
                     append(o, 0, b"error: capability unsupported\n")
                 }
                 ActivationError::MissingBinding => append(o, 0, b"error: missing binding\n"),
-                ActivationError::Malformed => append(o, 0, b"error: not a well-formed Module\n"),
+                ActivationError::Malformed => append(o, 0, b"error: not a well-formed Plan\n"),
             };
             (p, 1)
         }
     }
 }
 
-/// `verify <module_hex> <trusted_pubkey_hex>...`: verify a sealed Module.
+/// `verify <plan_hex> <trusted_pubkey_hex>...`: verify a sealed Plan.
 ///
-/// Recomputes the module's digest from its own bytes, checks it against the one
+/// Recomputes the plan's digest from its own bytes, checks it against the one
 /// carried, then requires an ed25519 signature over it by one of the trusted
 /// keys. Prints which key accepted, or why it was refused.
 fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -> (usize, i32) {
@@ -1445,17 +1437,14 @@ fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -
             append(
                 &mut s.out,
                 0,
-                b"error: verify needs <module_hex> <trusted_pubkey_hex>...\n",
+                b"error: verify needs <plan_hex> <trusted_pubkey_hex>...\n",
             ),
             1,
         );
     }
     let (a, b) = argv[1];
     let Some(mlen) = hex_decode(&arec[a..b], &mut s.ir) else {
-        return (
-            append(&mut s.out, 0, b"error: module is not valid hex\n"),
-            1,
-        );
+        return (append(&mut s.out, 0, b"error: plan is not valid hex\n"), 1);
     };
     // Trusted keys, decoded into a bounded table.
     const MAX_TRUSTED: usize = 8;
@@ -1475,7 +1464,7 @@ fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -
         }
         trusted[k] = kb;
     }
-    match module_verify(&s.ir[..mlen], &trusted[..n], &mut s.scratch) {
+    match plan_verify(&s.ir[..mlen], &trusted[..n], &mut s.scratch) {
         Ok(k) => {
             let mut p = append(&mut s.out, 0, b"ok: signed by trusted key ");
             p = append_u32(&mut s.out, p, k as u32);
@@ -1486,8 +1475,8 @@ fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -
         Err(e) => {
             let o = &mut s.out;
             let p = match e {
-                VerifyError::Malformed => append(o, 0, b"error: not a well-formed Module\n"),
-                VerifyError::NoDigest => append(o, 0, b"error: module carries no content digest\n"),
+                VerifyError::Malformed => append(o, 0, b"error: not a well-formed Plan\n"),
+                VerifyError::NoDigest => append(o, 0, b"error: plan carries no content digest\n"),
                 VerifyError::DigestMismatch => append(
                     o,
                     0,
@@ -1496,7 +1485,7 @@ fn cmd_verify(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize) -
                 VerifyError::SignatureInvalid => {
                     append(o, 0, b"error: no valid signature by a trusted signer\n")
                 }
-                VerifyError::TooLarge => append(o, 0, b"error: module too large for the buffers\n"),
+                VerifyError::TooLarge => append(o, 0, b"error: plan too large for the buffers\n"),
             };
             (p, 1)
         }
@@ -1516,7 +1505,7 @@ fn cmd_oci_init(s: &mut Work) -> (usize, i32) {
     }
 }
 
-/// `oci-push <hex> <tag>`: publish `hex` as a single module layer under `tag`,
+/// `oci-push <hex> <tag>`: publish `hex` as a single plan layer under `tag`,
 /// printing the bundle reference (the OCI manifest digest).
 fn cmd_oci_push(s: &mut Work, hex: &[u8], tag: &[u8]) -> (usize, i32) {
     let Some(blen) = hex_decode(hex, &mut s.ir) else {
@@ -1525,7 +1514,7 @@ fn cmd_oci_push(s: &mut Work, hex: &[u8], tag: &[u8]) -> (usize, i32) {
     // Disjoint field borrows: the body is read out of `ir` while the manifest,
     // index and read buffers are written — none of them alias.
     let layers = [Layer {
-        media_type: MEDIA_TYPE_MODULE,
+        media_type: MEDIA_TYPE_PLAN,
         bytes: &s.ir[..blen],
         name: b"",
     }];
@@ -2256,8 +2245,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         1,
                     )
                         }
-                    } else if sub == b"seal-module" {
-                        cmd_seal_module(s, arec, &argv, argc)
+                    } else if sub == b"seal-plan" {
+                        cmd_seal_plan(s, arec, &argv, argc)
                     } else if sub == b"decision" {
                         cmd_decision(s, arec, &argv, argc)
                     } else if sub == b"agg" {
@@ -2308,7 +2297,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             cmd_author(s, &arec[a..b])
                         } else {
                             (
-                                append(&mut s.out, 0, b"error: author needs <uproc_hex>\n"),
+                                append(&mut s.out, 0, b"error: author needs <plan_hex>\n"),
                                 1,
                             )
                         }
@@ -2387,7 +2376,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 append(
                                     &mut s.out,
                                     0,
-                                    b"error: graph needs <uproc_hex> <pipeline> [target]\n",
+                                    b"error: graph needs <plan_hex> <pipeline> [target]\n",
                                 ),
                                 1,
                             )
@@ -2397,10 +2386,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let (a, b) = argv[1];
                             cmd_parse(s, &arec[a..b])
                         } else {
-                            (
-                                append(&mut s.out, 0, b"error: parse needs <uproc_hex>\n"),
-                                1,
-                            )
+                            (append(&mut s.out, 0, b"error: parse needs <plan_hex>\n"), 1)
                         }
                     } else if sub == b"ckpt-save" {
                         if argc >= 2 {

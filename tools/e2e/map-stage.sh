@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # MAP STAGE, live: a label selector's requirements against a pod's labels.
 #
-# `examples/map_stage/selector.uproc` declares a `map` (a predicate applied to
+# `examples/map_stage/selector.plan` declares a `map` (a predicate applied to
 # every element of a repeated field, bounded by a declared max, its verdicts
 # counted) and a transformation reading the counts. The device lowers it with
 # `chronicle graph` to ONE pipeline node — the map is a stage of the compute run
@@ -17,7 +17,7 @@
 modules_ready || { no map "fluxor modules build failed"; finish; exit; }
 build_graph packaging/applet/chronicle/linux.yaml >/dev/null || { no map "cli graph build"; finish; exit; }
 
-SRC=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' examples/map_stage/selector.uproc)
+SRC=$(python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' examples/map_stage/selector.plan)
 yaml="$E2E_GEN/map-stage-$E2E_RUN.yaml"
 cli graph "$SRC" select linux >"$yaml" 2>/dev/null
 grep -q 'stage_kinds: {hex: "0200"}' "$yaml" \

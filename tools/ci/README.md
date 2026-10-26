@@ -49,7 +49,7 @@ express "these two must agree", and that is precisely what a retune breaks.
 The gate extracts the block, and for each row finds `const NAME ... = <rhs>;` at
 the recorded path and compares the right-hand side textually after collapsing
 whitespace. Textual comparison is deliberate: it accepts derived values
-(`2 * UPROC_BUF`) without evaluating anything, so the register records what the
+(`2 * PLAN_BUF`) without evaluating anything, so the register records what the
 source says rather than a number that has to be recomputed by hand.
 
 Design rules that make this work:

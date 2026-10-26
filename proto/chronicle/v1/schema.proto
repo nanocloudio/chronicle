@@ -4,10 +4,10 @@
 // resolution is hermetic and the canonical descriptor digest is stable.
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
 import "google/protobuf/descriptor.proto";
-import "unified/v1/common.proto";
+import "chronicle/v1/common.proto";
 
 message Schema {
   ArtefactHeader header = 1;

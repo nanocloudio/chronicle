@@ -3,12 +3,12 @@
 // CONTRACT describes portable identity (name/kind/typed operations/protocol +
 // security requirements/delivery guarantees/capability requirements). A Resource
 // BINDING maps the contract to an implementation and normally lives OUTSIDE
-// semantic module identity (addresses, ports, DNS, credentials, endpoints).
+// semantic plan identity (addresses, ports, DNS, credentials, endpoints).
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
-import "unified/v1/common.proto";
+import "chronicle/v1/common.proto";
 
 message ResourceContract {
   ArtefactHeader header = 1;  // kind = ARTEFACT_KIND_RESOURCE
@@ -74,12 +74,12 @@ enum DeliveryGuarantee {
 
 // A binding maps a contract to a concrete implementation. Deployment overlays
 // (addresses, credentials, discovered endpoints, health) are NOT part of
-// semantic module identity — they are supplied at bind time.
+// semantic plan identity — they are supplied at bind time.
 message ResourceBinding {
   QualifiedName contract = 1;     // which ResourceContract this satisfies
   BindingKind kind = 2;
   // Opaque, deployment-specific configuration (addresses, ports, DNS,
-  // namespaces, credential refs). Never digested into module identity.
+  // namespaces, credential refs). Never digested into plan identity.
   map<string, string> deployment = 3;
 }
 

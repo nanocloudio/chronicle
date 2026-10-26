@@ -1,16 +1,17 @@
 # Chronicle
 
-> Deterministic processing as content-addressed artefacts: Schema, Expression,
-> Transformation, Decision, Aggregation, Pipeline, Module — compiled ahead of
-> time, executed on Fluxor as `.fmod` modules.
+> A deterministic declarative process engine. You write a **plan**; Chronicle
+> compiles it ahead of time into content-addressed artefacts — Schema,
+> Expression, Transformation, Decision, Aggregation, Pipeline, and the Plan that
+> bundles them — and runs them on Fluxor as `.fmod` modules.
 
-Chronicle is a **fluxor-native** deterministic dataplane engine, structured like
+Chronicle is a **fluxor-native** deterministic declarative process engine, structured like
 its sibling nanocloud projects (`../quantum`, `../lattice`, `../clustor`): a
 fluxor project of on-device `.fmod` modules, with a host harness that tests the
 cores they share.
 
-It implements the **Unified Deterministic Processing** model, which unifies
-three concerns in one engine:
+It implements the **Deterministic Processing Model**, which brings three
+concerns together in one engine:
 
 - **Orchestration & effects** — connectors, pipelines, retries, compensation,
   telemetry (the **Pipeline** and **Resource** surfaces).
@@ -18,7 +19,7 @@ three concerns in one engine:
   keyed lanes, corrections, checkpoints (the **Aggregation** surface).
 - **Runtime & distribution** (Fluxor) — position-independent `.fmod` modules,
   typed-channel graphs, OCI packaging, capability negotiation, atomic activation
-  (the **Module** anchor).
+  (the **Plan** anchor).
 
 Envoy's service mesh maps onto the same model: Listener → Resource, filter chain
 → Pipeline, route → Decision, Cluster → upstream Resource (see
@@ -37,13 +38,13 @@ clocks, randomness, environment, filesystem, network, or locale — external
 actions are explicit Pipeline effects on Resources.
 
 ```
-authoring (.uproc / CEL) ─▶ canonical Protobuf artefacts ─▶ content digest (identity)
+authoring (.plan / CEL) ─▶ canonical Protobuf artefacts ─▶ content digest (identity)
                                     │
         build time  ────────────────┤  descriptor closures + checked CEL, lowered
                                     │  to bounded no_std bytecode + packed into a param
                                     ▼
         runtime     ─▶ generic Fluxor .fmod modules (bounded, no-alloc, deterministic),
-                        param-driven, distributed as OCI Module artefacts
+                        param-driven, distributed as OCI Plan artefacts
 ```
 
 The build-time / runtime split is the load-bearing choice: type- and CEL-checking
@@ -56,7 +57,7 @@ serializes it into a module param, and the module runs it — no rebuild.
 
 The last hop is real too: [`graph_core`](modules/common/graph_core.rs)
 renders a runnable Fluxor graph whose module params **are** the compiled programs,
-so one `.uproc` goes **authored → compiled → param → running on device**. Every
+so one `.plan` goes **authored → compiled → param → running on device**. Every
 bounded VM — the evaluator, the byte-serializer, the byte-deserializer, the staged
 pipeline, and the aggregation engine — is fuzz-tested to **never panic** on
 malformed input (a hard requirement for freestanding `.fmod` code); see
@@ -66,13 +67,13 @@ malformed input (a hard requirement for freestanding `.fmod` code); see
 
 | # | Artefact | Purpose | Canonical proto |
 |---|----------|---------|-----------------|
-| 1 | Schema | portable types + structural compatibility | `proto/unified/v1/schema.proto` |
+| 1 | Schema | portable types + structural compatibility | `proto/chronicle/v1/schema.proto` |
 | 2 | Expression | pure deterministic scalar computation (checked CEL) | `expression.proto` |
 | 3 | Transformation | typed input → typed output | `transformation.proto` |
 | 4 | Decision | ordered rules → deterministic outcome | `decision.proto` |
 | 5 | Aggregation | stateful temporal computation (windows / watermarks / lanes) | `aggregation.proto` |
 | 6 | Pipeline | compose artefacts + effects into typed workflows | `pipeline.proto` |
-| 7 | Module | immutable OCI deployment / compatibility unit | `module.proto` |
+| 7 | Plan | immutable OCI deployment / compatibility unit | `plan.proto` |
 
 ## Layout
 
@@ -87,12 +88,10 @@ malformed input (a hard requirement for freestanding `.fmod` code); see
 - `tools/lib.sh`, `tools/support/` — the shared E2E harness the gates and
   drivers both source. It resolves the nearest `fluxor.toml` as the project,
   so an application project's drivers source it and run against their own pins.
-- `proto/unified/v1/` — the artefact schemas: the **7** canonical artefacts plus
+- `proto/chronicle/v1/` — the artefact schemas: the **7** canonical artefacts plus
   two support protos (`common`, `resource`) that are explicitly *not* artefacts.
-  Package `unified.v1` is the **spec** type-namespace (the Unified Deterministic
-  Processing model that unifies orchestration, deterministic state, and runtime
-  distribution); the chronicle modules are the implementation. The two names are deliberate: `chronicle` = engine,
-  `unified.v1` = spec types.
+  Package `chronicle.v1` is the type namespace of the Deterministic Processing
+  Model; the chronicle modules are its implementation.
 - `examples/` — runnable graphs.
 - `tools/ci/` — structural gates (what the tree must BE).
 - `tools/e2e/` — behavioural drivers (each boots a real graph and asserts real output).
@@ -129,7 +128,7 @@ place, so there is nothing to reinstall.
 
 ```bash
 make ci          # fluxor ci — the full gate (lints, tests, strict module build)
-protoc -I proto --include_imports -o /dev/null proto/unified/v1/*.proto   # schemas compile
+protoc -I proto --include_imports -o /dev/null proto/chronicle/v1/*.proto   # schemas compile
 make test        # the host harness + the graph E2Es (what CI runs)
 make build       # the .fmod modules — this project has no cargo crate
 tools/e2e/expression.sh   # one graph E2E on its own → cust-42
@@ -139,7 +138,7 @@ printf '\x03\x01\x00\x05\x00ord-1\x02\x00\x06\x00cust-9\x03\x01\x08\x00\xfa\x00\
   | fluxor run examples/pipeline/linux.yaml | xxd   # -> {ord-1, 250, 500}
 ```
 
-The whole dataplane arc — authored `.uproc`/CEL → compiled → packed → module
+The whole dataplane arc — authored `.plan`/CEL → compiled → packed → module
 param → composed on-device fluxor graph → live external write, with fan-out —
 runs on real Fluxor hardware. `docs/conformance.md` maps every spec dimension
 to its test / on-device proof.

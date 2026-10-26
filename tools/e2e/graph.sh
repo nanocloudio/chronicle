@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# AUTHORING TO RUNNABLE GRAPH, ENTIRELY ON DEVICE — a `.uproc` document in, the
+# AUTHORING TO RUNNABLE GRAPH, ENTIRELY ON DEVICE — a `.plan` document in, the
 # graph YAML a fluxor runtime boots out:
 #
-#   chronicle graph <uproc_hex> <pipeline> [target] [bindings]
+#   chronicle graph <plan_hex> <pipeline> [target] [bindings]
 #
 # `tools/e2e/author.sh` proves a device can SEAL a document's artefacts; this
 # proves it can DEPLOY one — resolve the named pipeline, compile each stage
 # against the document's own schema (`registry_core`), pack the results into the
 # params a module loads (`pack_core`), and lower the whole thing to graph YAML
-# (`plan_core`), each effect bound to the provider its binding names.
+# (`graph_lower_core`), each effect bound to the provider its binding names.
 #
 # Nothing here shells out to cargo. The entire chain runs inside a `.fmod`.
 . "$(dirname "$0")/../lib.sh"
@@ -18,7 +18,7 @@ build_graph packaging/applet/chronicle/linux.yaml || { no graph "cli build"; fin
 cli() { run_text "" 10 -- "$@"; }
 hex_of() { python3 -c 'import sys;print(open(sys.argv[1],"rb").read().hex())' "$1"; }
 
-DOC=$(hex_of examples/authoring/compute_only.uproc)
+DOC=$(hex_of examples/authoring/compute_only.plan)
 
 # The whole point: source to a bootable graph, no host in the loop.
 got=$(cli graph "$DOC" process 2>/dev/null)
@@ -61,7 +61,7 @@ printf '%s\n' "$host" | grep -q 'cli_in.stdin_out' \
 # (`resource orders_store required`) and never what serves it, so a binding
 # cannot be invented. Emitting a graph that points at nothing would be worse
 # than refusing.
-eff=$(hex_of examples/authoring/process_order.uproc)
+eff=$(hex_of examples/authoring/process_order.plan)
 out=$(cli graph "$eff" process 2>/dev/null)
 case "$out" in
   *"has no binding"*)
@@ -101,7 +101,7 @@ esac
 # A decision splits the compute run, so the graph gets a SECOND pipeline node
 # whose name does not imply its module type: without `type: pipeline` fluxor
 # would look for a module named `pipeline2` and refuse the graph.
-SPLIT=$(hex_of examples/authoring/split_pipeline.uproc)
+SPLIT=$(hex_of examples/authoring/split_pipeline.plan)
 split_yaml=$E2E_GEN/split-$E2E_RUN.yaml
 cli graph "$SPLIT" process linux > "$split_yaml" 2>/dev/null
 

@@ -103,4 +103,4 @@ proven by the deterministic fuzzing in
 
 - [`../bytecode_policy.md`](../bytecode_policy.md) — what the VM may and may not become
 - [`../architecture/connectors.md`](../architecture/connectors.md) — how effects bind to sibling-owned provider modules
-- [`authoring.md`](authoring.md) — the `.uproc` document and the compute artefacts
+- [`authoring.md`](authoring.md) — the `.plan` document and the compute artefacts

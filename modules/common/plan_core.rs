@@ -1,736 +1,1258 @@
-// Pipeline -> module graph lowering, on device.
+// The `.plan` authoring DSL document parser, on device: a `.plan` file goes
+// in, a structured document of declaration spans comes out.
 //
-// This is the layer that removes judgment from graph construction. Given an
-// ordered plan — each stage pure COMPUTE, a MAP, a DECISION, or a connector
-// EFFECT — the graph is a PURE FUNCTION of the stage kinds. No human decides
-// what becomes a node; the policy is fixed:
+// This is deliberately THIN. It recognizes document
+// structure and captures every expression body as a verbatim span; the spans go
+// to `celc_core` unchanged, so the DSL reuses the proven CEL grammar,
+// type-checker and lowerer rather than growing a second one.
 //
-//   * a maximal run of consecutive COMPUTE and MAP stages collapses into ONE
-//     `pipeline` node whose `ir_stages` param runs them as a bytecode chain
-//     (a `stage_kinds` param names the maps), so pure compute never touches a
-//     channel;
-//   * a DECISION becomes its own node (the VM cannot branch), which also breaks
-//     the surrounding compute run;
-//   * each EFFECT becomes a genuine connector node — the provider module its
-//     binding names — wired into the transport;
-//   * dataflow is threaded in stage order, `cli_in -> ... -> cli_out` on a host
-//     profile, ends left open on an embedded one.
+// SPANS, NOT STRINGS. With no allocator there is nothing to own a `String`, and
+// nothing needs one: every name, type and body is a byte range in the caller's
+// source buffer. That is not a compromise — it is strictly better, because a
+// span also carries the position an error should point at.
 //
-// The same plan always yields byte-identical YAML, so a graph is
-// content-addressable exactly like the bytecode it carries.
+// The caller supplies the declaration arrays (`PlanArena`), so this core has no
+// ceiling of its own and a node parses whatever its memory allows. Overflowing
+// an array is reported as `TooMany` rather than truncated: a document parsed in
+// part is a document silently missing artefacts. For the same reason a clause
+// given twice is `DuplicateClause`, two artefacts sharing a name are
+// `DuplicateName`, and an integer outside the range its field can hold is
+// `OutOfRange` — none is resolved by silently keeping one reading.
 //
-// WHY THIS EMITS YAML DIRECTLY rather than building a `graph_core::GraphSpec`:
-// a GraphSpec borrows its names, params and wires, and every one of those
-// strings has to be BUILT here (node suffixes, hex params, `node.port` wire
-// endpoints). Handing back a GraphSpec would mean a struct holding both an arena
-// and slices into that same arena — self-referential, and not expressible safely.
-// The cost is that the YAML layout has two writers, so
-// `plan_matches_graph_core_emission` pins them together: it lowers a plan and
-// asserts the result equals what `graph_to_yaml` produces for the equivalent
-// hand-built spec. If the two ever drift, that test fails.
+// Grammar:
+//   document      := 'plan' QNAME '{' decl* '}'
+//   message       := 'message' QNAME '{' field* '}'
+//   field         := IDENT ':' type '=' INT ';'
+//   enumconst     := 'enum' IDENT '=' INT ';'
+//   expression    := 'expression' IDENT '(' IDENT ':' type ')' '->' type BODY
+//   transformation:= 'transformation' IDENT '(' IDENT ':' type ')' '->' type BODY
+//   decision      := 'decision' IDENT '(' IDENT ':' type ')' '->' type '{' rule* '}'
+//   rule          := 'when' EXPR '->' EXPR ';' | 'default' '->' EXPR ';'
+//   resource      := 'resource' QNAME ['required'] ';'
+//   pipeline      := 'pipeline' IDENT '(' IDENT ':' type ')' '->' type '{' stage* '}'
+//   stage         := 'call' IDENT '=' QNAME '(' args ')' ';'
+//                  | 'effect' IDENT '=' '@' IDENT ['.' IDENT] '(' IDENT ')' ';'
+//                  | 'commit' 'after' IDENT ';' | 'return' IDENT ';'
+//   aggregation   := 'aggregation' IDENT '(' IDENT ':' type ')' '->' type '{' aclause* '}'
+//   aclause       := 'key' EXPR ';' | 'event_time' EXPR ';'
+//                  | 'window' ('tumbling' INT | 'sliding' INT INT) ';'
+//                  | 'lateness' INT ';' | 'guard' INT ';' | 'lanes' INT ';'
+//                  | 'operator' IDENT '=' opkind ';' | 'emit' EXPR ';'
+//   opkind        := 'count' | ('sum'|'avg'|'min'|'max'|'distinct') '(' EXPR ')'
+//                  | ('topk'|'quantile') '(' INT ',' EXPR ')'
+//   map           := 'map' IDENT '(' IDENT ':' type ')' '->' type '{' mclause* '}'
+//   mclause       := 'over' IDENT '.' IDENT 'as' IDENT ':' type 'max' INT ';'
+//                  | 'count' IDENT '.' IDENT ',' IDENT '.' IDENT ',' IDENT '.' IDENT ';'
+//                  | 'when' EXPR ';'
+//   entry         := 'entry' IDENT '=' IDENT ';'
+//   provenance    := 'provenance' 'revision' STRING 'toolchain' STRING ';'
 //
-// Requires `pack_core` (the `ir_stages` container), `hex_core` (param encoding)
-// and `graph_core` (the `GraphError` vocabulary and the layout it defines).
+// Scanning is byte-level, which is safe for UTF-8: braces, quotes, backslash and
+// `->` are all ASCII, and continuation bytes (>= 0x80) never collide with them,
+// so a string body containing `{` or `}` is skipped correctly.
 
-/// Default version tag for a sibling-owned provider. Providers publish under
-/// `<abi>/<module>:<version>` in the fluxor OCI store; the composing project
-/// pins that reference, so the build resolves the module from the store —
-/// Chronicle owns no provider `.fmod`.
-///
-/// This is only the FALLBACK. Siblings release independently, so one constant
-/// for every provider is wrong as soon as any of them cuts a version — the pin
-/// would resolve to an artifact that exists under a different tag, or to
-/// nothing. A binding's `version` field gives each provider its own.
-pub const PROVIDER_VERSION: &[u8] = b"0.1.0";
-
-/// A connector effect binding: which capability a Resource effect realizes, plus
-/// its endpoint and params.
-///
-/// Every field arrives from the deployment's binding — the effect -> capability
-/// -> provider choice is DATA, not judgment.
-#[derive(Clone, Copy)]
-pub struct Connector<'a> {
-    /// The DOCUMENT's word for this effect (`b"kafka"`), used as the base node
-    /// instance name and its `<kind>N` suffix. Not the provider's name.
-    pub kind: &'a [u8],
-    /// The provider module that realizes the capability — the node's `type:`.
-    /// A deployment's pin, not a choice made here.
-    pub provider: &'a [u8],
-    /// The version tag that provider publishes under. Per provider, because
-    /// siblings release independently and one shared constant mispins the
-    /// moment two of them diverge.
-    pub version: &'a [u8],
-    /// The exchange method each request asks the provider: the exchange
-    /// contract's code (`METHOD_PUBLISH` for a durable destination). Every
-    /// provider takes requests on `request_in` and answers on `response_out`,
-    /// so the method is the one thing about the call a binding chooses.
-    pub method: u8,
-    /// The node's params, in the provider manifest's order: `(name, value,
-    /// quoted)`. `quoted = false` emits the value bare, which a numeric param
-    /// requires — a provider's `u32` decoder rejects `"167772161"`.
-    ///
-    /// The NAMES ARE THE PROVIDER'S and they arrive from the caller. That is
-    /// the point of this shape: nothing here knows what any provider calls
-    /// its params, so binding a new destination is a deployment change, not a
-    /// code change in this file.
-    pub params: &'a [(&'a [u8], &'a [u8], bool)],
+/// A byte range in the source document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub start: u32,
+    pub len: u32,
 }
 
-impl Connector<'_> {
-    /// The connector's kind tag — the base node INSTANCE name.
-    ///
-    /// Appends into a caller buffer rather than returning a `&'static [u8]`:
-    /// a match returning static references compiles to a table of
-    /// (pointer, len) pairs, and static pointer tables do not relocate in a
-    /// PIC module. Every field here is caller-supplied for the same reason —
-    /// a descriptor TABLE would not survive loading, but a slice the caller
-    /// owns does.
-    pub fn kind(&self, out: &mut [u8]) -> Result<usize, GraphError> {
-        gput(out, 0, self.kind)
+impl Span {
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
-
-    /// The sibling-owned provider module that realizes this capability.
-    pub fn provider_module(&self, out: &mut [u8]) -> Result<usize, GraphError> {
-        gput(out, 0, self.provider)
-    }
-
-    /// The store pin the build needs to compose this capability's provider
-    /// from the OCI store, scoped to the module ABI `abi`:
-    /// `<abi>/<module>:<version>`.
-    pub fn provider_pin(&self, abi: &[u8], out: &mut [u8]) -> Result<usize, GraphError> {
-        let mut p = gput(out, 0, abi)?;
-        p = gput(out, p, b"/")?;
-        p = gput(out, p, self.provider)?;
-        p = gput(out, p, b":")?;
-        gput(out, p, self.version)
-    }
-}
-
-/// One deployment-supplied binding: which provider realizes a document's
-/// named `resource`.
-///
-/// A `.uproc` declares `resource orders_store required;` and never says what
-/// serves it — "binding supplied at deploy time", which is the whole point of
-/// the declaration. This is that supply. The document names WHAT it needs; a
-/// deployment names WHICH provider, and the two meet here.
-#[derive(Clone, Copy)]
-pub struct ResourceBinding<'a> {
-    /// The `resource` name as the document spells it.
-    pub resource: &'a [u8],
-    /// The provider bound to it.
-    pub connector: Connector<'a>,
-}
-
-/// Find the binding for a named resource, or `None` when the deployment
-/// supplied none — which is a deployment error, not a document error.
-pub fn resolve_binding<'a>(
-    bindings: &'a [ResourceBinding<'a>],
-    resource: &[u8],
-) -> Option<&'a Connector<'a>> {
-    let mut i = 0;
-    while i < bindings.len() {
-        if bindings[i].resource == resource {
-            return Some(&bindings[i].connector);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// One resolved stage of a pipeline, ready to lower.
-#[derive(Clone, Copy)]
-pub enum PlanStage<'a> {
-    /// Pure compute: one stage's flat checked IR.
-    Compute { stage_ir: &'a [u8] },
-    /// A decision's pre-packed container.
-    Decision { container: &'a [u8] },
-    /// A map stage's container (`pipeline_core::MAP_HEADER` + its lowered
-    /// predicate). It does not branch, so it joins the surrounding compute
-    /// run in one pipeline node, named by that node's `stage_kinds`.
-    Map { container: &'a [u8] },
-    /// A connector effect.
-    Effect(Connector<'a>),
-}
-
-/// What the graph is being lowered FOR: the fluxor target, the connector
-/// transport, and whether the chain is `cli`-bracketed.
-///
-/// The node policy is profile-independent — the profile only decides the target,
-/// the transport node the connectors reach the network through, and whether the
-/// chain's ends are wired to a CLI or left open for a surrounding graph.
-#[derive(Clone, Copy)]
-pub struct TargetProfile<'a> {
-    pub target: &'a [u8],
-    pub transport: &'a [u8],
-    pub host_cli: bool,
-}
-
-impl<'a> TargetProfile<'a> {
-    /// The host profile: `linux` target, `linux_net` transport, `cli`-bracketed.
-    pub fn host() -> TargetProfile<'a> {
-        TargetProfile {
-            target: b"linux",
-            transport: b"linux_net",
-            host_cli: true,
-        }
-    }
-
-    /// An embedded profile: the chain's ends are left open for the surrounding
-    /// graph to wire, so no `cli` edges and no `cli` platform capability.
-    pub fn embedded(target: &'a [u8]) -> TargetProfile<'a> {
-        TargetProfile {
-            target,
-            transport: b"ip",
-            host_cli: false,
-        }
-    }
-}
-
-/// The largest chain this can lower — nodes are named `<kind>N`, and the plan is
-/// walked twice (once for modules, once for wiring), so the chain is recorded
-/// rather than rebuilt.
-pub const MAX_CHAIN: usize = 32;
-
-/// Longest node name plus port, e.g. `pipeline12.result_out`.
-const NAME_CAP: usize = 48;
-
-/// One node in the dataflow chain: its instance name and the ports the previous
-/// and next stages connect to.
-#[derive(Clone, Copy)]
-struct ChainNode {
-    name: [u8; NAME_CAP],
-    name_len: u8,
-    in_port: [u8; NAME_CAP],
-    in_len: u8,
-    out_port: [u8; NAME_CAP],
-    out_len: u8,
-}
-
-impl ChainNode {
-    fn blank() -> Self {
-        ChainNode {
-            name: [0u8; NAME_CAP],
-            name_len: 0,
-            in_port: [0u8; NAME_CAP],
-            in_len: 0,
-            out_port: [0u8; NAME_CAP],
-            out_len: 0,
-        }
-    }
-    fn name(&self) -> &[u8] {
-        &self.name[..self.name_len as usize]
-    }
-    fn in_port(&self) -> &[u8] {
-        &self.in_port[..self.in_len as usize]
-    }
-    fn out_port(&self) -> &[u8] {
-        &self.out_port[..self.out_len as usize]
-    }
-}
-
-fn set(dst: &mut [u8; NAME_CAP], len: &mut u8, s: &[u8]) -> Result<(), GraphError> {
-    if s.len() > NAME_CAP {
-        return Err(GraphError::TooLarge);
-    }
-    dst[..s.len()].copy_from_slice(s);
-    *len = s.len() as u8;
-    Ok(())
-}
-
-/// `<base>` for the first instance of a kind, `<base><n+1>` after that — the
-/// stable-unique naming.
-fn instance_name(base: &[u8], n: usize, out: &mut [u8]) -> Result<usize, GraphError> {
-    let p = gput(out, 0, base)?;
-    if n == 0 {
-        return Ok(p);
-    }
-    gput_u32(out, p, (n + 1) as u32)
-}
-
-/// Emit `  <key>: "<value>"\n` — a quoted scalar param, at the module indent.
-fn emit_param(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usize, GraphError> {
-    let mut p = gput(out, p, b"      ")?;
-    p = gput(out, p, key)?;
-    p = gput(out, p, b": \"")?;
-    p = gput(out, p, value)?;
-    gput(out, p, b"\"\n")
-}
-
-/// Emit a connector node's params, in the order the caller gave them.
-///
-/// One loop, no provider knowledge. Every param name, value and quoting
-/// decision arrives on the binding — which is what makes adding a
-/// destination a deployment change rather than an edit here, and what keeps
-/// a provider's param rename from silently breaking chronicle: a graph naming
-/// a param the provider does not accept builds fine and is refused at load,
-/// so the names must come from the deployment that knows the provider.
-fn emit_connector_params(out: &mut [u8], p: usize, c: &Connector) -> Result<usize, GraphError> {
-    let mut p = p;
-    for (key, value, quoted) in c.params {
-        // An empty value means "not set": omitted so the provider's own
-        // default applies, rather than emitting an empty string it would
-        // have to interpret.
-        if value.is_empty() {
-            continue;
-        }
-        p = if *quoted {
-            emit_param(out, p, key, value)?
+    /// The bytes this span names, given the document it came from.
+    pub fn of<'a>(&self, src: &'a [u8]) -> &'a [u8] {
+        let s = self.start as usize;
+        let e = s + self.len as usize;
+        if e <= src.len() {
+            &src[s..e]
         } else {
-            emit_param_raw(out, p, key, value)?
-        };
+            &[]
+        }
     }
-    Ok(p)
 }
 
-/// Emit one param with the value unquoted, `  key: 1234`.
-///
-/// A numeric param needs this: a provider's `u32` decoder rejects
-/// `"167772161"`, and whether a value is numeric is the provider's fact, so
-/// it rides on the binding rather than being inferred from the bytes.
-fn emit_param_raw(out: &mut [u8], p: usize, key: &[u8], value: &[u8]) -> Result<usize, GraphError> {
-    let mut p = gput(out, p, b"      ")?;
-    p = gput(out, p, key)?;
-    p = gput(out, p, b": ")?;
-    p = gput(out, p, value)?;
-    gput(out, p, b"\n")
+/// Why parsing failed, and where. The offset maps back to a line/column for
+/// display by whatever has the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanError {
+    pub kind: PlanErrorKind,
+    pub offset: usize,
 }
 
-/// Emit one `wiring:` edge, `  - from: <a>\n    to: <b>\n`.
-fn emit_wire(
-    out: &mut [u8],
-    p: usize,
-    from_node: &[u8],
-    from_port: &[u8],
-    to_node: &[u8],
-    to_port: &[u8],
-) -> Result<usize, GraphError> {
-    let mut p = gput(out, p, b"  - from: ")?;
-    p = gput(out, p, from_node)?;
-    p = gput(out, p, b".")?;
-    p = gput(out, p, from_port)?;
-    p = gput(out, p, b"\n    to: ")?;
-    p = gput(out, p, to_node)?;
-    p = gput(out, p, b".")?;
-    p = gput(out, p, to_port)?;
-    gput(out, p, b"\n")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanErrorKind {
+    ExpectedPlan,
+    ExpectedIdent,
+    ExpectedByte(u8),
+    ExpectedType,
+    ExpectedInt,
+    ExpectedString,
+    ExpectedArrow,
+    UnknownDeclaration,
+    UnknownOperator,
+    UnterminatedBody,
+    /// Content after the plan's closing brace.
+    TrailingInput,
+    MissingClause,
+    /// A declaration array in the arena is full.
+    TooMany,
+    /// A clause that may appear once in its declaration appeared again.
+    DuplicateClause,
+    /// Two artefact declarations (expression, transformation, decision, map,
+    /// aggregation, pipeline) share a name, or two entries do.
+    DuplicateName,
+    /// An integer outside the range the field it sets can hold.
+    OutOfRange,
+    /// A type this toolchain has no scalar for (`double`, `float`) — refused
+    /// rather than read as a message of that name.
+    UnsupportedType,
+    /// A second collection operator (`distinct`, `topk`, `quantile`) in one
+    /// aggregation. A pane holds one collection cell, so the engine would
+    /// refuse the definition at load; it is refused here instead.
+    TooManyCollections,
 }
 
-/// Lower `stages` into fluxor graph YAML for the host profile.
-pub fn lower_pipeline(
-    stages: &[PlanStage],
-    target: &[u8],
-    tick_us: u32,
-    out: &mut [u8],
-    scratch: &mut [u8],
-) -> Result<usize, GraphError> {
-    let mut profile = TargetProfile::host();
-    profile.target = target;
-    lower_pipeline_with(stages, &profile, tick_us, out, scratch)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FieldDecl {
+    pub name: Span,
+    pub ty: Span,
+    pub number: u32,
 }
 
-/// Lower `stages` into fluxor graph YAML for `profile`.
-///
-/// `scratch` holds the packed `ir_stages` container for the largest compute run
-/// before it is hex-encoded; it must be at least as large as that container.
-/// Pure and deterministic: identical inputs render identical bytes.
-pub fn lower_pipeline_with(
-    stages: &[PlanStage],
-    profile: &TargetProfile,
-    tick_us: u32,
-    out: &mut [u8],
-    scratch: &mut [u8],
-) -> Result<usize, GraphError> {
-    let mut chain = [ChainNode::blank(); MAX_CHAIN];
-    let mut n_chain = 0usize;
-    let mut needs_net = false;
-
-    // Per-kind instance counts, so repeated nodes get stable unique names.
-    let (mut pipe_n, mut decision_n) = (0usize, 0usize);
-    // Per-KIND instance counters, keyed by the document's own word for the
-    // effect: a second `redis` is `redis2`, while the first `kafka` starts
-    // fresh. The kinds are whatever the bindings name, so the table is
-    // discovered as the plan is walked.
-    let mut kind_names = [[0u8; NAME_CAP]; MAX_CHAIN];
-    let mut kind_lens = [0usize; MAX_CHAIN];
-    let mut kind_counts = [0usize; MAX_CHAIN];
-    let mut kinds_seen = 0usize;
-
-    // Modules are emitted as the plan is walked; wiring needs the whole chain, so
-    // it is emitted afterwards from `chain`.
-    let mut p = gput(out, 0, b"target: ")?;
-    p = gput(out, p, profile.target)?;
-    p = gput(out, p, b"\ntick_us: ")?;
-    p = gput_u32(out, p, tick_us)?;
-    p = gput(out, p, b"\n")?;
-    // `accept_cycles` depends on whether any effect appears, which is not known
-    // until the walk finishes — so the walk runs first and the rest of the
-    // document is assembled after it, from here.
-    let header_end = p;
-
-    // ---- pass 1: walk the plan, recording the chain ----
-    //
-    // Two passes, because `scheduler.accept_cycles` and the `net` platform
-    // capability both depend on whether ANY effect appears, and both are emitted
-    // before the modules. Rather than buffer the module text somewhere and move
-    // it, the walk records what each node is and pass 2 renders it.
-    let mut effects = [None::<Connector>; MAX_CHAIN];
-    // Per pipeline node: the provider node it asks, when it carries an effect.
-    let mut requester_of = [None::<usize>; MAX_CHAIN];
-    let mut ir_spans = [(0usize, 0usize); MAX_CHAIN];
-    // Per chain NODE (not per stage): 0 pipeline, 1 decision, 2 effect.
-    let mut kinds = [0u8; MAX_CHAIN];
-    let mut decisions = [&[] as &[u8]; MAX_CHAIN];
-    // Per pipeline node: its stages' kinds (`STAGE_KIND_COMPUTE` or
-    // `STAGE_KIND_MAP`), and whether any is a map — only then does the node
-    // carry a `stage_kinds` param.
-    let mut run_kinds = [[0u8; MAX_NODE_STAGES]; MAX_CHAIN];
-    let mut run_lens = [0usize; MAX_CHAIN];
-    let mut run_maps = [false; MAX_CHAIN];
-
-    // The packed ir_stages containers for each compute run live end to end in
-    // `scratch`; `ir_spans` records where each one is.
-    let mut scratch_used = 0usize;
-
-    let mut i = 0usize;
-    while i < stages.len() {
-        if n_chain >= MAX_CHAIN {
-            return Err(GraphError::TooLarge);
-        }
-        match &stages[i] {
-            PlanStage::Compute { .. } | PlanStage::Map { .. } => {
-                // Collapse the maximal run of consecutive compute (and map)
-                // stages into one pipeline node — the policy that keeps pure
-                // compute off the wire. A map's container rides in its stage
-                // slot verbatim; `stage_kinds` tells the node which it is.
-                let mut run = [&[] as &[u8]; MAX_NODE_STAGES];
-                let mut n_run = 0usize;
-                loop {
-                    let (bytes, kind) = match stages.get(i) {
-                        Some(PlanStage::Compute { stage_ir }) => (*stage_ir, STAGE_KIND_COMPUTE),
-                        Some(PlanStage::Map { container }) => (*container, STAGE_KIND_MAP),
-                        _ => break,
-                    };
-                    if n_run >= MAX_NODE_STAGES {
-                        return Err(GraphError::RunTooLong);
-                    }
-                    run[n_run] = bytes;
-                    run_kinds[n_chain][n_run] = kind;
-                    run_maps[n_chain] |= kind == STAGE_KIND_MAP;
-                    n_run += 1;
-                    i += 1;
-                }
-                run_lens[n_chain] = n_run;
-                let packed = pack_ir_stages(&mut scratch[scratch_used..], &run[..n_run], &[])
-                    .map_err(|_| GraphError::TooLarge)?;
-                ir_spans[n_chain] = (scratch_used, packed);
-                scratch_used += packed;
-
-                let mut name = [0u8; NAME_CAP];
-                let nl = instance_name(b"pipeline", pipe_n, &mut name)?;
-                pipe_n += 1;
-                kinds[n_chain] = 0;
-                let c = &mut chain[n_chain];
-                set(&mut c.name, &mut c.name_len, &name[..nl])?;
-                set(&mut c.in_port, &mut c.in_len, b"record_in")?;
-                set(&mut c.out_port, &mut c.out_len, b"result_out")?;
-                n_chain += 1;
-            }
-            PlanStage::Decision { container } => {
-                let mut name = [0u8; NAME_CAP];
-                let nl = instance_name(b"decision", decision_n, &mut name)?;
-                decision_n += 1;
-                kinds[n_chain] = 1;
-                decisions[n_chain] = container;
-                let c = &mut chain[n_chain];
-                set(&mut c.name, &mut c.name_len, &name[..nl])?;
-                set(&mut c.in_port, &mut c.in_len, b"record_in")?;
-                set(&mut c.out_port, &mut c.out_len, b"result_out")?;
-                n_chain += 1;
-                i += 1;
-            }
-            PlanStage::Effect(binding) => {
-                needs_net = true;
-                // The effect is a request the pipeline node before it asks:
-                // that node becomes the requester, and the answer continues
-                // the chain from its `result_out`. With no pipeline node to
-                // carry it — the plan starts with the effect, follows a
-                // decision, or follows another effect — a node with no stages
-                // is placed to carry it.
-                let carrier_free =
-                    n_chain > 0 && kinds[n_chain - 1] == 0 && requester_of[n_chain - 1].is_none();
-                if !carrier_free {
-                    if n_chain >= MAX_CHAIN {
-                        return Err(GraphError::TooLarge);
-                    }
-                    let mut name = [0u8; NAME_CAP];
-                    let nl = instance_name(b"pipeline", pipe_n, &mut name)?;
-                    pipe_n += 1;
-                    kinds[n_chain] = 0;
-                    run_lens[n_chain] = 0;
-                    let c = &mut chain[n_chain];
-                    set(&mut c.name, &mut c.name_len, &name[..nl])?;
-                    set(&mut c.in_port, &mut c.in_len, b"record_in")?;
-                    set(&mut c.out_port, &mut c.out_len, b"result_out")?;
-                    n_chain += 1;
-                    if n_chain >= MAX_CHAIN {
-                        return Err(GraphError::TooLarge);
-                    }
-                }
-                let carrier = n_chain - 1;
-
-                let mut base = [0u8; NAME_CAP];
-                let bl = binding.kind(&mut base)?;
-
-                // Find this kind's counter, or start one.
-                let mut slot = kinds_seen;
-                let mut k = 0usize;
-                while k < kinds_seen {
-                    if kind_lens[k] == bl && kind_names[k][..bl] == base[..bl] {
-                        slot = k;
-                        break;
-                    }
-                    k += 1;
-                }
-                if slot == kinds_seen {
-                    if kinds_seen >= MAX_CHAIN {
-                        return Err(GraphError::TooLarge);
-                    }
-                    kind_names[slot][..bl].copy_from_slice(&base[..bl]);
-                    kind_lens[slot] = bl;
-                    kinds_seen += 1;
-                }
-
-                let mut name = [0u8; NAME_CAP];
-                let nl = instance_name(&base[..bl], kind_counts[slot], &mut name)?;
-                kind_counts[slot] += 1;
-
-                // The provider is a side node: it answers its requester and is
-                // not a link in the record chain.
-                kinds[n_chain] = 2;
-                effects[n_chain] = Some(*binding);
-                requester_of[carrier] = Some(n_chain);
-                let c = &mut chain[n_chain];
-                set(&mut c.name, &mut c.name_len, &name[..nl])?;
-                set(&mut c.in_port, &mut c.in_len, b"request_in")?;
-                set(&mut c.out_port, &mut c.out_len, b"response_out")?;
-                n_chain += 1;
-                i += 1;
-            }
-        }
-    }
-
-    // ---- pass 2: the document, now that `needs_net` is known ----
-    let mut p = header_end;
-    if needs_net {
-        p = gput(out, p, b"scheduler:\n  accept_cycles: true\n")?;
-    }
-
-    // An EMPTY section is an explicit empty collection, never a bare key. A bare
-    // `platform:` parses as null ("must be a mapping") and `wiring` is required
-    // outright — an embedded compute-only graph has both empty, and fluxor
-    // refuses either as a bare key.
-    if !profile.host_cli && !needs_net {
-        p = gput(out, p, b"\nplatform: {}\n")?;
-    } else {
-        p = gput(out, p, b"\nplatform:\n")?;
-        if profile.host_cli {
-            p = gput(out, p, b"  cli: {}\n")?;
-        }
-        if needs_net {
-            p = gput(out, p, b"  net: {}\n")?;
-        }
-    }
-
-    if n_chain == 0 {
-        p = gput(out, p, b"\nmodules: []\n")?;
-    } else {
-        p = gput(out, p, b"\nmodules:\n")?;
-    }
-    for k in 0..n_chain {
-        p = gput(out, p, b"  - name: ")?;
-        p = gput(out, p, chain[k].name())?;
-        p = gput(out, p, b"\n")?;
-        match kinds[k] {
-            0 => {
-                // `type:` only when the instance name is not the module name.
-                // The first compute node is `pipeline`, so the name implies the
-                // type; a second run is `pipeline2`, and without an explicit
-                // type fluxor looks for a module by that name and refuses the
-                // graph. Same rule as the decision arm below.
-                if chain[k].name() != b"pipeline" {
-                    p = gput(out, p, b"    type: pipeline\n")?;
-                }
-                p = gput(out, p, b"    params:\n")?;
-                if run_lens[k] > 0 {
-                    p = gput(out, p, b"      ir_stages: {hex: \"")?;
-                    let (off, len) = ir_spans[k];
-                    p = put_hex(out, p, &scratch[off..off + len])?;
-                    p = gput(out, p, b"\"}\n")?;
-                }
-                if let Some(e) = requester_of[k] {
-                    let c = effects[e].ok_or(GraphError::EffectUnbound)?;
-                    p = gput(out, p, b"      method: ")?;
-                    p = gput_u32(out, p, c.method as u32)?;
-                    p = gput(out, p, b"\n")?;
-                }
-                if run_maps[k] {
-                    p = gput(out, p, b"      stage_kinds: {hex: \"")?;
-                    p = put_hex(out, p, &run_kinds[k][..run_lens[k]])?;
-                    p = gput(out, p, b"\"}\n")?;
-                }
-            }
-            1 => {
-                // `type:` only when the instance name is NOT the module name —
-                // the first decision node is called `decision`, so the name
-                // implies the type and it is omitted.
-                if chain[k].name() != b"decision" {
-                    p = gput(out, p, b"    type: decision\n")?;
-                }
-                p = gput(out, p, b"    params:\n      decision: {hex: \"")?;
-                p = put_hex(out, p, decisions[k])?;
-                p = gput(out, p, b"\"}\n")?;
-            }
-            _ => {
-                let c = effects[k].ok_or(GraphError::EffectUnbound)?;
-                let mut m = [0u8; NAME_CAP];
-                let ml = c.provider_module(&mut m)?;
-                p = gput(out, p, b"    type: ")?;
-                p = gput(out, p, &m[..ml])?;
-                p = gput(out, p, b"\n    params:\n")?;
-                p = emit_connector_params(out, p, &c)?;
-            }
-        }
-    }
-    // ---- wiring: source edge, inter-stage edges, sink edge, exchange edges,
-    //      transport edges ----
-    //
-    // The record chain is every node but the providers, which hang off their
-    // requesters. A single node on an embedded profile has NO edges at all: the
-    // ends are left open for the surrounding graph. Emitting a bare `wiring:`
-    // key there would be refused ("wiring must be a list"), so the section is
-    // counted first and only opened if something goes in it.
-    let mut links = [0usize; MAX_CHAIN];
-    let mut n_links = 0usize;
-    for (k, kind) in kinds.iter().enumerate().take(n_chain) {
-        if *kind != 2 {
-            links[n_links] = k;
-            n_links += 1;
-        }
-    }
-    let n_effects = n_chain - n_links;
-    let mut n_wires = 4 * n_effects;
-    if n_links > 0 {
-        if profile.host_cli {
-            n_wires += 2;
-        }
-        n_wires += n_links - 1;
-    }
-    if n_wires == 0 {
-        p = gput(out, p, b"\nwiring: []\n")?;
-    } else {
-        p = gput(out, p, b"\nwiring:\n")?;
-    }
-    if n_links > 0 {
-        let first = chain[links[0]];
-        let last = chain[links[n_links - 1]];
-        if profile.host_cli {
-            p = emit_wire(
-                out,
-                p,
-                b"cli_in",
-                b"stdin_out",
-                first.name(),
-                first.in_port(),
-            )?;
-        }
-        for w in 0..n_links - 1 {
-            let (a, b) = (chain[links[w]], chain[links[w + 1]]);
-            p = emit_wire(out, p, a.name(), a.out_port(), b.name(), b.in_port())?;
-        }
-        if profile.host_cli {
-            p = emit_wire(
-                out,
-                p,
-                last.name(),
-                last.out_port(),
-                b"cli_out",
-                b"bytes_in",
-            )?;
-        }
-    }
-    // Each requester's exchange with its provider, in node order.
-    for k in 0..n_chain {
-        let Some(e) = requester_of[k] else {
-            continue;
-        };
-        let (r, v) = (chain[k].name(), chain[e].name());
-        p = emit_wire(out, p, r, b"request_out", v, b"request_in")?;
-        p = emit_wire(out, p, v, b"response_out", r, b"response_in")?;
-    }
-    // Transport edges last, in node order — the canonical order.
-    for k in 0..n_chain {
-        if kinds[k] != 2 {
-            continue;
-        }
-        let name = chain[k].name();
-        p = emit_wire(out, p, name, b"net_out", profile.transport, b"net_in")?;
-        p = emit_wire(out, p, profile.transport, b"net_out", name, b"net_in")?;
-    }
-    Ok(p)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageDecl {
+    pub name: Span,
+    pub first_field: u16,
+    pub n_fields: u16,
 }
 
-/// Append lowercase hex of `bytes` at `p`.
-fn put_hex(out: &mut [u8], p: usize, bytes: &[u8]) -> Result<usize, GraphError> {
-    if p + bytes.len() * 2 > out.len() {
-        return Err(GraphError::TooLarge);
-    }
-    let n = hex_encode(bytes, &mut out[p..]).ok_or(GraphError::TooLarge)?;
-    Ok(p + n)
+/// Shared by `expression` and `transformation` — identical shape, different
+/// keyword and different downstream artefact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FnDecl {
+    pub name: Span,
+    pub param_name: Span,
+    pub param_type: Span,
+    pub result_type: Span,
+    pub body: Span,
 }
 
-/// The provider store pins a plan needs, deduplicated and in stage order.
-///
-/// The composing project's `fluxor.lock` must hold these before building —
-/// each provider's project a declared dependency, whose modules `fluxor update`
-/// pins — so the graph-image build resolves each provider module from the OCI
-/// store.
-/// Pure: a function of the plan and the module ABI the pins are tagged with —
-/// the pin-side mirror of the graph itself.
-///
-/// Writes each pin into `out[i]`, returning how many were written.
-pub fn plan_provider_pins(
-    stages: &[PlanStage],
-    abi: &[u8],
-    out: &mut [&mut [u8]],
-    lens: &mut [usize],
-) -> Result<usize, GraphError> {
-    let mut n = 0usize;
-    for st in stages {
-        let PlanStage::Effect(binding) = st else {
-            continue;
-        };
-        let mut pin = [0u8; 96];
-        let pl = binding.provider_pin(abi, &mut pin)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuleDecl {
+    pub when: Span,
+    pub outcome: Span,
+}
 
-        let mut seen = false;
-        for k in 0..n {
-            if lens[k] == pl && out[k][..pl] == pin[..pl] {
-                seen = true;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecisionDecl {
+    pub name: Span,
+    pub param_name: Span,
+    pub input_type: Span,
+    pub output_type: Span,
+    pub first_rule: u16,
+    pub n_rules: u16,
+    pub default: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceDecl {
+    pub name: Span,
+    pub required: bool,
+}
+
+/// Stage kinds. `Call` uses `artefact` + the arg range; `Effect` uses
+/// `resource`, `operation` and `arg0`.
+pub const STAGE_CALL: u8 = 0;
+pub const STAGE_EFFECT: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StageDecl {
+    pub kind: u8,
+    pub name: Span,
+    /// Call: the artefact QNAME. Effect: the resource identifier.
+    pub target: Span,
+    /// Effect only: the operation after `.` (empty when absent).
+    pub operation: Span,
+    /// Effect only: the single argument.
+    pub arg0: Span,
+    /// Call only: range into the arena's `args`.
+    pub first_arg: u16,
+    pub n_args: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineDecl {
+    pub name: Span,
+    pub port_name: Span,
+    pub input_type: Span,
+    pub output_type: Span,
+    pub first_stage: u16,
+    pub n_stages: u16,
+    /// Empty when there is no `commit after`.
+    pub commit_after: Span,
+    pub return_stage: Span,
+}
+
+/// Operator kinds, in the DSL's declaration order (`agg_kind_to_op` maps
+/// them to the proto's `OperatorKind`).
+pub const AGG_SUM: u8 = 0;
+pub const AGG_COUNT: u8 = 1;
+pub const AGG_AVG: u8 = 2;
+pub const AGG_MIN: u8 = 3;
+pub const AGG_MAX: u8 = 4;
+pub const AGG_DISTINCT: u8 = 5;
+pub const AGG_TOPK: u8 = 6;
+pub const AGG_QUANTILE: u8 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OperatorDecl {
+    pub name: Span,
+    pub kind: u8,
+    /// `k` for TopK, permille for Quantile; 0 otherwise.
+    pub param: u32,
+    /// Value selector (empty for Count).
+    pub selector: Span,
+}
+
+pub const WINDOW_TUMBLING: u8 = 0;
+pub const WINDOW_SLIDING: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AggregationDecl {
+    pub name: Span,
+    pub param_name: Span,
+    pub input_type: Span,
+    pub output_type: Span,
+    pub key: Span,
+    pub event_time: Span,
+    pub window_kind: u8,
+    pub window_size_ms: i64,
+    pub window_step_ms: i64,
+    pub lateness_ms: i64,
+    pub guard_ms: i64,
+    pub max_lanes: u32,
+    pub first_op: u16,
+    pub n_ops: u16,
+    pub emit: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnumDecl {
+    pub name: Span,
+    pub value: i64,
+}
+
+/// `map NAME(r: T) -> T { over r.F as e: E max N; count r.A, r.B, r.C;
+/// when PRED; }` — a bounded map stage: PRED (an expression over `e` and `r`)
+/// is applied to every element of the repeated field `r.F`, at most N of them,
+/// and its true/false/unknown verdicts are counted into `r.A`/`r.B`/`r.C`.
+/// Every name is a span; the lowering resolves them against the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapDecl {
+    pub name: Span,
+    pub param_name: Span,
+    pub param_type: Span,
+    pub result_type: Span,
+    pub over_param: Span,
+    pub over: Span,
+    pub elem_name: Span,
+    pub elem_type: Span,
+    pub max: i64,
+    pub counts: [Span; 3],
+    pub count_params: [Span; 3],
+    pub when: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EntryDecl {
+    pub name: Span,
+    pub pipeline: Span,
+}
+
+/// Caller-provided storage for the parsed declarations.
+pub struct PlanArena<'a> {
+    pub messages: &'a mut [MessageDecl],
+    pub fields: &'a mut [FieldDecl],
+    pub enums: &'a mut [EnumDecl],
+    pub expressions: &'a mut [FnDecl],
+    pub transformations: &'a mut [FnDecl],
+    pub decisions: &'a mut [DecisionDecl],
+    pub rules: &'a mut [RuleDecl],
+    pub resources: &'a mut [ResourceDecl],
+    pub pipelines: &'a mut [PipelineDecl],
+    pub stages: &'a mut [StageDecl],
+    pub args: &'a mut [Span],
+    pub aggregations: &'a mut [AggregationDecl],
+    pub operators: &'a mut [OperatorDecl],
+    pub entries: &'a mut [EntryDecl],
+    pub maps: &'a mut [MapDecl],
+}
+
+/// How much of each arena array the parse filled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Doc {
+    pub name: Span,
+    pub n_messages: usize,
+    pub n_fields: usize,
+    pub n_enums: usize,
+    pub n_expressions: usize,
+    pub n_transformations: usize,
+    pub n_decisions: usize,
+    pub n_rules: usize,
+    pub n_resources: usize,
+    pub n_pipelines: usize,
+    pub n_stages: usize,
+    pub n_args: usize,
+    pub n_aggregations: usize,
+    pub n_operators: usize,
+    pub n_entries: usize,
+    pub n_maps: usize,
+    /// `provenance revision "..." toolchain "..."`; empty when absent.
+    pub provenance_revision: Span,
+    pub provenance_toolchain: Span,
+}
+
+// ------------------------------------------------------------------ scanner
+
+struct P<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+fn is_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+impl<'a> P<'a> {
+    fn new(s: &'a [u8]) -> Self {
+        P { s, i: 0 }
+    }
+
+    fn err<T>(&self, kind: PlanErrorKind) -> Result<T, PlanError> {
+        Err(PlanError {
+            kind,
+            offset: self.i,
+        })
+    }
+
+    /// Skip whitespace and `//` line comments.
+    fn ws(&mut self) {
+        loop {
+            while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+            if self.i + 1 < self.s.len() && self.s[self.i] == b'/' && self.s[self.i + 1] == b'/' {
+                while self.i < self.s.len() && self.s[self.i] != b'\n' {
+                    self.i += 1;
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.ws();
+        self.s.get(self.i).copied()
+    }
+
+    /// Match `kw` on a word boundary, consuming it on success.
+    fn keyword(&mut self, kw: &[u8]) -> bool {
+        self.ws();
+        if self.i < self.s.len() && self.s[self.i..].starts_with(kw) {
+            let after = self.i + kw.len();
+            if after >= self.s.len() || !is_ident_continue(self.s[after]) {
+                self.i = after;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn expect_byte(&mut self, b: u8) -> Result<(), PlanError> {
+        self.ws();
+        if self.s.get(self.i) == Some(&b) {
+            self.i += 1;
+            Ok(())
+        } else {
+            self.err(PlanErrorKind::ExpectedByte(b))
+        }
+    }
+
+    fn eat_byte(&mut self, b: u8) -> bool {
+        self.ws();
+        if self.s.get(self.i) == Some(&b) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn arrow(&mut self) -> Result<(), PlanError> {
+        self.ws();
+        if self.i + 1 < self.s.len() && self.s[self.i] == b'-' && self.s[self.i + 1] == b'>' {
+            self.i += 2;
+            Ok(())
+        } else {
+            self.err(PlanErrorKind::ExpectedArrow)
+        }
+    }
+
+    fn ident(&mut self) -> Result<Span, PlanError> {
+        self.ws();
+        let start = self.i;
+        if self.i >= self.s.len() || !is_ident_start(self.s[self.i]) {
+            return self.err(PlanErrorKind::ExpectedIdent);
+        }
+        self.i += 1;
+        while self.i < self.s.len() && is_ident_continue(self.s[self.i]) {
+            self.i += 1;
+        }
+        Ok(Span {
+            start: start as u32,
+            len: (self.i - start) as u32,
+        })
+    }
+
+    /// A dotted qualified name: `a.b.c`.
+    fn qname(&mut self) -> Result<Span, PlanError> {
+        self.ws();
+        let start = self.i;
+        self.ident()?;
+        loop {
+            let save = self.i;
+            if self.i < self.s.len() && self.s[self.i] == b'.' {
+                self.i += 1;
+                if self.ident().is_err() {
+                    self.i = save;
+                    break;
+                }
+            } else {
                 break;
             }
         }
-        if seen {
-            continue;
-        }
-        if n >= out.len() || n >= lens.len() {
-            return Err(GraphError::TooLarge);
-        }
-        if out[n].len() < pl {
-            return Err(GraphError::TooLarge);
-        }
-        out[n][..pl].copy_from_slice(&pin[..pl]);
-        lens[n] = pl;
-        n += 1;
+        Ok(Span {
+            start: start as u32,
+            len: (self.i - start) as u32,
+        })
     }
-    Ok(n)
+
+    /// A type: a builtin keyword or a qualified message name. Either way the
+    /// span is the verbatim text, which is what `celc_core` consumes.
+    fn ty(&mut self) -> Result<Span, PlanError> {
+        self.ws();
+        if self.i >= self.s.len() || !is_ident_start(self.s[self.i]) {
+            return self.err(PlanErrorKind::ExpectedType);
+        }
+        let at = self.i;
+        let t = self.qname()?;
+        if matches!(t.of(self.s), b"double" | b"float") {
+            return Err(PlanError {
+                kind: PlanErrorKind::UnsupportedType,
+                offset: at,
+            });
+        }
+        Ok(t)
+    }
+
+    fn int(&mut self) -> Result<i64, PlanError> {
+        self.ws();
+        let neg = if self.i < self.s.len() && self.s[self.i] == b'-' {
+            self.i += 1;
+            true
+        } else {
+            false
+        };
+        let start = self.i;
+        while self.i < self.s.len() && self.s[self.i].is_ascii_digit() {
+            self.i += 1;
+        }
+        if self.i == start {
+            return self.err(PlanErrorKind::ExpectedInt);
+        }
+        let mut v: i64 = 0;
+        for k in start..self.i {
+            v = match v
+                .checked_mul(10)
+                .and_then(|x| x.checked_add((self.s[k] - b'0') as i64))
+            {
+                Some(x) => x,
+                None => return self.err(PlanErrorKind::ExpectedInt),
+            };
+        }
+        Ok(if neg { -v } else { v })
+    }
+
+    /// An integer that must lie in `min..=max`; outside it is `OutOfRange`,
+    /// never wrapped or clamped into the field that holds it.
+    fn int_in(&mut self, min: i64, max: i64) -> Result<i64, PlanError> {
+        self.ws();
+        let at = self.i;
+        let v = self.int()?;
+        if v < min || v > max {
+            return Err(PlanError {
+                kind: PlanErrorKind::OutOfRange,
+                offset: at,
+            });
+        }
+        Ok(v)
+    }
+
+    /// Refuse a clause already seen in this declaration.
+    fn once(&self, seen: &mut bool) -> Result<(), PlanError> {
+        if *seen {
+            return self.err(PlanErrorKind::DuplicateClause);
+        }
+        *seen = true;
+        Ok(())
+    }
+
+    /// A double-quoted string; the span excludes the quotes.
+    fn string(&mut self) -> Result<Span, PlanError> {
+        self.ws();
+        if self.s.get(self.i) != Some(&b'"') {
+            return self.err(PlanErrorKind::ExpectedString);
+        }
+        self.i += 1;
+        let start = self.i;
+        while self.i < self.s.len() && self.s[self.i] != b'"' {
+            if self.s[self.i] == b'\\' {
+                self.i += 1;
+            }
+            self.i += 1;
+        }
+        if self.i >= self.s.len() {
+            return self.err(PlanErrorKind::ExpectedString);
+        }
+        let span = Span {
+            start: start as u32,
+            len: (self.i - start) as u32,
+        };
+        self.i += 1;
+        Ok(span)
+    }
+
+    /// A `{ … }` body captured verbatim between the braces, with surrounding
+    /// whitespace TRIMMED. Tracks nesting and skips string literals so a `}`
+    /// inside a string does not close it.
+    fn body(&mut self) -> Result<Span, PlanError> {
+        self.expect_byte(b'{')?;
+        let start = self.i;
+        let mut depth = 1usize;
+        while self.i < self.s.len() {
+            match self.s[self.i] {
+                b'"' => {
+                    self.i += 1;
+                    while self.i < self.s.len() && self.s[self.i] != b'"' {
+                        if self.s[self.i] == b'\\' {
+                            self.i += 1;
+                        }
+                        self.i += 1;
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // TRIM both ends. The body is sealed into the artefact as
+                        // its `source`, so leading/trailing layout would change
+                        // the content digest — two documents differing only in
+                        // indentation would produce different identities.
+                        let mut b = start;
+                        let mut e = self.i;
+                        while b < e && self.s[b].is_ascii_whitespace() {
+                            b += 1;
+                        }
+                        while e > b && self.s[e - 1].is_ascii_whitespace() {
+                            e -= 1;
+                        }
+                        let span = Span {
+                            start: b as u32,
+                            len: (e - b) as u32,
+                        };
+                        self.i += 1;
+                        return Ok(span);
+                    }
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        self.err(PlanErrorKind::UnterminatedBody)
+    }
+
+    /// An expression running to the next `->` at depth 0, captured verbatim.
+    ///
+    /// A `when` expression cannot simply stop at `>`: a comparison like
+    /// `units >= 1000` contains one, and stopping there would truncate the
+    /// predicate to `units` — which still parses as CEL, so the mistake would
+    /// survive as a silently wrong rule rather than an error.
+    fn expr_until_arrow(&mut self) -> Result<Span, PlanError> {
+        self.ws();
+        let start = self.i;
+        let mut depth = 0usize;
+        while self.i < self.s.len() {
+            match self.s[self.i] {
+                b'"' => {
+                    self.i += 1;
+                    while self.i < self.s.len() && self.s[self.i] != b'"' {
+                        if self.s[self.i] == b'\\' {
+                            self.i += 1;
+                        }
+                        self.i += 1;
+                    }
+                }
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                b'-' if depth == 0 && self.i + 1 < self.s.len() && self.s[self.i + 1] == b'>' => {
+                    break
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        let mut end = self.i;
+        while end > start && self.s[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        Ok(Span {
+            start: start as u32,
+            len: (end - start) as u32,
+        })
+    }
+
+    /// An expression running to `terminator` at depth 0, captured verbatim.
+    /// Used for rule/clause expressions, which are not brace-delimited but may
+    /// CONTAIN braces (a message construction).
+    fn expr_until(&mut self, terminator: u8) -> Result<Span, PlanError> {
+        self.ws();
+        let start = self.i;
+        let mut depth = 0usize;
+        while self.i < self.s.len() {
+            let b = self.s[self.i];
+            match b {
+                b'"' => {
+                    self.i += 1;
+                    while self.i < self.s.len() && self.s[self.i] != b'"' {
+                        if self.s[self.i] == b'\\' {
+                            self.i += 1;
+                        }
+                        self.i += 1;
+                    }
+                }
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ if b == terminator && depth == 0 => break,
+                _ => {}
+            }
+            self.i += 1;
+        }
+        let mut end = self.i;
+        while end > start && self.s[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        Ok(Span {
+            start: start as u32,
+            len: (end - start) as u32,
+        })
+    }
+}
+
+/// Push into an arena array, reporting `TooMany` rather than truncating.
+macro_rules! push {
+    ($p:expr, $arr:expr, $n:expr, $val:expr) => {{
+        if $n >= $arr.len() {
+            return $p.err(PlanErrorKind::TooMany);
+        }
+        $arr[$n] = $val;
+        $n += 1;
+    }};
+}
+
+/// Parse a `.plan` document into `arena`.
+pub fn plan_parse(src: &[u8], arena: &mut PlanArena) -> Result<Doc, PlanError> {
+    let mut p = P::new(src);
+    let mut doc = Doc::default();
+
+    if !p.keyword(b"plan") {
+        return p.err(PlanErrorKind::ExpectedPlan);
+    }
+    doc.name = p.qname()?;
+    p.expect_byte(b'{')?;
+    let mut seen_provenance = false;
+
+    loop {
+        if p.eat_byte(b'}') {
+            break;
+        }
+        if p.peek().is_none() {
+            return p.err(PlanErrorKind::ExpectedByte(b'}'));
+        }
+
+        if p.keyword(b"message") {
+            let name = p.qname()?;
+            p.expect_byte(b'{')?;
+            let first = doc.n_fields;
+            while !p.eat_byte(b'}') {
+                let fname = p.ident()?;
+                p.expect_byte(b':')?;
+                let fty = p.ty()?;
+                p.expect_byte(b'=')?;
+                let num = p.int_in(1, u32::MAX as i64)? as u32;
+                p.expect_byte(b';')?;
+                push!(
+                    p,
+                    arena.fields,
+                    doc.n_fields,
+                    FieldDecl {
+                        name: fname,
+                        ty: fty,
+                        number: num,
+                    }
+                );
+            }
+            push!(
+                p,
+                arena.messages,
+                doc.n_messages,
+                MessageDecl {
+                    name,
+                    first_field: first as u16,
+                    n_fields: (doc.n_fields - first) as u16,
+                }
+            );
+        } else if p.keyword(b"enum") {
+            let name = p.ident()?;
+            p.expect_byte(b'=')?;
+            let value = p.int()?;
+            p.expect_byte(b';')?;
+            push!(p, arena.enums, doc.n_enums, EnumDecl { name, value });
+        } else if p.keyword(b"expression") {
+            let d = parse_fn(&mut p)?;
+            push!(p, arena.expressions, doc.n_expressions, d);
+        } else if p.keyword(b"transformation") {
+            let d = parse_fn(&mut p)?;
+            push!(p, arena.transformations, doc.n_transformations, d);
+        } else if p.keyword(b"decision") {
+            let name = p.ident()?;
+            p.expect_byte(b'(')?;
+            let param_name = p.ident()?;
+            p.expect_byte(b':')?;
+            let input_type = p.ty()?;
+            p.expect_byte(b')')?;
+            p.arrow()?;
+            let output_type = p.ty()?;
+            p.expect_byte(b'{')?;
+            let first = doc.n_rules;
+            let mut default = Span::default();
+            let mut seen_default = false;
+            while !p.eat_byte(b'}') {
+                if p.keyword(b"when") {
+                    let when = p.expr_until_arrow()?;
+                    p.arrow()?;
+                    let outcome = p.expr_until(b';')?;
+                    p.expect_byte(b';')?;
+                    push!(p, arena.rules, doc.n_rules, RuleDecl { when, outcome });
+                } else if p.keyword(b"default") {
+                    p.once(&mut seen_default)?;
+                    p.arrow()?;
+                    default = p.expr_until(b';')?;
+                    p.expect_byte(b';')?;
+                } else {
+                    return p.err(PlanErrorKind::UnknownDeclaration);
+                }
+            }
+            if default.is_empty() {
+                return p.err(PlanErrorKind::MissingClause);
+            }
+            push!(
+                p,
+                arena.decisions,
+                doc.n_decisions,
+                DecisionDecl {
+                    name,
+                    param_name,
+                    input_type,
+                    output_type,
+                    first_rule: first as u16,
+                    n_rules: (doc.n_rules - first) as u16,
+                    default,
+                }
+            );
+        } else if p.keyword(b"resource") {
+            let name = p.qname()?;
+            let required = p.keyword(b"required");
+            p.expect_byte(b';')?;
+            push!(
+                p,
+                arena.resources,
+                doc.n_resources,
+                ResourceDecl { name, required }
+            );
+        } else if p.keyword(b"pipeline") {
+            let d = parse_pipeline(&mut p, arena, &mut doc)?;
+            push!(p, arena.pipelines, doc.n_pipelines, d);
+        } else if p.keyword(b"aggregation") {
+            let d = parse_aggregation(&mut p, arena, &mut doc)?;
+            push!(p, arena.aggregations, doc.n_aggregations, d);
+        } else if p.keyword(b"map") {
+            let d = parse_map(&mut p)?;
+            push!(p, arena.maps, doc.n_maps, d);
+        } else if p.keyword(b"entry") {
+            let name = p.ident()?;
+            p.expect_byte(b'=')?;
+            let pipeline = p.ident()?;
+            p.expect_byte(b';')?;
+            push!(
+                p,
+                arena.entries,
+                doc.n_entries,
+                EntryDecl { name, pipeline }
+            );
+        } else if p.keyword(b"provenance") {
+            p.once(&mut seen_provenance)?;
+            if !p.keyword(b"revision") {
+                return p.err(PlanErrorKind::UnknownDeclaration);
+            }
+            doc.provenance_revision = p.string()?;
+            if !p.keyword(b"toolchain") {
+                return p.err(PlanErrorKind::UnknownDeclaration);
+            }
+            doc.provenance_toolchain = p.string()?;
+            p.expect_byte(b';')?;
+        } else {
+            return p.err(PlanErrorKind::UnknownDeclaration);
+        }
+    }
+    // Nothing may follow the plan's closing brace. Without this, a document
+    // with junk appended parses as though the junk were not there — so a file
+    // and that file plus arbitrary trailing bytes would seal to the SAME
+    // digests, and a content digest would no longer identify one source.
+    p.ws();
+    if p.peek().is_some() {
+        return p.err(PlanErrorKind::TrailingInput);
+    }
+    check_unique_names(src, arena, &doc)?;
+    Ok(doc)
+}
+
+/// Refuse two artefact declarations of any kind sharing a name, and two
+/// entries sharing one. A stage names its target by bare symbol, so a name
+/// declared twice would resolve to whichever lookup ran first — and the
+/// sealed Plan would carry two refs under one name.
+fn check_unique_names(src: &[u8], arena: &PlanArena, doc: &Doc) -> Result<(), PlanError> {
+    // Plain matches, not a table of closures: a PIC module cannot hold a
+    // vtable or pointer table, so each kind is reached through code.
+    let count = |k: usize| match k {
+        0 => doc.n_expressions,
+        1 => doc.n_transformations,
+        2 => doc.n_decisions,
+        3 => doc.n_maps,
+        4 => doc.n_aggregations,
+        _ => doc.n_pipelines,
+    };
+    let name = |k: usize, i: usize| match k {
+        0 => arena.expressions[i].name,
+        1 => arena.transformations[i].name,
+        2 => arena.decisions[i].name,
+        3 => arena.maps[i].name,
+        4 => arena.aggregations[i].name,
+        _ => arena.pipelines[i].name,
+    };
+    for ka in 0..6 {
+        for ia in 0..count(ka) {
+            let a = name(ka, ia).of(src);
+            for kb in ka..6 {
+                let from = if kb == ka { ia + 1 } else { 0 };
+                for ib in from..count(kb) {
+                    let b = name(kb, ib);
+                    if b.of(src) == a {
+                        return Err(PlanError {
+                            kind: PlanErrorKind::DuplicateName,
+                            offset: b.start as usize,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for ia in 0..doc.n_entries {
+        for ib in ia + 1..doc.n_entries {
+            if arena.entries[ib].name.of(src) == arena.entries[ia].name.of(src) {
+                return Err(PlanError {
+                    kind: PlanErrorKind::DuplicateName,
+                    offset: arena.entries[ib].name.start as usize,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `IDENT '.' IDENT` — a parameter's field, as two spans.
+fn param_field(p: &mut P) -> Result<(Span, Span), PlanError> {
+    let a = p.ident()?;
+    p.expect_byte(b'.')?;
+    let b = p.ident()?;
+    Ok((a, b))
+}
+
+/// The `map` declaration (see [`MapDecl`]). Clauses may come in any order;
+/// `over`, `count` and `when` are each required exactly once.
+fn parse_map(p: &mut P) -> Result<MapDecl, PlanError> {
+    let mut d = MapDecl {
+        name: p.ident()?,
+        ..MapDecl::default()
+    };
+    p.expect_byte(b'(')?;
+    d.param_name = p.ident()?;
+    p.expect_byte(b':')?;
+    d.param_type = p.ty()?;
+    p.expect_byte(b')')?;
+    p.arrow()?;
+    d.result_type = p.ty()?;
+    p.expect_byte(b'{')?;
+    let (mut over, mut count, mut when) = (false, false, false);
+    while !p.eat_byte(b'}') {
+        if p.keyword(b"over") {
+            p.once(&mut over)?;
+            (d.over_param, d.over) = param_field(p)?;
+            if !p.keyword(b"as") {
+                return p.err(PlanErrorKind::MissingClause);
+            }
+            d.elem_name = p.ident()?;
+            p.expect_byte(b':')?;
+            d.elem_type = p.ty()?;
+            if !p.keyword(b"max") {
+                return p.err(PlanErrorKind::MissingClause);
+            }
+            d.max = p.int_in(1, u8::MAX as i64)?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"count") {
+            p.once(&mut count)?;
+            for k in 0..3 {
+                if k > 0 {
+                    p.expect_byte(b',')?;
+                }
+                (d.count_params[k], d.counts[k]) = param_field(p)?;
+            }
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"when") {
+            p.once(&mut when)?;
+            d.when = p.expr_until(b';')?;
+            p.expect_byte(b';')?;
+        } else {
+            return p.err(PlanErrorKind::UnknownDeclaration);
+        }
+    }
+    if !over || !count || d.when.is_empty() {
+        return p.err(PlanErrorKind::MissingClause);
+    }
+    Ok(d)
+}
+
+/// `NAME '(' PARAM ':' TYPE ')' '->' TYPE BODY` — expression and transformation.
+fn parse_fn(p: &mut P) -> Result<FnDecl, PlanError> {
+    let name = p.ident()?;
+    p.expect_byte(b'(')?;
+    let param_name = p.ident()?;
+    p.expect_byte(b':')?;
+    let param_type = p.ty()?;
+    p.expect_byte(b')')?;
+    p.arrow()?;
+    let result_type = p.ty()?;
+    let body = p.body()?;
+    Ok(FnDecl {
+        name,
+        param_name,
+        param_type,
+        result_type,
+        body,
+    })
+}
+
+fn parse_pipeline(
+    p: &mut P,
+    arena: &mut PlanArena,
+    doc: &mut Doc,
+) -> Result<PipelineDecl, PlanError> {
+    let name = p.ident()?;
+    p.expect_byte(b'(')?;
+    let port_name = p.ident()?;
+    p.expect_byte(b':')?;
+    let input_type = p.ty()?;
+    p.expect_byte(b')')?;
+    p.arrow()?;
+    let output_type = p.ty()?;
+    p.expect_byte(b'{')?;
+
+    let first = doc.n_stages;
+    let mut commit_after = Span::default();
+    let mut return_stage = Span::default();
+    let (mut seen_commit, mut seen_return) = (false, false);
+    while !p.eat_byte(b'}') {
+        if p.keyword(b"call") {
+            let sname = p.ident()?;
+            p.expect_byte(b'=')?;
+            let artefact = p.qname()?;
+            p.expect_byte(b'(')?;
+            let arg_first = doc.n_args;
+            if !p.eat_byte(b')') {
+                loop {
+                    let a = p.ident()?;
+                    push!(p, arena.args, doc.n_args, a);
+                    if p.eat_byte(b',') {
+                        continue;
+                    }
+                    p.expect_byte(b')')?;
+                    break;
+                }
+            }
+            p.expect_byte(b';')?;
+            push!(
+                p,
+                arena.stages,
+                doc.n_stages,
+                StageDecl {
+                    kind: STAGE_CALL,
+                    name: sname,
+                    target: artefact,
+                    operation: Span::default(),
+                    arg0: Span::default(),
+                    first_arg: arg_first as u16,
+                    n_args: (doc.n_args - arg_first) as u16,
+                }
+            );
+        } else if p.keyword(b"effect") {
+            let sname = p.ident()?;
+            p.expect_byte(b'=')?;
+            p.expect_byte(b'@')?;
+            let resource = p.ident()?;
+            let operation = if p.eat_byte(b'.') {
+                p.ident()?
+            } else {
+                Span::default()
+            };
+            p.expect_byte(b'(')?;
+            let arg = p.ident()?;
+            p.expect_byte(b')')?;
+            p.expect_byte(b';')?;
+            push!(
+                p,
+                arena.stages,
+                doc.n_stages,
+                StageDecl {
+                    kind: STAGE_EFFECT,
+                    name: sname,
+                    target: resource,
+                    operation,
+                    arg0: arg,
+                    first_arg: 0,
+                    n_args: 0,
+                }
+            );
+        } else if p.keyword(b"commit") {
+            p.once(&mut seen_commit)?;
+            if !p.keyword(b"after") {
+                return p.err(PlanErrorKind::UnknownDeclaration);
+            }
+            commit_after = p.ident()?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"return") {
+            p.once(&mut seen_return)?;
+            return_stage = p.ident()?;
+            p.expect_byte(b';')?;
+        } else {
+            return p.err(PlanErrorKind::UnknownDeclaration);
+        }
+    }
+    if return_stage.is_empty() {
+        return p.err(PlanErrorKind::MissingClause);
+    }
+    Ok(PipelineDecl {
+        name,
+        port_name,
+        input_type,
+        output_type,
+        first_stage: first as u16,
+        n_stages: (doc.n_stages - first) as u16,
+        commit_after,
+        return_stage,
+    })
+}
+
+fn parse_aggregation(
+    p: &mut P,
+    arena: &mut PlanArena,
+    doc: &mut Doc,
+) -> Result<AggregationDecl, PlanError> {
+    let name = p.ident()?;
+    p.expect_byte(b'(')?;
+    let param_name = p.ident()?;
+    p.expect_byte(b':')?;
+    let input_type = p.ty()?;
+    p.expect_byte(b')')?;
+    p.arrow()?;
+    let output_type = p.ty()?;
+    p.expect_byte(b'{')?;
+
+    let first = doc.n_operators;
+    let mut d = AggregationDecl {
+        name,
+        param_name,
+        input_type,
+        output_type,
+        first_op: first as u16,
+        ..Default::default()
+    };
+    // One flag per clause that may appear once: key, event_time, window,
+    // lateness, guard, lanes, emit.
+    let mut seen = [false; 7];
+    // A pane holds one collection cell: see `TooManyCollections`.
+    let mut has_collection = false;
+    while !p.eat_byte(b'}') {
+        if p.keyword(b"key") {
+            p.once(&mut seen[0])?;
+            d.key = p.expr_until(b';')?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"event_time") {
+            p.once(&mut seen[1])?;
+            d.event_time = p.expr_until(b';')?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"window") {
+            p.once(&mut seen[2])?;
+            if p.keyword(b"tumbling") {
+                d.window_kind = WINDOW_TUMBLING;
+                d.window_size_ms = p.int_in(1, i64::MAX)?;
+            } else if p.keyword(b"sliding") {
+                d.window_kind = WINDOW_SLIDING;
+                d.window_size_ms = p.int_in(1, i64::MAX)?;
+                d.window_step_ms = p.int_in(1, i64::MAX)?;
+            } else {
+                return p.err(PlanErrorKind::UnknownDeclaration);
+            }
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"lateness") {
+            p.once(&mut seen[3])?;
+            d.lateness_ms = p.int_in(0, i64::MAX)?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"guard") {
+            p.once(&mut seen[4])?;
+            d.guard_ms = p.int_in(0, i64::MAX)?;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"lanes") {
+            p.once(&mut seen[5])?;
+            d.max_lanes = p.int_in(1, u32::MAX as i64)? as u32;
+            p.expect_byte(b';')?;
+        } else if p.keyword(b"operator") {
+            let oname = p.ident()?;
+            p.expect_byte(b'=')?;
+            let op = parse_opkind(p)?;
+            if matches!(op.0, AGG_DISTINCT | AGG_TOPK | AGG_QUANTILE) {
+                if has_collection {
+                    return p.err(PlanErrorKind::TooManyCollections);
+                }
+                has_collection = true;
+            }
+            p.expect_byte(b';')?;
+            push!(
+                p,
+                arena.operators,
+                doc.n_operators,
+                OperatorDecl {
+                    name: oname,
+                    kind: op.0,
+                    param: op.1,
+                    selector: op.2,
+                }
+            );
+        } else if p.keyword(b"emit") {
+            p.once(&mut seen[6])?;
+            d.emit = p.expr_until(b';')?;
+            p.expect_byte(b';')?;
+        } else {
+            return p.err(PlanErrorKind::UnknownDeclaration);
+        }
+    }
+    if !seen[2] || d.key.is_empty() || d.event_time.is_empty() || d.emit.is_empty() {
+        return p.err(PlanErrorKind::MissingClause);
+    }
+    d.n_ops = (doc.n_operators - first) as u16;
+    Ok(d)
+}
+
+/// `(kind, param, selector)`.
+fn parse_opkind(p: &mut P) -> Result<(u8, u32, Span), PlanError> {
+    if p.keyword(b"count") {
+        return Ok((AGG_COUNT, 0, Span::default()));
+    }
+    for (kw, kind) in [
+        (b"sum".as_slice(), AGG_SUM),
+        (b"avg".as_slice(), AGG_AVG),
+        (b"min".as_slice(), AGG_MIN),
+        (b"max".as_slice(), AGG_MAX),
+        (b"distinct".as_slice(), AGG_DISTINCT),
+    ] {
+        if p.keyword(kw) {
+            p.expect_byte(b'(')?;
+            let sel = p.expr_until(b')')?;
+            p.expect_byte(b')')?;
+            return Ok((kind, 0, sel));
+        }
+    }
+    for (kw, kind) in [
+        (b"topk".as_slice(), AGG_TOPK),
+        (b"quantile".as_slice(), AGG_QUANTILE),
+    ] {
+        if p.keyword(kw) {
+            p.expect_byte(b'(')?;
+            // TOPK's k is 1..=65535, the `u16` the execution container
+            // carries; QUANTILE's permille is 0..=1000.
+            let n = if kind == AGG_TOPK {
+                p.int_in(1, u16::MAX as i64)?
+            } else {
+                p.int_in(0, 1000)?
+            } as u32;
+            p.expect_byte(b',')?;
+            let sel = p.expr_until(b')')?;
+            p.expect_byte(b')')?;
+            return Ok((kind, n, sel));
+        }
+    }
+    p.err(PlanErrorKind::UnknownOperator)
+}
+
+/// Map a byte offset to a 1-based (line, column) for error display.
+pub fn plan_line_col(src: &[u8], offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let end = offset.min(src.len());
+    let mut i = 0;
+    while i < end {
+        if src[i] == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        i += 1;
+    }
+    (line, col)
 }

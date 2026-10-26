@@ -2,7 +2,7 @@
 // and what happens to the one it replaces.
 //
 // Split out from `activation_core` because it shares nothing with it. Activation
-// planning validates an artefact against a node's holdings and needs the whole
+// resolution validates an artefact against a node's holdings and needs the whole
 // protobuf reader to do it; the barrier is pure log-index bookkeeping over two
 // digests. Anything that stages a version needs the barrier — the release
 // control plane does, and has no business pulling in artefact validation to get
@@ -12,7 +12,7 @@
 
 /// Log-index activation barrier with version coexistence and rollback.
 ///
-/// The other half of activation: `plan_activation` decides whether a module MAY
+/// The other half of activation: `resolve_activation` decides whether a module MAY
 /// run; this decides WHEN it starts running, and what happens to the version it
 /// replaces.
 ///

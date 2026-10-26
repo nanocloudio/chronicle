@@ -3,7 +3,7 @@
 //! PARAM-DRIVEN: the checked-CEL bytecode is NOT baked into the module — it
 //! arrives as a `program` module param (a `blob`: `{hex: "…"}` in a graph)
 //! with a `max_cost` ceiling. So one evaluator binary serves ANY Expression: the
-//! `.uproc`/CEL compiler emits the bytecode, a config sets it as the param, and
+//! `.plan`/CEL compiler emits the bytecode, a config sets it as the param, and
 //! this module runs it. Two configs with different `program` values produce
 //! different results from the identical `.fmod` (see examples/expression/*.yaml).
 //!

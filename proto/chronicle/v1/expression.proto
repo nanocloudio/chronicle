@@ -9,9 +9,9 @@
 // process state, files, or networks. Determinism is structural.
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
-import "unified/v1/common.proto";
+import "chronicle/v1/common.proto";
 
 message Expression {
   ArtefactHeader header = 1;

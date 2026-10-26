@@ -1,26 +1,27 @@
-# The `.uproc` authoring DSL
+# Writing a plan
 
-A single human-authored `.uproc` document describes a processing **module** — its
-type environment plus the logic and orchestration artefacts — and compiles
-**deterministically** to the sealed canonical artefacts + a `Module`.
+A **plan** is the declarative definition of a process: a single human-authored
+`.plan` document holding its type environment plus the logic and orchestration
+artefacts. It compiles **deterministically** to the sealed canonical artefacts
+plus the `Plan` that bundles them.
 
 It is a thin front end, by design. The document parser
-([`uproc_core.rs`](../../modules/common/uproc_core.rs)) recognizes only the
+([`plan_core.rs`](../../modules/common/plan_core.rs)) recognizes only the
 *structure*; every expression body is captured as a verbatim source span and
 handed unchanged to the CEL compiler
 ([`celc_core.rs`](../../modules/common/celc_core.rs)). The DSL therefore inherits
 the exact CEL-subset grammar, type-checker, lowerer, and content-digest identity
-of the engine — a module authored in text seals to digests pinned by the golden
-corpus (`module_identity_matches_the_prost_corpus`).
+of the engine — a plan authored in text seals to digests pinned by the golden
+corpus (`plan_identity_matches_the_prost_corpus`).
 
 ## Example
 
-See [`examples/authoring/process_order.uproc`](../../examples/authoring/process_order.uproc)
+See [`examples/authoring/process_order.plan`](../../examples/authoring/process_order.plan)
 — `commerce.process_order`, authored end to end. Abridged here: the full file also
 declares `commerce.Money`, `commerce.NormalizedOrder` and `commerce.Route`.
 
 ```
-module commerce.process_order {
+plan commerce.process_order {
   message commerce.Order { id: string = 1; total: commerce.Money = 3; }
   enum AUTOMATIC = 0;
   enum MANUAL_REVIEW = 1;
@@ -52,7 +53,7 @@ module commerce.process_order {
 ## Grammar (EBNF sketch)
 
 ```
-document      := 'module' QNAME '{' decl* '}'
+document      := 'plan' QNAME '{' decl* '}'
 decl          := message | enumconst | expression | transformation
                | decision | aggregation | map | resource | pipeline | entry
                | provenance
@@ -90,20 +91,20 @@ declaration order (earlier binds tighter), matching the `first` hit policy.
 
 ## Guarantees
 
-- **Deterministic identity** — identical source ⇒ identical module + artefact
-  digests (`sealing_is_deterministic`, `module_identity_matches_the_prost_corpus`).
+- **Deterministic identity** — identical source ⇒ identical plan + artefact
+  digests (`sealing_is_deterministic`, `plan_identity_matches_the_prost_corpus`).
 - **Fidelity** — parsing and sealing are pinned against the golden corpus, so a
   parser or compiler change that alters a document's artefacts is a visible,
   breaking change (`document_parsing_matches_the_corpus`, `rejection_matches_the_corpus`).
 - **Structured errors** — parse errors carry a 1-based line/column; reference and
-  type errors are typed `UprocError` values, never panics.
+  type errors are typed `PlanError` values, never panics.
 
 ## Aggregation
 
 The Aggregation artefact (deterministic event-time state) is authored via an
 `aggregation { … }` block that lowers to a sealed Aggregation artefact
 (`artefact_core.rs::seal_aggregation`).
-See [`examples/authoring/customer_totals.uproc`](../../examples/authoring/customer_totals.uproc).
+See [`examples/authoring/customer_totals.plan`](../../examples/authoring/customer_totals.plan).
 
 ```
 aggregation customer_totals(order: commerce.Order) -> commerce.CustomerTotal {
@@ -145,12 +146,12 @@ map, so no program frames an exchange record.
 
 There is no `connector { … }` block in the DSL — writing one is a parse error.
 Wire edges are pipeline params rather than sealed canonical artefacts, which is
-also why they never appear in a Module's artefact refs.
+also why they never appear in a Plan's artefact refs.
 
 Protocol I/O itself is not a Chronicle concern at all: a connector is a
 sibling-owned provider module composed as a graph node and resolved from the
 fluxor OCI store by pin — see [connectors.md](../architecture/connectors.md) and
-`plan_core`'s `Connector`, which maps an effect's capability to the provider that
+`graph_lower_core`'s `Connector`, which maps an effect's capability to the provider that
 realizes it.
 
 ## Authoring on device
@@ -161,9 +162,9 @@ graph — which is the point of the DSL existing at all:
 
 | command | what it does |
 | --- | --- |
-| `chronicle parse <uproc_hex>` | parse a document and summarise its declarations |
-| `chronicle author <uproc_hex>` | compile and SEAL every artefact, printing `<name> <digest>` |
-| `chronicle graph <uproc_hex> <pipeline> [target] [bindings]` | lower a pipeline to bootable graph YAML, binding each effect's resource from `[bindings]` (see [connectors.md](../architecture/connectors.md)) |
+| `chronicle parse <plan_hex>` | parse a document and summarise its declarations |
+| `chronicle author <plan_hex>` | compile and SEAL every artefact, printing `<name> <digest>` |
+| `chronicle graph <plan_hex> <pipeline> [target] [bindings]` | lower a pipeline to bootable graph YAML, binding each effect's resource from `[bindings]` (see [connectors.md](../architecture/connectors.md)) |
 | `chronicle compile-source <schema> <param> <type> <source>` | type-check source handed over at runtime → `ir` hex |
 | `chronicle compile-stages <schema> <param> <type> <src>…` | the same, as a chain → `ir_stages` hex |
 | `chronicle release <default_tag> <tag>:<prog_hex>…` | build the multi-version `versions` param |
@@ -195,7 +196,7 @@ Driven end to end by [`tools/e2e/graph.sh`](../../tools/e2e/graph.sh),
 ## Scope
 
 The DSL covers the artefact kinds with a builder — Expression, Transformation,
-Decision, Aggregation, Pipeline (including its map stages) — plus the Module
+Decision, Aggregation, Pipeline (including its map stages) — plus the Plan
 wrapper. Schema artefacts
 (descriptor closures) are supplied out-of-band, referenced by the message closure
 declared inline. Connector wire edges are pipeline PARAMS, not a DSL block (see

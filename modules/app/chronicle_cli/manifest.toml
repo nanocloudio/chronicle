@@ -13,7 +13,7 @@ timer_class      = "agnostic"
 #   chronicle check <ir_hex>                validate + lower an ir_stages container
 #   chronicle eval <ir_hex> <record_hex>    dry-run a record through the stages
 #   chronicle seal|seal-tf …                seal an Expression / Transformation
-#   chronicle seal-module …                 seal the deployment unit
+#   chronicle seal-plan …                 seal the deployment unit
 #   chronicle digest <hex>                  sha256 content digest (version identity)
 #   chronicle help
 #
@@ -29,7 +29,7 @@ timer_class      = "agnostic"
 # load — same lowerer, same cost derivation.
 
 # argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
-# Sized for `seal-module`, the widest form: 4 fixed arguments plus a
+# Sized for `seal-plan`, the widest form: 4 fixed arguments plus a
 # <kind> <pkg.sym> <digest> triple per contained artefact.
 # Feature-set variants. The pinned CEL extension surface
 # (modules/common/builtins_core.rs) is cfg-gated per extension at TOP
@@ -48,7 +48,7 @@ default  = true
 name         = "args"
 direction    = "input"
 content_type = "OctetStream"
-# 2 x UPROC_BUF + slack: the document travels as ONE hex argument, and an argv
+# 2 x PLAN_BUF + slack: the document travels as ONE hex argument, and an argv
 # record that exceeds the CHANNEL is never delivered at all — the applet waits
 # for argv that cannot arrive (cli_in bounds the retry and logs, but the fix is
 # a channel the record fits).

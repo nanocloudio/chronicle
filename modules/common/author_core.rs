@@ -4,8 +4,8 @@
 // hex, build the parse arena over module state, format the reply — while the
 // compile→seal→reference logic lives here over plain buffers.
 //
-// Mounted inside chronicle_cli's `mod tc {}` AFTER celc_core/lower_core/uproc_core/
-// artefact_core, so `celc_compile_auto`, `lower_flat`, `uproc_parse`, the `seal_*`
+// Mounted inside chronicle_cli's `mod tc {}` AFTER celc_core/lower_core/plan_core/
+// artefact_core, so `celc_compile_auto`, `lower_flat`, `plan_parse`, the `seal_*`
 // builders and `split_qname` are all in scope. The shared CLI output helpers
 // (`append`/`append_u32`) and the `compile_one`/`compile_failed` pair live here too
 // and are re-exported to the crate root, so every `cmd_*` resolves them.
@@ -217,7 +217,7 @@ pub fn append_release_reason(out: &mut [u8], at: usize, e: ReleaseError) -> usiz
 pub const MAX_ARGV: usize = 24;
 pub const MAX_SET: usize = 8;
 
-/// The compile work buffers one `.uproc` artefact is assembled in: the
+/// The compile work buffers one `.plan` artefact is assembled in: the
 /// container, the lowered code, and the digest-free encoding the two-pass
 /// seal needs. All three live in module STATE (`chronicle_cli::State`), never
 /// on the PIC stack, so the bound costs state rather than a frame.
@@ -466,7 +466,7 @@ pub fn agg_kind_to_op(kind: u8) -> i32 {
 /// The kind a LOCAL declaration named `symbol` was declared as, or `None`
 /// when the document declares nothing by that name. A map's predicate is
 /// sealed as an Expression; the iteration is the calling Stage's MapSpec.
-pub fn declared_kind(arena: &UprocArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<i32> {
+pub fn declared_kind(arena: &PlanArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<i32> {
     for i in 0..doc.n_expressions {
         if arena.expressions[i].name.of(src) == symbol {
             return Some(KIND_EXPRESSION);
@@ -501,7 +501,7 @@ pub fn local_target<'a>(target: &'a [u8], pkg: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// The map declaration named `symbol`, if the document declares one.
-pub fn find_map(arena: &UprocArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<MapDecl> {
+pub fn find_map(arena: &PlanArena, doc: &Doc, src: &[u8], symbol: &[u8]) -> Option<MapDecl> {
     (0..doc.n_maps)
         .map(|i| arena.maps[i])
         .find(|m| m.name.of(src) == symbol)
@@ -613,32 +613,30 @@ pub fn map_container(
     Ok(MAP_HEADER + 6 + clen)
 }
 
-pub fn append_uproc_reason(out: &mut [u8], at: usize, k: UprocErrorKind) -> usize {
+pub fn append_plan_reason(out: &mut [u8], at: usize, k: PlanErrorKind) -> usize {
     match k {
-        UprocErrorKind::ExpectedModule => append(out, at, b"expected a `module` header"),
-        UprocErrorKind::ExpectedIdent => append(out, at, b"expected an identifier"),
-        UprocErrorKind::ExpectedByte(_) => append(out, at, b"unexpected byte"),
-        UprocErrorKind::ExpectedType => append(out, at, b"expected a type"),
-        UprocErrorKind::ExpectedInt => append(out, at, b"expected an integer"),
-        UprocErrorKind::ExpectedString => append(out, at, b"expected a string"),
-        UprocErrorKind::ExpectedArrow => append(out, at, b"expected `->`"),
-        UprocErrorKind::UnknownDeclaration => append(out, at, b"unknown declaration"),
-        UprocErrorKind::UnknownOperator => append(out, at, b"unknown operator kind"),
-        UprocErrorKind::UnterminatedBody => append(out, at, b"unterminated body"),
-        UprocErrorKind::TrailingInput => {
-            append(out, at, b"content after the module's closing brace")
-        }
-        UprocErrorKind::MissingClause => append(out, at, b"a required clause is missing"),
-        UprocErrorKind::TooMany => append(out, at, b"too many declarations for this node"),
-        UprocErrorKind::DuplicateClause => {
+        PlanErrorKind::ExpectedPlan => append(out, at, b"expected a `plan` header"),
+        PlanErrorKind::ExpectedIdent => append(out, at, b"expected an identifier"),
+        PlanErrorKind::ExpectedByte(_) => append(out, at, b"unexpected byte"),
+        PlanErrorKind::ExpectedType => append(out, at, b"expected a type"),
+        PlanErrorKind::ExpectedInt => append(out, at, b"expected an integer"),
+        PlanErrorKind::ExpectedString => append(out, at, b"expected a string"),
+        PlanErrorKind::ExpectedArrow => append(out, at, b"expected `->`"),
+        PlanErrorKind::UnknownDeclaration => append(out, at, b"unknown declaration"),
+        PlanErrorKind::UnknownOperator => append(out, at, b"unknown operator kind"),
+        PlanErrorKind::UnterminatedBody => append(out, at, b"unterminated body"),
+        PlanErrorKind::TrailingInput => append(out, at, b"content after the plan's closing brace"),
+        PlanErrorKind::MissingClause => append(out, at, b"a required clause is missing"),
+        PlanErrorKind::TooMany => append(out, at, b"too many declarations for this node"),
+        PlanErrorKind::DuplicateClause => {
             append(out, at, b"a clause appears twice in one declaration")
         }
-        UprocErrorKind::DuplicateName => append(out, at, b"two declarations share a name"),
-        UprocErrorKind::OutOfRange => append(out, at, b"integer out of range for its field"),
-        UprocErrorKind::UnsupportedType => {
+        PlanErrorKind::DuplicateName => append(out, at, b"two declarations share a name"),
+        PlanErrorKind::OutOfRange => append(out, at, b"integer out of range for its field"),
+        PlanErrorKind::UnsupportedType => {
             append(out, at, b"unsupported type (no double/float scalar)")
         }
-        UprocErrorKind::TooManyCollections => append(
+        PlanErrorKind::TooManyCollections => append(
             out,
             at,
             b"at most one distinct, topk or quantile operator per aggregation",
@@ -646,9 +644,9 @@ pub fn append_uproc_reason(out: &mut [u8], at: usize, k: UprocErrorKind) -> usiz
     }
 }
 
-/// Author every artefact a `.uproc` declares: parse it, emit the schema, compile
+/// Author every artefact a `.plan` declares: parse it, emit the schema, compile
 /// and seal each expression / transformation / decision / pipeline / aggregation,
-/// then seal a Module referencing them all. Pure compute over caller buffers — no
+/// then seal a Plan referencing them all. Pure compute over caller buffers — no
 /// ABI, no syscalls — so the host harness drives it directly.
 #[allow(
     clippy::too_many_arguments,
@@ -656,7 +654,7 @@ pub fn append_uproc_reason(out: &mut [u8], at: usize, k: UprocErrorKind) -> usiz
 )]
 pub fn author_document(
     src: &[u8],
-    arena: &mut UprocArena,
+    arena: &mut PlanArena,
     st_prog: &mut [u8],
     st_code: &mut [u8],
     st_cont: &mut [u8],
@@ -664,12 +662,12 @@ pub fn author_document(
     st_rules: &mut RuleCode,
     st_out: &mut [u8],
 ) -> (usize, i32) {
-    let doc = match uproc_parse(src, &mut *arena) {
+    let doc = match plan_parse(src, &mut *arena) {
         Ok(d) => d,
         Err(e) => {
-            let (line, col) = uproc_line_col(src, e.offset);
+            let (line, col) = plan_line_col(src, e.offset);
             let mut p = append(&mut *st_out, 0, b"error: ");
-            p = append_uproc_reason(&mut *st_out, p, e.kind);
+            p = append_plan_reason(&mut *st_out, p, e.kind);
             p = append(&mut *st_out, p, b" at line ");
             p = append_u32(&mut *st_out, p, line as u32);
             p = append(&mut *st_out, p, b" column ");
@@ -679,12 +677,12 @@ pub fn author_document(
         }
     };
 
-    let Ok(slen) = uproc_schema_text(src, &doc, arena, &mut *st_prog) else {
+    let Ok(slen) = plan_schema_text(src, &doc, arena, &mut *st_prog) else {
         return (append(&mut *st_out, 0, b"error: schema too large\n"), 1);
     };
-    let (pkg, _sym) = split_qname(doc.module.of(src));
+    let (pkg, _sym) = split_qname(doc.name.of(src));
 
-    // Every sealed artefact becomes a Module ref, so the document produces a
+    // Every sealed artefact becomes a Plan entry, so the document produces a
     // deployment unit rather than a loose pile of digests.
     const MAX_ART: usize = 24;
     let mut rdigest = [[0u8; 32]; MAX_ART];
@@ -712,7 +710,7 @@ pub fn author_document(
             arena.transformations[i - doc.n_expressions]
         };
         let mut params = [0u8; 256];
-        let Ok(plen) = uproc_params_text(src, d.param_name, d.param_type, &mut params) else {
+        let Ok(plen) = plan_params_text(src, d.param_name, d.param_type, &mut params) else {
             return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
         };
         let mut code = [0u8; 512];
@@ -857,7 +855,7 @@ pub fn author_document(
     for i in 0..doc.n_decisions {
         let d = arena.decisions[i];
         let mut params = [0u8; 256];
-        let Ok(plen) = uproc_params_text(src, d.param_name, d.input_type, &mut params) else {
+        let Ok(plen) = plan_params_text(src, d.param_name, d.input_type, &mut params) else {
             return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
         };
         if d.n_rules as usize > MAX_RULE {
@@ -1124,7 +1122,7 @@ pub fn author_document(
             );
         }
         let mut params = [0u8; 256];
-        let Ok(plen) = uproc_params_text(src, ag.param_name, ag.input_type, &mut params) else {
+        let Ok(plen) = plan_params_text(src, ag.param_name, ag.input_type, &mut params) else {
             return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
         };
 
@@ -1176,7 +1174,7 @@ pub fn author_document(
         }
 
         // `emit` reads `ctx`, whose type is synthesized from the operator set.
-        let Ok(elen_schema) = uproc_agg_emit_schema(src, &ag, arena, pkg, &mut *st_prog, slen)
+        let Ok(elen_schema) = plan_agg_emit_schema(src, &ag, arena, pkg, &mut *st_prog, slen)
         else {
             return (
                 append(&mut *st_out, 0, b"error: emit schema too large\n"),
@@ -1184,7 +1182,7 @@ pub fn author_document(
             );
         };
         let mut eparams = [0u8; 256];
-        let Ok(eplen) = uproc_agg_emit_params(src, &ag, pkg, &mut eparams) else {
+        let Ok(eplen) = plan_agg_emit_params(src, &ag, pkg, &mut eparams) else {
             return (append(&mut *st_out, 0, b"error: params too large\n"), 1);
         };
         let mut ecode = [0u8; 512];
@@ -1281,16 +1279,16 @@ pub fn author_document(
         out_p = emit(&mut *st_out, out_p, ag.name.of(src), &digest);
     }
 
-    // ---- The Module itself: the deployment unit the artefacts belong to ----
+    // ---- The Plan itself: the deployment unit the artefacts belong to ------
     {
-        let mut refs = [ModuleRef {
+        let mut refs = [PlanEntry {
             package: &[],
             symbol: &[],
             kind: 0,
             digest: &[],
         }; MAX_ART];
         for k in 0..nrefs {
-            refs[k] = ModuleRef {
+            refs[k] = PlanEntry {
                 package: pkg,
                 symbol: rsym[k],
                 kind: rkind[k],
@@ -1298,7 +1296,7 @@ pub fn author_document(
             };
         }
         // Resource declarations become binding REQUIREMENTS the deployment must
-        // satisfy; `entry` declarations become the module's activatable surfaces.
+        // satisfy; `entry` declarations become the plan's activatable surfaces.
         const MAX_BIND: usize = 8;
         let mut binds = [BindingSpec {
             package: &[],
@@ -1351,10 +1349,10 @@ pub fn author_document(
         let header = HeaderSpec {
             package: pkg,
             symbol: _sym,
-            kind: KIND_MODULE,
+            kind: KIND_PLAN,
             capability: b"",
         };
-        let spec = ModuleSpec {
+        let spec = PlanSpec {
             source_revision: doc.provenance_revision.of(src),
             build_toolchain: if doc.provenance_toolchain.is_empty() {
                 b"chronicle".as_slice()
@@ -1363,7 +1361,7 @@ pub fn author_document(
             },
             provenance_class: PROVENANCE_LOCAL_BUILD,
         };
-        let Ok((_, mdigest)) = seal_module(
+        let Ok((_, pdigest)) = seal_plan(
             &mut *st_cont,
             &mut *st_scratch,
             &header,
@@ -1373,9 +1371,9 @@ pub fn author_document(
             &spec,
             &[],
         ) else {
-            return (append(&mut *st_out, 0, b"error: module seal failed\n"), 1);
+            return (append(&mut *st_out, 0, b"error: plan seal failed\n"), 1);
         };
-        out_p = emit(&mut *st_out, out_p, b"MODULE", &mdigest);
+        out_p = emit(&mut *st_out, out_p, b"PLAN", &pdigest);
     }
 
     if out_p == 0 {
@@ -1384,8 +1382,8 @@ pub fn author_document(
     (out_p, 0)
 }
 
-/// Build a deployment GRAPH from a `.uproc`: parse it, resolve the named pipeline
-/// to its stages, and emit the graph plan. Flat over caller buffers so the host
+/// Build a deployment GRAPH from a `.plan`: parse it, resolve the named pipeline
+/// to its graph stages, and emit the graph. Flat over caller buffers so the host
 /// harness drives it directly.
 #[allow(
     clippy::too_many_arguments,
@@ -1393,7 +1391,7 @@ pub fn author_document(
 )]
 pub fn graph_document(
     src: &[u8],
-    arena: &mut UprocArena,
+    arena: &mut PlanArena,
     st_prog: &mut [u8],
     st_code: &mut [u8],
     st_cont: &mut [u8],
@@ -1403,12 +1401,12 @@ pub fn graph_document(
     target: &[u8],
     bindings: &[ResourceBinding],
 ) -> (usize, i32) {
-    let doc = match uproc_parse(src, &mut *arena) {
+    let doc = match plan_parse(src, &mut *arena) {
         Ok(d) => d,
         Err(e) => {
-            let (line, col) = uproc_line_col(src, e.offset);
+            let (line, col) = plan_line_col(src, e.offset);
             let mut p = append(&mut *st_out, 0, b"error: ");
-            p = append_uproc_reason(&mut *st_out, p, e.kind);
+            p = append_plan_reason(&mut *st_out, p, e.kind);
             p = append(&mut *st_out, p, b" at line ");
             p = append_u32(&mut *st_out, p, line as u32);
             p = append(&mut *st_out, p, b" column ");
@@ -1418,7 +1416,7 @@ pub fn graph_document(
         }
     };
 
-    let Ok(slen) = uproc_schema_text(src, &doc, arena, &mut *st_prog) else {
+    let Ok(slen) = plan_schema_text(src, &doc, arena, &mut *st_prog) else {
         return (append(&mut *st_out, 0, b"error: schema too large\n"), 1);
     };
     let schema = &st_prog[..slen];
@@ -1438,8 +1436,8 @@ pub fn graph_document(
         return (p, 1);
     };
 
-    // Compile every stage into the plan. Stage IR accumulates end to end in
-    // `cont`; `plan[]` holds slices into it. Stage kinds are the executor's
+    // Compile every stage into its graph stage. Stage IR accumulates end to end in
+    // `cont`; `graph_stages[]` holds slices into it. Stage kinds are the executor's
     // (`STAGE_KIND_*`), plus `EFFECT` for a connector stage.
     const EFFECT: u8 = 0xff;
     let mut spans = [(0usize, 0usize); MAX_PIPELINE_STAGES];
@@ -1448,7 +1446,7 @@ pub fn graph_document(
     let mut effects = [None::<Connector>; MAX_PIPELINE_STAGES];
     let mut used = 0usize;
     let mut n_stages = 0usize;
-    let (pkg, _) = split_qname(doc.module.of(src));
+    let (pkg, _) = split_qname(doc.name.of(src));
 
     if pipe.n_stages as usize > MAX_PIPELINE_STAGES {
         return too_many_stages(&mut *st_out);
@@ -1624,19 +1622,19 @@ pub fn graph_document(
         }
     }
 
-    let mut plan = [PlanStage::Compute { stage_ir: b"" }; MAX_PIPELINE_STAGES];
+    let mut graph_stages = [GraphStage::Compute { stage_ir: b"" }; MAX_PIPELINE_STAGES];
     for i in 0..n_stages {
         let (off, len) = spans[i];
         let bytes = &st_cont[off..off + len];
-        plan[i] = match kinds[i] {
-            STAGE_KIND_COMPUTE => PlanStage::Compute { stage_ir: bytes },
-            STAGE_KIND_DECISION => PlanStage::Decision { container: bytes },
-            STAGE_KIND_MAP => PlanStage::Map { container: bytes },
+        graph_stages[i] = match kinds[i] {
+            STAGE_KIND_COMPUTE => GraphStage::Compute { stage_ir: bytes },
+            STAGE_KIND_DECISION => GraphStage::Decision { container: bytes },
+            STAGE_KIND_MAP => GraphStage::Map { container: bytes },
             // Resolved above from the deployment's bindings; an effect stage
             // without one cannot reach here, and is refused rather than
             // silently lowered as compute if it ever does.
             _ => match effects[i] {
-                Some(c) => PlanStage::Effect(c),
+                Some(c) => GraphStage::Effect(c),
                 None => {
                     return (
                         append(
@@ -1657,7 +1655,7 @@ pub fn graph_document(
         TargetProfile::embedded(target)
     };
     match lower_pipeline_with(
-        &plan[..n_stages],
+        &graph_stages[..n_stages],
         &profile,
         1000,
         &mut *st_out,
@@ -1956,7 +1954,7 @@ pub fn release_from_argv(
 
 // ── Deployment bindings ───────────────────────────────────────────────────
 //
-// A `.uproc` names the resources a pipeline needs and deliberately says
+// A `.plan` names the resources a pipeline needs and deliberately says
 // nothing about what serves them. This parses the other half — the
 // deployment's answer — from one argument, so a node can lower a document
 // with effects without a build host.

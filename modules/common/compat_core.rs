@@ -1,4 +1,4 @@
-// Semantic + structural diffing — deciding whether a new version of a module or
+// Semantic + structural diffing — deciding whether a new version of a plan or
 // a schema can replace the old one. A no_std, no-alloc core like activation's,
 // so it can run wherever activation does; no module mounts it, and the
 // chronicle_cli harness covers it.
@@ -11,7 +11,7 @@
 //
 // Two verdicts:
 //
-//   MODULE   — IDENTICAL when the recomputed digests match. BREAKING when an
+//   PLAN     — IDENTICAL when the recomputed digests match. BREAKING when an
 //              entry point disappears (callers lose a surface) or the new
 //              version requires a capability the old one did not (a stricter
 //              demand on the runtime, so a node that ran the old may not run the
@@ -31,17 +31,17 @@
 //
 // That permutation assumes the input is canonical protobuf (fields ascending by
 // number), which is what every producer in this system emits — the same
-// assumption `modsig_core`'s strip makes.
+// assumption `plansig_core`'s strip makes.
 //
-// Requires `pb_core` and `modsig_core`, plus the fluxor SDK `sha256`.
+// Requires `pb_core` and `plansig_core`, plus the fluxor SDK `sha256`.
 
-/// `CompatibilityLevel` (proto/unified/v1/common.proto).
+/// `CompatibilityLevel` (proto/chronicle/v1/common.proto).
 pub const COMPAT_UNSPECIFIED: i32 = 0;
 pub const COMPAT_IDENTICAL: i32 = 1;
 pub const COMPAT_COMPATIBLE: i32 = 2;
 pub const COMPAT_BREAKING: i32 = 3;
 
-/// Module: `capabilities = 11`, `entry_points = 12`.
+/// Plan: `capabilities = 11`, `entry_points = 12`.
 const F_ENTRY_POINTS: u32 = 12;
 /// `EntryPoint { name = 1, pipeline = 2 }`.
 const F_EP_NAME: u32 = 1;
@@ -94,11 +94,11 @@ impl From<VerifyError> for CompatError {
     }
 }
 
-// ------------------------------------------------------------------ modules
+// ------------------------------------------------------------------ plans
 
-/// Whether `name` appears as an entry-point name in `module`.
-fn has_entry_point(module: &[u8], name: &[u8]) -> Result<bool, CompatError> {
-    let mut r = PbR::new(module);
+/// Whether `name` appears as an entry-point name in `plan`.
+fn has_entry_point(plan: &[u8], name: &[u8]) -> Result<bool, CompatError> {
+    let mut r = PbR::new(plan);
     while let Some(f) = r.next_field()? {
         if f.number != F_ENTRY_POINTS || f.wire != WT_LEN {
             continue;
@@ -113,9 +113,9 @@ fn has_entry_point(module: &[u8], name: &[u8]) -> Result<bool, CompatError> {
     Ok(false)
 }
 
-/// Whether `name` is a REQUIRED capability of `module`.
-fn requires_capability(module: &[u8], name: &[u8]) -> Result<bool, CompatError> {
-    let mut r = PbR::new(module);
+/// Whether `name` is a REQUIRED capability of `plan`.
+fn requires_capability(plan: &[u8], name: &[u8]) -> Result<bool, CompatError> {
+    let mut r = PbR::new(plan);
     while let Some(f) = r.next_field()? {
         if f.number != F_CAPABILITIES || f.wire != WT_LEN {
             continue;
@@ -137,21 +137,21 @@ fn requires_capability(module: &[u8], name: &[u8]) -> Result<bool, CompatError> 
     Ok(false)
 }
 
-/// Compare two sealed Modules.
+/// Compare two sealed Plans.
 ///
-/// `scratch_a`/`scratch_b` each hold one module's pre-digest reconstruction and
-/// must be at least as large as the module they serve.
-pub fn module_compatibility(
+/// `scratch_a`/`scratch_b` each hold one plan's pre-digest reconstruction and
+/// must be at least as large as the plan they serve.
+pub fn plan_compatibility(
     old: &[u8],
     new: &[u8],
     scratch_a: &mut [u8],
     scratch_b: &mut [u8],
 ) -> Result<i32, CompatError> {
     // Identity is by recomputed digest, not by the carried one — the same
-    // reasoning as verification: a module that merely CLAIMS a digest proves
+    // reasoning as verification: a plan that merely CLAIMS a digest proves
     // nothing about its contents.
-    let da = module_recomputed_digest(old, scratch_a)?;
-    let db = module_recomputed_digest(new, scratch_b)?;
+    let da = plan_recomputed_digest(old, scratch_a)?;
+    let db = plan_recomputed_digest(new, scratch_b)?;
     if da == db {
         return Ok(COMPAT_IDENTICAL);
     }

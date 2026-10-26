@@ -1,22 +1,22 @@
-// Module signature verification, on device — what lets a node ACCEPT a module
+// Plan signature verification, on device — what lets a node ACCEPT a plan
 // rather than only author one, instead of trusting whoever hands it bytes.
 //
-// Given the canonical protobuf of a Module and a set of trusted signer keys, it
-// answers whether the module is genuinely what it claims to be and genuinely
+// Given the canonical protobuf of a Plan and a set of trusted signer keys, it
+// answers whether the plan is genuinely what it claims to be and genuinely
 // signed by someone trusted.
 //
 // TWO CHECKS, AND BOTH MATTER:
 //
 //   1. The digest is RECOMPUTED from the bytes and compared to the one the
-//      module carries. Skipping this would make the whole exercise theatre — an
+//      plan carries. Skipping this would make the whole exercise theatre — an
 //      attacker who can set `content_digest` to any value can sign that value
-//      and pass a signature check while the module's actual content says
+//      and pass a signature check while the plan's actual content says
 //      something else entirely.
 //   2. A signature over that digest verifies under a TRUSTED key. An untrusted
 //      signer is rejected even when the signature is cryptographically perfect.
 //
 // Recomputation works by STRIPPING rather than re-encoding. The digest is
-// defined over the module's canonical encoding with the header's `content_digest`
+// defined over the plan's canonical encoding with the header's `content_digest`
 // (field 1.7) cleared and every detached signature (field 14) omitted. So the
 // pre-digest bytes are recovered by copying every other field through
 // byte-for-byte — a re-encode could perturb bytes it was only meant to pass on,
@@ -27,7 +27,7 @@
 // Requires `pb_core` (the reader + writer) and the fluxor SDK `ed25519` +
 // `sha256`. The crypto is the SDK's, not ours — one owner for the repo set.
 
-/// Module field numbers (see `artefact_core::encode_module`).
+/// Plan field numbers (see `artefact_core::encode_plan`).
 const F_HEADER: u32 = 1;
 const F_SIGNATURES: u32 = 14;
 /// Header field number of the content digest (`artefact_core::pb_header`).
@@ -41,7 +41,7 @@ const DIGEST_ALGORITHM: &[u8] = b"sha256";
 const F_SIG_ALGORITHM: u32 = 1;
 const F_SIG_SIGNATURE: u32 = 2;
 const F_SIG_SIGNER: u32 = 3;
-/// `Capability { name = 1, optional = 2 }`, at Module field 11.
+/// `Capability { name = 1, optional = 2 }`, at Plan field 11.
 ///
 /// These live here rather than in each reader because BOTH `activation_core` and
 /// `compat_core` walk the capability list, and two copies of a field number are
@@ -59,11 +59,11 @@ pub const ALG_ED25519: &[u8] = b"ed25519";
 /// Why verification failed. Values, never panics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyError {
-    /// The bytes are not a well-formed Module.
+    /// The bytes are not a well-formed Plan.
     Malformed,
-    /// The module carries no `content_digest` to check against.
+    /// The plan carries no `content_digest` to check against.
     NoDigest,
-    /// The recomputed digest differs from the one the module carries — the
+    /// The recomputed digest differs from the one the plan carries — the
     /// content has been altered since it was sealed.
     DigestMismatch,
     /// No signature by a trusted signer verifies over the digest. Covers an
@@ -83,13 +83,13 @@ impl From<PbError> for VerifyError {
     }
 }
 
-/// Rebuild the PRE-DIGEST encoding of `module` into `out`, returning its length.
+/// Rebuild the PRE-DIGEST encoding of `plan` into `out`, returning its length.
 ///
 /// Every top-level field is copied through verbatim except the signatures, which
 /// are dropped, and the header, which is re-emitted without its content digest.
-pub fn module_predigest(module: &[u8], out: &mut [u8]) -> Result<usize, VerifyError> {
+pub fn plan_predigest(plan: &[u8], out: &mut [u8]) -> Result<usize, VerifyError> {
     let mut w = Pb::new(out);
-    let mut r = PbR::new(module);
+    let mut r = PbR::new(plan);
     while let Some(f) = r.next_field()? {
         match f.number {
             // Detached signatures sign the digest, so including them would make
@@ -114,9 +114,9 @@ pub fn module_predigest(module: &[u8], out: &mut [u8]) -> Result<usize, VerifyEr
     Ok(w.len())
 }
 
-/// The digest `module` CLAIMS: its header's `content_digest.value`.
-pub fn module_claimed_digest(module: &[u8]) -> Result<[u8; 32], VerifyError> {
-    let mut r = PbR::new(module);
+/// The digest `plan` CLAIMS: its header's `content_digest.value`.
+pub fn plan_claimed_digest(plan: &[u8]) -> Result<[u8; 32], VerifyError> {
+    let mut r = PbR::new(plan);
     while let Some(f) = r.next_field()? {
         if f.number != F_HEADER || f.wire != WT_LEN {
             continue;
@@ -145,9 +145,9 @@ pub fn module_claimed_digest(module: &[u8]) -> Result<[u8; 32], VerifyError> {
             }
             // The algorithm label is INSIDE the content-digest field, which
             // recomputation strips — so nothing else authenticates it, and a
-            // module whose label had been altered would otherwise verify
+            // plan whose label had been altered would otherwise verify
             // cleanly. Pinning it here is what makes every byte of a sealed
-            // module either signed or checked. Found by the property test that
+            // plan either signed or checked. Found by the property test that
             // perturbs each byte in turn.
             if algorithm != DIGEST_ALGORITHM {
                 return Err(VerifyError::Malformed);
@@ -160,17 +160,14 @@ pub fn module_claimed_digest(module: &[u8]) -> Result<[u8; 32], VerifyError> {
     Err(VerifyError::NoDigest)
 }
 
-/// Recompute the digest of `module` from its own bytes. `scratch` holds the
-/// pre-digest encoding and must be at least as large as `module`.
-pub fn module_recomputed_digest(
-    module: &[u8],
-    scratch: &mut [u8],
-) -> Result<[u8; 32], VerifyError> {
-    let n = module_predigest(module, scratch)?;
+/// Recompute the digest of `plan` from its own bytes. `scratch` holds the
+/// pre-digest encoding and must be at least as large as `plan`.
+pub fn plan_recomputed_digest(plan: &[u8], scratch: &mut [u8]) -> Result<[u8; 32], VerifyError> {
+    let n = plan_predigest(plan, scratch)?;
     Ok(sha256(&scratch[..n]))
 }
 
-/// Verify `module`: recompute its digest, check it against the one carried, then
+/// Verify `plan`: recompute its digest, check it against the one carried, then
 /// require a signature over it by one of `trusted`.
 ///
 /// Returns the index into `trusted` of the signer that verified — a caller
@@ -178,18 +175,18 @@ pub fn module_recomputed_digest(
 ///
 /// An empty `trusted` set rejects everything, which is the correct behaviour: a
 /// node that trusts nobody accepts nothing.
-pub fn module_verify(
-    module: &[u8],
+pub fn plan_verify(
+    plan: &[u8],
     trusted: &[[u8; 32]],
     scratch: &mut [u8],
 ) -> Result<usize, VerifyError> {
-    let claimed = module_claimed_digest(module)?;
-    let actual = module_recomputed_digest(module, scratch)?;
+    let claimed = plan_claimed_digest(plan)?;
+    let actual = plan_recomputed_digest(plan, scratch)?;
     if claimed != actual {
         return Err(VerifyError::DigestMismatch);
     }
 
-    let mut r = PbR::new(module);
+    let mut r = PbR::new(plan);
     while let Some(f) = r.next_field()? {
         if f.number != F_SIGNATURES || f.wire != WT_LEN {
             continue;

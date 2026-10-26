@@ -1,9 +1,9 @@
-# Multi-Version Modules
+# Multi-Version Pipelines
 
 ## Overview
 
 A single pipeline instance can hold several versions of its program at once and
-choose one **per record** — by default, or pinned by an `X-Module-Version` tag. A
+choose one **per record** — by default, or pinned by an `X-Pipeline-Version` tag. A
 version is a **content digest**, so the same tag resolves to the same bytecode on
 every instance in a fleet. A release is committed once to a replicated store and
 every instance converges to it. This lets a fleet run mixed versions during a
@@ -12,7 +12,7 @@ rollout without N×M separate deployments, and never serve the wrong version.
 ## Version selection
 
 Each record carries a version selector in reserved field `255` — the value of the
-`X-Module-Version` request header, threaded in at ingress. Per record the pipeline
+`X-Pipeline-Version` request header, threaded in at ingress. Per record the pipeline
 resolves it against its loaded [version table](../../modules/common/version_core.rs):
 
 - empty selector → the **default** version;
@@ -21,8 +21,8 @@ resolves it against its loaded [version table](../../modules/common/version_core
   load balancer retries another instance. An instance never silently runs a version
   it was not asked for.
 
-Selection is **per module** — a request can pin different versions of different
-pipelines independently (`X-Module-Version: orders=v2, enrich=green`).
+Selection is **per pipeline** — a request can pin different versions of different
+pipelines independently (`X-Pipeline-Version: orders=v2, enrich=green`).
 
 ## Hot reload
 

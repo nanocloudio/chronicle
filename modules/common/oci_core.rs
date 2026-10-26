@@ -30,14 +30,14 @@
 
 /// Media types — the `application/vnd.nanocloud.*` convention, matching the host
 /// so a bundle round-trips between them byte for byte.
-pub const MEDIA_TYPE_MODULE: &[u8] = b"application/vnd.nanocloud.unified.module.v1+pb";
-pub const MEDIA_TYPE_ARTEFACT: &[u8] = b"application/vnd.nanocloud.unified.artefact.v1+pb";
+pub const MEDIA_TYPE_PLAN: &[u8] = b"application/vnd.nanocloud.chronicle.plan.v1+pb";
+pub const MEDIA_TYPE_ARTEFACT: &[u8] = b"application/vnd.nanocloud.chronicle.artefact.v1+pb";
 pub const MEDIA_TYPE_MANIFEST: &[u8] = b"application/vnd.oci.image.manifest.v1+json";
 pub const MEDIA_TYPE_EMPTY: &[u8] = b"application/vnd.oci.empty.v1+json";
 
 /// Annotation keys (mirror `io.fluxor.provenance` / `io.fluxor.source-rev`).
-pub const ANNOTATION_PROVENANCE: &[u8] = b"io.nanocloud.unified.provenance";
-pub const ANNOTATION_SOURCE_REV: &[u8] = b"io.nanocloud.unified.source-rev";
+pub const ANNOTATION_PROVENANCE: &[u8] = b"io.nanocloud.chronicle.provenance";
+pub const ANNOTATION_SOURCE_REV: &[u8] = b"io.nanocloud.chronicle.source-rev";
 pub const ANNOTATION_NAME: &[u8] = b"org.opencontainers.image.ref.name";
 
 /// Store keys for the two named objects in an image layout.

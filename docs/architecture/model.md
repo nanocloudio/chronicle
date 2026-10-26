@@ -1,8 +1,10 @@
-# The Unified Deterministic Processing Model
+# The Deterministic Processing Model
 
 ## Overview
 
-Chronicle expresses a dataplane as a small set of **content-addressed artefacts**.
+Chronicle is a deterministic declarative process engine. A process is defined by a
+**plan**: a `.plan` document that compiles to a small set of **content-addressed
+artefacts**, sealed together as one Plan.
 Each artefact is a canonical Protobuf document whose identity is the digest of its
 own canonical bytes (with the digest field cleared). Logic is checked once, ahead
 of time, and lowered to bounded bytecode; the runtime executes that bytecode over a
@@ -26,25 +28,35 @@ Three foundations are load-bearing:
 | 4 | Decision | ordered rules → deterministic outcome | `decision.proto` |
 | 5 | Aggregation | stateful event-time computation (windows / watermarks / lanes) | `aggregation.proto` |
 | 6 | Pipeline | compose artefacts + effects into typed workflows | `pipeline.proto` |
-| 7 | Module | immutable OCI deployment / compatibility unit | `module.proto` |
+| 7 | Plan | immutable OCI deployment / compatibility unit: the other six, bundled | `plan.proto` |
 
 Two further protos — `common.proto` and `resource.proto` — are support types, not
-artefacts. The Protobuf package is `unified.v1`: the type namespace of the model
-(which unifies orchestration, deterministic state, and runtime distribution),
-distinct from `chronicle`, the engine that implements it.
+artefacts. The Protobuf package is `chronicle.v1`, the type namespace of the model.
+A Plan is published to an OCI store as a manifest whose plan layer is typed
+`application/vnd.nanocloud.chronicle.plan.v1+pb` and whose artefact layers are typed
+`application/vnd.nanocloud.chronicle.artefact.v1+pb`.
+
+A Chronicle plan is not a fluxor **owner plan**. Fluxor uses the word for the
+bounded binary device-graph plan its composer emits and its kernel applies
+(`FLXP` magic, delivered as `FLUXOR_PLAN=<file>`, kept by the node agent as
+`current.plan`): which owner holds which slot on one node. A Chronicle plan is a
+process definition — `.plan` text that opens with `plan <name> {`, or the sealed
+`chronicle.v1.Plan` it compiles to. The two never share a file: a Chronicle plan
+lowers to a fluxor graph, and an owner plan places graphs on a node. Where both
+appear, say "owner plan" for fluxor's.
 
 ## The build-time / runtime split
 
 The load-bearing choice is *where* checking happens.
 
 ```
-authoring (.uproc / CEL)  ─▶  canonical Protobuf artefacts  ─▶  content digest (identity)
+authoring (.plan / CEL)  ─▶  canonical Protobuf artefacts  ─▶  content digest (identity)
                                      │
    build time  ─────────────────────┤  descriptor closures + checked CEL, lowered to
                                      │  bounded no_std bytecode, packed into a module param
                                      ▼
    runtime     ─▶  generic Fluxor .fmod modules — bounded, no-alloc, deterministic —
-                    param-driven, distributed as OCI Module artefacts
+                    param-driven, distributed as OCI Plan artefacts
 ```
 
 Type-checking and CEL-checking run **once**, at build time, producing sealed
@@ -57,10 +69,10 @@ renders a runnable Fluxor graph whose params *are* the compiled programs.
 
 ## Content-digest identity
 
-Every artefact, and the Module that bundles them, is identified by the sha256 of
+Every artefact, and the Plan that bundles them, is identified by the sha256 of
 its canonical serialization. This is what makes distribution and versioning
-tractable: an OCI Module is fetched by digest and verified byte-for-byte; a
-[module version](versioning.md) is a digest, so the same tag resolves to the same
+tractable: an OCI Plan is fetched by digest and verified byte-for-byte; a
+[pipeline version](versioning.md) is a digest, so the same tag resolves to the same
 bytecode on every instance in a fleet. The one map field that appears inside a
 digested artefact (an Aggregation watermark override table) is encoded as a
 `BTreeMap`, so insertion order cannot perturb the digest.
@@ -92,4 +104,4 @@ but shipping sources lands in `modules/common/`.
 - [dataplane.md](dataplane.md) — the on-device modules and the record frame
 - [connectors.md](connectors.md) — the byte codecs and the transport
 - [versioning.md](versioning.md) — content-digest versions across a fleet
-- [../guides/authoring.md](../guides/authoring.md) — authoring artefacts in `.uproc`
+- [../guides/authoring.md](../guides/authoring.md) — authoring artefacts in `.plan`

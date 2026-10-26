@@ -1,7 +1,7 @@
 // The dynamic (server-side) compile path, on device — type-checking source
 // handed over at RUNTIME rather than compiled from a document at build time.
 //
-// The build-time flow gets its type environment from a `.uproc` document. This
+// The build-time flow gets its type environment from a `.plan` document. This
 // is the other entry point: a node holds a SCHEMA and type-checks source given
 // to it, emitting the same shippable checked IR the modules lower at load. A
 // source string checked here becomes a self-validating artefact there — the
@@ -9,7 +9,7 @@
 // out-of-band agreement on the opcode set.
 //
 // The "registry" is the schema TEXT (`Name{field:ty@N,...};…;ENUM=n`) that
-// `celc_core` already compiles against and `uproc_lower_core` already builds. A
+// `celc_core` already compiles against and `plan_lower_core` already builds. A
 // second in-memory catalog would be a second source of truth for the same
 // environment, so there isn't one — registering a schema means holding that
 // text, and this layer is the orchestration around it: bind the parameter, run
@@ -22,7 +22,7 @@
 // "it can run".
 //
 // Requires `celc_core` (the compiler), `lower_core` (IR -> bytecode for the
-// decision container), `pack_core` (the containers) and `uproc_lower_core`
+// decision container), `pack_core` (the containers) and `plan_lower_core`
 // (the parameter binding text).
 
 /// Why a dynamic compile was refused.
@@ -62,7 +62,7 @@ pub struct RuleSource<'a> {
 
 /// Build the `name:Type` parameter binding the compiler wants.
 ///
-/// `uproc_params_text` does this for the build-time path, but it binds SPANS
+/// `plan_params_text` does this for the build-time path, but it binds SPANS
 /// into a document buffer; the dynamic path has free-standing slices. The type
 /// name still goes through `schema_type_name`, so the one translation that
 /// matters (`string` -> `str`) has a single owner. Skipping it would not fail

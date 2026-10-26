@@ -3,7 +3,7 @@
 // truth. Lets one pipeline instance hold several versions of its program at once
 // (blue/green, canary) and pick one PER RECORD, so a fleet can run mixed versions
 // without separate deployments: a request pins a version by tag (the
-// `X-Module-Version` header, threaded into a reserved record field), or gets the
+// `X-Pipeline-Version` header, threaded into a reserved record field), or gets the
 // default. An unknown/unloaded version fails CLOSED (never silently runs the wrong
 // one). The table is mutable at runtime (hot reload) via `version_apply`.
 //
@@ -22,7 +22,7 @@ pub const VERSION_DIGEST_LEN: usize = 8;
 /// Maximum tag length (`v1`, `green`, `canary`, …).
 pub const VERSION_TAG_CAP: usize = 24;
 /// The reserved record field carrying the per-request version selector (the
-/// `X-Module-Version` value). Data fields are 1..=N; 255 is the envelope slot.
+/// `X-Pipeline-Version` value). Data fields are 1..=N; 255 is the envelope slot.
 pub const VERSION_SELECTOR_FIELD: u32 = 255;
 
 /// One version: a content digest, a human tag, and the program it runs (the
@@ -168,7 +168,7 @@ pub fn write_version_entry(
     Some(w)
 }
 
-/// Pull the version selector (the `X-Module-Version` value) out of a decoded
+/// Pull the version selector (the `X-Pipeline-Version` value) out of a decoded
 /// record's fields — the reserved field 255, if present — else an empty slice.
 pub fn version_selector<'a>(fields: &[Field<'a>]) -> &'a [u8] {
     let mut i = 0;

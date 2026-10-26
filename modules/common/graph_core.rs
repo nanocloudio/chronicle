@@ -5,7 +5,7 @@
 // document can now also emit the GRAPH that runs it: which modules to
 // instantiate, what params they carry, and how their ports connect.
 //
-// Whether a node should plan its OWN graph is a separate question — normally a
+// Whether a node should author its OWN graph is a separate question — normally a
 // node receives a graph rather than authoring one. What this enables is a node
 // authoring a graph for ANOTHER node: a controller that compiles a document and
 // hands the result to a fleet, with no Linux build host anywhere in the loop.

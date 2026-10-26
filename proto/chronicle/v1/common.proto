@@ -1,4 +1,4 @@
-// Common model shared by every artefact in the Unified Deterministic Processing
+// Common model shared by every artefact in the Deterministic Processing
 // Specification. Protobuf is the canonical type system; these messages ARE the
 // canonical representation of the common model. Authoring syntax (the DSL) is
 // non-normative and compiles to these messages.
@@ -9,7 +9,7 @@
 // in tag order, no unknown fields, packed repeated scalars).
 syntax = "proto3";
 
-package unified.v1;
+package chronicle.v1;
 
 // Content-addressed identity. Format mirrors OCI: `<algorithm>:<hex>`.
 message Digest {
@@ -37,7 +37,7 @@ enum ArtefactKind {
   ARTEFACT_KIND_DECISION = 4;
   ARTEFACT_KIND_AGGREGATION = 5;
   ARTEFACT_KIND_PIPELINE = 6;
-  ARTEFACT_KIND_MODULE = 7;
+  ARTEFACT_KIND_PLAN = 7;
   ARTEFACT_KIND_RESOURCE = 8;
 }
 
@@ -65,7 +65,7 @@ message CapabilityRequirement {
 }
 
 // Compatibility metadata for semantic + structural diffing (spec: COMMON MODEL,
-// MODULE). Semver plus an optional predecessor digest establishing a lineage.
+// PLAN). Semver plus an optional predecessor digest establishing a lineage.
 message CompatibilityMetadata {
   string semantic_version = 1;         // e.g. "1.4.0"
   Digest predecessor = 2;              // prior version's content digest, if any

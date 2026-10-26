@@ -37,7 +37,7 @@ graph author.
 
 ## How an effect binds
 
-A `.uproc` declares what a pipeline needs and never what serves it:
+A `.plan` declares what a pipeline needs and never what serves it:
 
 ```
 resource orders_store required;
@@ -68,11 +68,11 @@ are joined by `|`, so `|`, `,`, `;` and `=` cannot appear inside a value. No
 binding names a port: every provider takes requests on `request_in` and answers
 on `response_out`.
 
-The planner ([`plan_core.rs`](../../modules/common/plan_core.rs)) turns each
+The graph lowering ([`graph_lower_core.rs`](../../modules/common/graph_lower_core.rs)) turns each
 binding into a `Connector` — the graph node's `type:`, its store pin
 `<abi>/<provider>:<version>`, its method and its params. Each binding carries
 its own version tag because siblings release independently.
-`plan_provider_pins` lists the pins a plan needs: the module artifacts the
+`graph_provider_pins` lists the pins a pipeline's graph stages need: the module artifacts the
 composing project's `fluxor.lock` must hold, which it holds by declaring each
 provider's project under `[dependencies]` (`fluxor update` pins a dependency's
 modules). [`graph_core.rs`](../../modules/common/graph_core.rs) renders the
@@ -84,8 +84,8 @@ An effect is a request the pipeline node before it asks. That node becomes the
 the provider's `response_out` back to its `response_in`), and each answer
 continues the chain from its `result_out`. The provider hangs off its
 requester; it is not a link in the record chain. With no compute node free to
-carry the effect — the plan starts with it, or it follows a decision or another
-effect — the planner places a pipeline node with no stages to carry it. Every
+carry the effect — the pipeline starts with it, or it follows a decision or another
+effect — the lowering places a pipeline node with no stages to carry it. Every
 provider answers every request once, so a stage may follow any effect: after a
 query it reads the rows, after a publish an empty answer whose status is at
 field 253.
@@ -93,7 +93,7 @@ field 253.
 An unbound resource is refused as a deployment error; the document is not at
 fault for declining to name an endpoint.
 
-The plan suite (`tests/harness/tests/pipeline_suites/plan.rs`) pins the
+The graph-lowering suite (`tests/harness/tests/pipeline_suites/graph_lowering.rs`) pins the
 lowering, and `tools/e2e/graph.sh` asserts both halves — refusal without a
 binding, lowering with one — through the real `.fmod`.
 

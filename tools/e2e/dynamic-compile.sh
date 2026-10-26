@@ -4,7 +4,7 @@
 #   chronicle compile-source <schema> <param> <type> <source>   -> ir hex
 #   chronicle compile-stages <schema> <param> <type> <src>...   -> ir_stages hex
 #
-# Distinct from `author`/`graph`, which compile a `.uproc` DOCUMENT. Here a node
+# Distinct from `author`/`graph`, which compile a `.plan` DOCUMENT. Here a node
 # holds a schema and type-checks source it has never seen, handed over at
 # runtime. The result is the same shippable checked IR the modules lower at load,
 # so the target proves it can run it by lowering it — no opaque bytecode, and no

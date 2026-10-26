@@ -1,4 +1,4 @@
-# chronicle-unified project configuration consumed by the `fluxor` CLI.
+# chronicle project configuration consumed by the `fluxor` CLI.
 # See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
 
 [project]

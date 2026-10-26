@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# MODULE VERIFICATION without a Linux toolchain — a device deciding whether to
-# ACCEPT a module, not merely author one:
+# PLAN VERIFICATION without a Linux toolchain — a device deciding whether to
+# ACCEPT a plan, not merely author one:
 #
-#   chronicle verify <module_hex> <trusted_pubkey_hex>...
+#   chronicle verify <plan_hex> <trusted_pubkey_hex>...
 #
-# Two checks, both on device: the digest is RECOMPUTED from the module's own
+# Two checks, both on device: the digest is RECOMPUTED from the plan's own
 # bytes and compared to the one it carries, then an ed25519 signature over that
 # digest must verify under a trusted key. The crypto is the fluxor SDK's — the
 # repo set's single crypto owner — composed here, not reimplemented.
 #
-# The assertions that matter are the REJECTIONS. Accepting a good module proves
+# The assertions that matter are the REJECTIONS. Accepting a good plan proves
 # little; refusing a tampered body and an untrusted signer is the whole point,
 # so each is checked to fail for its own distinct reason.
 #
-# The fixtures are pinned: a signed Module and its key. They depend on the
+# The fixtures are pinned: a signed Plan and its key. They depend on the
 # encoder and the signing key, so a change to either needs them derived anew
 # from the format, not copied from what the applet now prints.
 . "$(dirname "$0")/../lib.sh"
@@ -28,8 +28,8 @@ build_graph packaging/applet/chronicle/linux.yaml || { no verify "cli build"; fi
 
 got=$(cli verify "$GOOD" "$KEY" 2>/dev/null | head -1)
 case "$got" in
-  ok:*) ok "verify accepts a module signed by a trusted key" ;;
-  *) no verify "good module rejected: '$got'" ;;
+  ok:*) ok "verify accepts a plan signed by a trusted key" ;;
+  *) no verify "good plan rejected: '$got'" ;;
 esac
 
 # Tampered body: caught by RECOMPUTATION, not by the signature — the signature
@@ -37,7 +37,7 @@ esac
 got=$(cli verify "$TAMPERED" "$KEY" 2>/dev/null | head -1)
 case "$got" in
   *"digest mismatch"*) ok "verify rejects a tampered body as a digest mismatch" ;;
-  *) no verify "tampered module not caught by digest: '$got'" ;;
+  *) no verify "tampered plan not caught by digest: '$got'" ;;
 esac
 
 # Valid signature, unknown signer.
@@ -51,7 +51,7 @@ esac
 if cli verify "$GOOD" 2>/dev/null | head -1 | grep -q '^error'; then
   ok "verify with no trusted keys accepts nothing"
 else
-  no verify "an empty trust set accepted a module"
+  no verify "an empty trust set accepted a plan"
 fi
 
 # Junk is a clean structured error, not a crash.

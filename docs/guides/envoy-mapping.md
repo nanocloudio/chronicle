@@ -5,7 +5,7 @@ Resource model. The scope is *semantics-first* — the artefact model and
 executable routing — not wire-level data-plane parity (xDS transport, SDS/SPIFFE,
 HTTP/2/3 load balancing, outlier detection).
 
-| Envoy concept | Unified artefact | Status |
+| Envoy concept | Chronicle artefact | Status |
 |---|---|---|
 | **Listener** | Resource contract (`RESOURCE_KIND_LISTENER`), bound to a Pipeline input | contract type ✓; binding model ✓ |
 | **Filter chain** | **Pipeline** | executable ✓ (the pipeline module) |
@@ -19,7 +19,7 @@ HTTP/2/3 load balancing, outlier detection).
 | **Circuit breaker** | Resource operational policy | modeled; runtime later |
 | **Rate limiting** | Decision + Aggregation + Resource | Decision ✓; Aggregation ✓ |
 | **Access logging** | Telemetry Resource (`RESOURCE_KIND_TELEMETRY`) | contract ✓ |
-| **xDS** | Module + Resource distribution binding | OCI Module ✓; live xDS transport later |
+| **xDS** | Plan + Resource distribution binding | OCI Plan ✓; live xDS transport later |
 
 ## Executable proof
 
