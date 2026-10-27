@@ -239,7 +239,8 @@ unsafe fn requester_step(s: &mut ModuleState, sys: &SyscallTable) {
             s.link_up = true;
             return;
         }
-        Answer::Partial => return,
+        // Another requester's answer on a fanned `response_in`.
+        Answer::Partial | Answer::Foreign => return,
         Answer::Aborted | Answer::TooLarge | Answer::Unknown => {
             s.answers_failed = s.answers_failed.wrapping_add(1);
             return;
@@ -634,6 +635,8 @@ mod pipe {
 /// Returns true when any stage is bad. A compute stage is scanned for unknown
 /// opcodes and truncation; a decision stage is scanned as a decision
 /// container. Skipping either would admit a program this build cannot run.
+/// A declared kind this build does not run (`stage_kind_known`; kind 3 is
+/// reserved) is bad outright, never scanned as compute.
 fn scan_kinded_versions(vbin: &[u8], kinds: &[u8]) -> bool {
     let Some(vt) = parse_version_table(vbin) else {
         return true;
@@ -647,14 +650,11 @@ fn scan_kinded_versions(vbin: &[u8], kinds: &[u8]) -> bool {
             let Some(st) = stage_at(prog, i) else {
                 return true;
             };
-            let decision = kinds.get(i).is_some_and(|k| *k == STAGE_KIND_DECISION);
-            let map = kinds.get(i).is_some_and(|k| *k == STAGE_KIND_MAP);
-            let bad = if decision {
-                scan_decision_container(st.code).is_err()
-            } else if map {
-                scan_map_container(st.code).is_err()
-            } else {
-                scan_code(st.code).is_err()
+            let bad = match kinds.get(i).copied().unwrap_or(STAGE_KIND_COMPUTE) {
+                STAGE_KIND_COMPUTE => scan_code(st.code).is_err(),
+                STAGE_KIND_DECISION => scan_decision_container(st.code).is_err(),
+                STAGE_KIND_MAP => scan_map_container(st.code).is_err(),
+                _ => true,
             };
             if bad {
                 return true;
@@ -683,13 +683,14 @@ impl StageEval for KindedEval {
         dst: &mut [u8],
         spent: &mut u64,
     ) -> Result<usize, PipeError> {
-        if stage.kind == STAGE_KIND_MAP {
-            return run_map_stage(stage.code, src, dst, spent);
+        match stage.kind {
+            STAGE_KIND_COMPUTE => run_stage_metered(stage, src, dst, spent),
+            STAGE_KIND_DECISION => run_decision_stage(stage, src, dst, spent),
+            STAGE_KIND_MAP => run_map_stage(stage.code, src, dst, spent),
+            // Refused at load (`scan_kinded_versions`, `lower_stages_kinded`);
+            // the fail-closed answer should one reach a record anyway.
+            other => Err(PipeError::StageEval(EvalError::BadOpcode(other))),
         }
-        if stage.kind != STAGE_KIND_DECISION {
-            return run_stage_metered(stage, src, dst, spent);
-        }
-        run_decision_stage(stage, src, dst, spent)
     }
 }
 
@@ -1104,6 +1105,9 @@ pub extern "C" fn module_new(
         s.in_id = ExchangeId::NONE;
         s.in_answered = false;
         s.inflight = Inflight::new();
+        // Its exchanges carry its own `request_out` handle, so requesters
+        // fanned into one provider each take only their own answers.
+        s.inflight.set_tag(s.req_out_chan.to_le_bytes());
         s.link_up = true;
         s.req_box = ExchangeOutbox::new();
         s.resp_box = ExchangeOutbox::new();

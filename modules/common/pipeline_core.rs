@@ -93,6 +93,17 @@ pub const STAGE_KIND_DECISION: u8 = 1;
 /// the per-element logic is ordinary expression bytecode (bytecode_policy.md,
 /// "constrained artefact kinds").
 pub const STAGE_KIND_MAP: u8 = 2;
+/// RESERVED, never reassigned: no stage runs as kind 3. A container that
+/// names it is refused at load like every kind this build does not run
+/// ([`stage_kind_known`]); it is never run as another kind.
+pub const STAGE_KIND_TRAFFIC: u8 = 3;
+
+/// Whether this build runs stages of `kind`. A stage whose kind is not
+/// declared is compute; a declared kind outside these is refused at load
+/// (`lower_stages_kinded`, the pipeline module's scan), never run as compute.
+pub fn stage_kind_known(kind: u8) -> bool {
+    kind == STAGE_KIND_COMPUTE || kind == STAGE_KIND_DECISION || kind == STAGE_KIND_MAP
+}
 
 /// Stages one pipeline node runs: the stage table it builds per record holds
 /// this many. The graph lowering refuses a run of compute and map stages

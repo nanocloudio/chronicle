@@ -40,5 +40,10 @@ check_fault expression examples/expression/linux.yaml \
   's|program: {hex: "[0-9a-f]*"}|program: {hex: "ff"}|'     "[expr] FAULT"
 check_fault pipeline   examples/pipeline/linux.yaml \
   's|ir_stages: {hex: "[0-9a-f]*"}|ir_stages: {hex: "ff"}|' "[pipeline] FAULT"
+# A sound container whose second stage names a kind this build does not run —
+# kind 3, reserved — fails the load; it is never run as compute.
+check_fault pipeline-kind examples/pipeline/linux.yaml \
+  's|^\(      ir_stages: {hex: "[0-9a-f]*"}\)$|\1\n      stage_kinds: {hex: "0003"}|' \
+  "[pipeline] FAULT: ir_stages container failed to lower"
 
 finish

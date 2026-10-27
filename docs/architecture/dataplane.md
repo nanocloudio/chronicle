@@ -99,6 +99,11 @@ names a different executor for a stage:
 | `00` compute | Transformation bytecode | the expression evaluator |
 | `01` decision | a [Decision](model.md) container | the first-hit policy driver |
 | `02` map | a map container (`MAP_HEADER` + a predicate) | the bounded map driver |
+| `03` | reserved — refused at load | none |
+
+Kind `03` is reserved: a container that names it, or any other kind this
+build does not run, fails the load whole (`stage_kind_known`) and is never run
+as compute. The value is never reassigned.
 
 A Decision is one input, one output and the same decode/evaluate/encode step a
 compute stage is; only the program format differs. Running it as a stage makes
@@ -111,7 +116,9 @@ format is unchanged and a container read on its own is all compute. Each kind
 is validated at load by its own scanner — an unknown opcode fails a compute
 stage, a malformed container fails a decision stage — and a stage whose kind is
 not declared is scanned as compute, so a decision body can never be admitted
-unchecked.
+unchecked. A declared kind this build does not run (`03` among them) fails the
+load whole (`LowerError::BadKind`, the module's FAULT); it is never run as
+another kind.
 
 A decision stage's body is copied through the lowering verbatim rather than
 transcoded, and its arms carry their own cost bounds; see `DECISION_STAGE_COST`

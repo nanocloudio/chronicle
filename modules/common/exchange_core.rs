@@ -281,6 +281,10 @@ pub enum Answer {
     TooLarge,
     /// A record for no exchange this pipeline has open.
     Unknown,
+    /// A record under another requester's tag: an answer to a requester
+    /// fanned into the same provider, whose answers reach every one of them.
+    /// Not this pipeline's to take, and no fault of the provider's.
+    Foreign,
     /// LINK_DOWN: every open exchange is now marked for replay.
     LinkDown(u32),
     /// LINK_UP: replays may be sent.
@@ -303,6 +307,9 @@ pub struct Answered<'a> {
 pub struct Inflight<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize> {
     slots: [Slot<CARRY, REQ, RESP>; SLOTS],
     next_id: u64,
+    /// Id bytes 8..12 of every exchange this requester opens
+    /// ([`Inflight::set_tag`]); zero untagged.
+    tag: [u8; 4],
 }
 
 impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize>
@@ -312,7 +319,23 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
         Inflight {
             slots: [Slot::EMPTY; SLOTS],
             next_id: 1,
+            tag: [0; 4],
         }
+    }
+
+    /// Name this requester's exchanges: `tag` rides in id bytes 8..12 of
+    /// every exchange it opens — the pipeline module gives the handle of its
+    /// own `request_out`, as Kagi's requesters do
+    /// (`tx_call_id`) — so several requesters fanned into one provider,
+    /// whose answers are fanned back to all of them, each take only their
+    /// own. Set before the first exchange opens.
+    pub fn set_tag(&mut self, tag: [u8; 4]) {
+        self.tag = tag;
+    }
+
+    /// Whether `id` is under this requester's tag (bytes 12.. zero).
+    fn mine(&self, id: &ExchangeId) -> bool {
+        id.0[8..12] == self.tag && id.0[12..].iter().all(|b| *b == 0)
     }
 
     /// Exchanges open.
@@ -342,7 +365,9 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
         s.id = id;
         s.carry[..carry.len()].copy_from_slice(carry);
         s.carry_len = carry.len() as u16;
-        Some((at, ExchangeId::from_u64(id)))
+        let mut eid = ExchangeId::from_u64(id);
+        eid.0[8..12].copy_from_slice(&self.tag);
+        Some((at, eid))
     }
 
     /// Where the reserved slot's request is written.
@@ -390,7 +415,7 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
 
     fn find(&self, id: &ExchangeId) -> Option<usize> {
         let n = id.as_u64();
-        if id.0[8..].iter().any(|b| *b != 0) {
+        if !self.mine(id) {
             return None;
         }
         self.slots.iter().position(|s| s.live && s.id == n)
@@ -416,6 +441,12 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
                 } else {
                     Answer::LinkUp
                 }
+            }
+            exchange::Record::Head(h) if !self.mine(&h.id) => Answer::Foreign,
+            exchange::Record::Body { id, .. } | exchange::Record::Abort { id, .. }
+                if !self.mine(&id) =>
+            {
+                Answer::Foreign
             }
             exchange::Record::Head(h) => {
                 let Some(at) = self.find(&h.id) else {

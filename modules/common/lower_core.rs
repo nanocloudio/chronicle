@@ -74,6 +74,10 @@ pub enum LowerError {
     /// trailer, so a count that disagrees with the body is refused rather
     /// than run as fewer stages than were written.
     TrailingBytes,
+    /// A declared stage kind this build does not run (`stage_kind_known`) —
+    /// kind 3, reserved, among them. Refused rather than lowered as compute:
+    /// a body written for another executor is not flat IR.
+    BadKind(u8),
 }
 
 /// The static cost is carried on the wire as a `u32`, and it is narrowed from the
@@ -274,7 +278,9 @@ pub fn lower_stages(ir_container: &[u8], out: &mut [u8]) -> Result<usize, LowerE
 ///
 /// `kinds` is parallel to the container and may be shorter or empty; an
 /// unnamed stage is compute, so a container alone lowers exactly as
-/// [`lower_stages`] does.
+/// [`lower_stages`] does. A NAMED kind this build does not run
+/// (`stage_kind_known`; kind 3 is reserved) fails the whole transcode with
+/// [`LowerError::BadKind`].
 pub fn lower_stages_kinded(
     ir_container: &[u8],
     kinds: &[u8],
@@ -303,6 +309,11 @@ pub fn lower_stages_kinded(
         // then backfill (cost, code_len) once `lower_flat` reports them.
         if wp + 7 > out.len() {
             return Err(LowerError::Overflow);
+        }
+        if let Some(k) = kinds.get(ip_stage) {
+            if !stage_kind_known(*k) {
+                return Err(LowerError::BadKind(*k));
+            }
         }
         let is_container = kinds
             .get(ip_stage)

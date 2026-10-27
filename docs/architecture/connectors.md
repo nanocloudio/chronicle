@@ -189,7 +189,11 @@ ever reads or writes a body.
   requester is never left waiting.
 - **Requester** (`request_out` + `response_in`). The result record is a request
   this node opens under an id of its own, asking `method` unless a mapped field
-  names one. Its **carry** (field 254, [the frame](dataplane.md#the-typed-record-frame))
+  names one. The id is a counter tagged with the handle of the node's own
+  `request_out` (bytes 8..12, as Kagi's requesters tag theirs),
+  so several requesters may be fanned into one provider and its
+  `response_out` fanned back to all of them: each takes only its own
+  answers and passes over the others' without counting them as faults. Its **carry** (field 254, [the frame](dataplane.md#the-typed-record-frame))
   stays in the node — a carry past `KEY_BUF` (512 B, 64 B on rp2040) is refused
   (`carry_refused`), never truncated. Each answer becomes a record on
   `result_out`: the body through `reply_decode` (without one, an empty body or
@@ -224,6 +228,23 @@ ever reads or writes a body.
 `tools/e2e/http-exchange.sh` and `tools/e2e/pipeline-chain.sh` prove the
 requester, publish, HTTP and provider roles live, with an oversized carry
 refused.
+
+## Fixed-width binary providers
+
+A provider whose requests and answers are fixed-width binary payloads rather
+than HTTP bodies is asked the same way: the graph gives the requester node an
+`encode` program that writes each field at its width (`INT` for an integer,
+`PAD` for a byte string zero-filled to a fixed slot and refused when longer)
+and a `reply_decode` program that reads the answer back into a record — see
+[wire-codec.md](../guides/wire-codec.md). Every pipeline of a plan that asks
+the same provider may share it: their requesters fan into its `request_in`
+and its `response_out` fans back to all of them, each taking only its own
+answers by its tag.
+
+`tests/harness` proves both pieces on the host: `PAD`'s fill, exact width
+and refusal (`tests/harness/tests/pipeline_suites/ser.rs`), and two tagged
+requesters on one provider, each taking its own answers and passing over the
+other's as `Foreign` (`tests/harness/tests/exchange_suites/exchange.rs`).
 
 ## Port vocabulary
 

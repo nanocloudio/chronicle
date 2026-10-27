@@ -46,6 +46,7 @@ A program is terminated by `ser::FINISH`.
 | `INT` | `width:u8`, `endian:u8` | pop an int → append as a binary integer |
 | `VARINT` | — | pop an int → append as a varint (an `Int` zig-zagged, a `Uint` unsigned) |
 | `LEN` | — | pop bytes/str → push `Int(byte length)` |
+| `PAD` | `width:u16` | pop bytes/str → append it, then zeros up to `width` bytes; longer than `width` is refused (`Overflow`), never clipped — a fixed-width slot such as a zone name, a zero-padded record, or an all-zero slot from an empty value |
 | `RGN_BEGIN` | — | open a region; the matching closer frames it |
 | `RGN_END` | — | close: merge into the parent region, no prefix |
 | `RGN_LEN` | `width:u8`, `endian:u8`, `delta:i8` | close: prepend a fixed-width length |

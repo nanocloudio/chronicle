@@ -74,6 +74,7 @@ pub mod ser {
     pub const FINISH: u8 = 0x6A; // terminator: result = the serialized bytes; `TypeError` while a region is still open
     pub const RGN_DECLEN: u8 = 0x6B; // prepend "<decimal len>\r\n" (RESP bulk header)
     pub const RGN_ZIGVARINT: u8 = 0x6C; // prepend zig-zag (signed) varint(len) (Kafka)
+    pub const PAD: u8 = 0x6D; // width:u16 LE — pop bytes/str → append it, then zeros up to `width` bytes (a fixed-width field: a zone name, a zero-padded record, an all-zero slot from an empty value); `Overflow` when it is longer than `width`
 }
 
 const SER_STACK: usize = 32;
@@ -263,6 +264,32 @@ pub fn eval_bytes<'a>(
                     }
                 }
                 put!(&buf[..width]);
+            }
+            ser::PAD => {
+                let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
+                let width = u16::from_le_bytes([b[0], b[1]]) as usize;
+                pc += 2;
+                let v = match pop!() {
+                    Value::Bytes(b) | Value::Frame(b) => b,
+                    Value::Str(s) => s.as_bytes(),
+                    _ => return Err(EvalError::TypeError),
+                };
+                // Longer than its slot is refused, never clipped: a clipped
+                // fixed-width field is a different value.
+                if v.len() > width {
+                    return Err(EvalError::Overflow);
+                }
+                if end + width > out.len() {
+                    return Err(EvalError::BuildOverflow);
+                }
+                put!(v);
+                // In bounds: `end + width` was checked before the value went in.
+                let mut k = v.len();
+                while k < width {
+                    out[end] = 0;
+                    end += 1;
+                    k += 1;
+                }
             }
             ser::VARINT => {
                 // A signed Int zig-zags; a Uint is already unsigned and writes
