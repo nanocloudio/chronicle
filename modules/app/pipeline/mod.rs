@@ -728,12 +728,12 @@ fn run_decision_stage(
 use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
     eval_decode_scratch, frame_len, is_data_field, lower_stages_kinded, parse_version_table,
-    pipeline_reload_kinded, record_id, request_fields, request_head, response_fields,
+    pipeline_reload_kinded, rd_frame, record_id, request_fields, request_head, response_fields,
     response_head, run_decision_metered, run_map_stage, run_stage_metered, run_stages_metered,
     run_stages_with, scan_code, scan_decision_container, scan_map_container, scan_version_table,
     stage_at, stage_count, version_selector_from_frame, Accounting, Admit, Answer, BlobIn, Builder,
-    EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError, Scratch, Stage,
-    StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD,
+    EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError, RdFrame, Scratch,
+    Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD,
     EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE,
     STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
 };
@@ -925,13 +925,26 @@ struct ModuleState {
     enc_len: u16,
     enc_out: [u8; ENC_BUF],
 
-    // Optional front-end decoder: a byte-deserialization program that parses a
-    // raw protocol chunk, or a collected request's body, into a record frame
-    // before the stages.
+    // Optional front-end decoder: a byte-deserialization program that parses
+    // the next record of the raw byte stream on `record_in` (`raw_intake`), or
+    // a collected request's body, into a record frame before the stages.
     dec_in: BlobIn,
     dec: [u8; PROG_BUF],
     dec_len: u16,
     dec_out: [u8; ENC_BUF],
+    /// `decode_len`: every raw record is this many bytes; `0`, the decode
+    /// program frames each record itself (`deser_core::rd_frame`).
+    dec_fixed: u32,
+    /// Raw bytes held in `in_buf` toward the next record — the rest of a read
+    /// that carried more than one record, or the start of one a later read
+    /// completes.
+    in_have: u16,
+    /// Bytes are being dropped to resynchronise on the next record: the
+    /// whole run of them is ONE rejected input.
+    hunting: bool,
+    /// Raw bytes dropped resynchronising: bytes that began no record, and a
+    /// buffer's worth that could not hold one.
+    resync_bytes: u32,
     /// Where a decode program builds values (`CAT`, `HEX` — a key assembled
     /// from parts, an identity as hex); reused per record.
     dec_scratch: [u8; DEC_SCRATCH],
@@ -1026,6 +1039,10 @@ define_params! {
     16, answer, u8, 0 => |s, d, len| { s.answer = p_u8(d, len, 0, 0) != 0; };
     // Answer each collected request with its status once its record resolves.
     17, ack, u8, 0 => |s, d, len| { s.ack = p_u8(d, len, 0, 0) != 0; };
+    // The width of every raw record on `record_in`, for a fixed-width
+    // producer; absent, the `decode` program frames each record by what it
+    // reads. Past the record buffer, or without `decode`: a FAULT.
+    18, decode_len, u32, 0 => |s, d, len| { s.dec_fixed = p_u32(d, len, 0, 0); };
 }
 
 #[no_mangle]
@@ -1083,6 +1100,10 @@ pub extern "C" fn module_new(
         s.enc_len = 0;
         s.dec_in = BlobIn::new();
         s.dec_len = 0;
+        s.dec_fixed = 0;
+        s.in_have = 0;
+        s.hunting = false;
+        s.resync_bytes = 0;
         s.ver_in = BlobIn::new();
         s.vbin_len = 0;
         s.kinds_in = BlobIn::new();
@@ -1291,6 +1312,9 @@ pub extern "C" fn module_new(
         if relay_req && m.id == 0 {
             fault = b"[pipeline] FAULT: a relay needs an id field";
         }
+        if s.dec_fixed > 0 && (s.dec_len == 0 || s.dec_fixed as usize > REC_BUF) {
+            fault = b"[pipeline] FAULT: decode_len needs decode and fits one record";
+        }
         s.acct = Accounting::default();
         if !fault.is_empty() {
             s.vbin_len = 0;
@@ -1377,6 +1401,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             tlm_counter(sys, midx, t, b + 14, s.relayed as u64);
             tlm_counter(sys, midx, t, b + 15, s.carry_refused as u64);
             tlm_counter(sys, midx, t, b + 16, s.over_bound as u64);
+            tlm_counter(sys, midx, t, b + 17, s.resync_bytes as u64);
         }
 
         // 0. A held exchange record goes before anything else: every answer,
@@ -1489,8 +1514,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 3. Admit ONE input unit: a whole collected request (provider), a
         //    request HEAD to rewrite (relay), or a record on `record_in` —
         //    mode (a) no decoder: a whole typed frame, peeked whole; mode (b)
-        //    decoder: a raw protocol chunk decoded to one frame (no partial-read
-        //    state — a message split across reads fails the decode, counted).
+        //    decoder: the next record of a raw byte stream, framed by the
+        //    decoder or by `decode_len` (`raw_intake`).
         let frame_ptr: *const u8;
         let frame_bytes: usize;
         if relay_req {
@@ -1510,26 +1535,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 None => return 0,
             }
         } else if s.dec_len > 0 {
-            if !readable(sys, s.in_chan) {
-                return 0;
-            }
-            let n = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr(), REC_BUF);
-            if n <= 0 {
-                return 0;
-            }
-            let raw_len = n as usize;
-            // A raw protocol chunk accepted for processing is one admitted record.
-            s.acct.admit_input(raw_len as u64);
-            let inp = core::slice::from_raw_parts(s.in_buf.as_ptr(), raw_len);
-            match decode_into(s, inp) {
+            match raw_intake(s, sys) {
                 Some(rl) => {
                     frame_ptr = s.dec_out.as_ptr();
                     frame_bytes = rl;
                 }
-                None => {
-                    record_failed(s, sys);
-                    return 0;
-                }
+                None => return 0,
             }
         } else {
             let inch = SysChan::new(sys, s.in_chan);
@@ -1875,21 +1886,118 @@ unsafe fn emit_answer(s: &mut ModuleState, sys: &SyscallTable, out_len: usize, r
     }
 }
 
-/// Run the ingress decoder over `inp`, leaving the record frame in `dec_out`.
-/// `None` when it cannot become one record — including a payload that builds
-/// more fields than the table holds, counted `over_bound`.
+/// The most bytes one step drops resynchronising before it yields: a run of
+/// garbage is worked through a bounded slice at a time, never in one step.
+const RESYNC_STEP: usize = 64;
+
+/// The next record of the raw byte stream on `record_in`, decoded into
+/// `dec_out` as a record frame and admitted; `None` when there is none to
+/// process this step.
+///
+/// Bytes are held in `in_buf` across reads (`in_have`), and the decoder
+/// frames records out of what is held (`deser_core::rd_frame`): several
+/// records in one read are decoded one per step, in order, before the channel
+/// is read again; a record split across reads waits for the rest. Only when
+/// the held bytes cannot yield a record is the channel read, once a step.
+///
+/// What is not a record is accounted, never silently lost:
+///   * a fixed-width record (`decode_len`) the program refuses is admitted
+///     and failed, and its bytes dropped whole, keeping the next aligned;
+///   * a byte no record starts with is dropped and decoding resumes at the
+///     next (resync); a run of them, up to the record that ends it, is ONE
+///     rejected input, its bytes counted in `resync_bytes`;
+///   * held bytes that fill the buffer without completing a record are
+///     dropped whole and counted `over_bound`; what follows is resynchronised
+///     on in the same run.
 #[inline(never)]
-unsafe fn decode_into(s: &mut ModuleState, inp: &[u8]) -> Option<usize> {
-    let mut b = Builder::new();
-    let dec = core::slice::from_raw_parts(s.dec.as_ptr(), s.dec_len as usize);
-    let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
-    if let Err(e) = eval_decode_scratch(dec, inp, scr, &mut b, 100_000) {
-        if e == EvalError::BuildOverflow {
-            s.over_bound = s.over_bound.wrapping_add(1);
+unsafe fn raw_intake(s: &mut ModuleState, sys: &SyscallTable) -> Option<usize> {
+    let mut read = false;
+    let mut dropped = 0usize;
+    loop {
+        let have = s.in_have as usize;
+        let mut b = Builder::new();
+        let dec = core::slice::from_raw_parts(s.dec.as_ptr(), s.dec_len as usize);
+        let held = core::slice::from_raw_parts(s.in_buf.as_ptr(), have);
+        let scr = core::slice::from_raw_parts_mut(s.dec_scratch.as_mut_ptr(), DEC_SCRATCH);
+        let framed = rd_frame(
+            dec,
+            held,
+            s.dec_fixed as usize,
+            REC_BUF,
+            scr,
+            &mut b,
+            100_000,
+        );
+        match framed {
+            RdFrame::Record(n) => {
+                let frame = encode_frame(&b.message(), &mut s.dec_out);
+                take_held(s, n);
+                s.hunting = false;
+                s.acct.admit_input(n as u64);
+                return match frame {
+                    Ok(fl) => Some(fl),
+                    Err(_) => {
+                        record_failed(s, sys);
+                        None
+                    }
+                };
+            }
+            RdFrame::Malformed(n, e) => {
+                if e == EvalError::BuildOverflow {
+                    s.over_bound = s.over_bound.wrapping_add(1);
+                }
+                take_held(s, n);
+                if s.dec_fixed > 0 {
+                    s.acct.admit_input(n as u64);
+                    record_failed(s, sys);
+                    return None;
+                }
+                resync_drop(s, n);
+                dropped += n;
+                if dropped >= RESYNC_STEP {
+                    return None;
+                }
+            }
+            RdFrame::Overflow => {
+                s.over_bound = s.over_bound.wrapping_add(1);
+                take_held(s, have);
+                resync_drop(s, have);
+                return None;
+            }
+            RdFrame::Need => {
+                if read || have >= REC_BUF || !readable(sys, s.in_chan) {
+                    return None;
+                }
+                read = true;
+                let n =
+                    (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr().add(have), REC_BUF - have);
+                if n <= 0 {
+                    return None;
+                }
+                s.in_have = (have + n as usize) as u16;
+            }
         }
-        return None;
     }
-    encode_frame(&b.message(), &mut s.dec_out).ok()
+}
+
+/// Drop the first `n` held bytes, keeping the rest at the front.
+fn take_held(s: &mut ModuleState, n: usize) {
+    let have = s.in_have as usize;
+    let n = n.min(have);
+    s.in_buf.copy_within(n..have, 0);
+    s.in_have = (have - n) as u16;
+}
+
+/// Account `n` raw bytes dropped resynchronising: the first of a run is a
+/// rejected input, the rest of the run only bytes.
+fn resync_drop(s: &mut ModuleState, n: usize) {
+    if s.hunting {
+        s.acct.bytes_in = s.acct.bytes_in.wrapping_add(n as u64);
+    } else {
+        s.hunting = true;
+        s.acct.reject_input(n as u64);
+    }
+    s.resync_bytes = s.resync_bytes.wrapping_add(n as u32);
 }
 
 /// Run the trailing encoder over the record in `out_buf`, leaving the bytes in

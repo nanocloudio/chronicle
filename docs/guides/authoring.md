@@ -89,6 +89,41 @@ EXPR          := <the CEL subset of celc_core, captured verbatim>
 `//` line comments are allowed anywhere. Rule priorities are assigned by
 declaration order (earlier binds tighter), matching the `first` hit policy.
 
+## Absence, faults and `&&` / `||`
+
+An expression meets two kinds of trouble at run time, and `&&` / `||` resolve
+both the way CEL does — commutatively, whichever side it is on:
+
+- **Absence.** A field the record does not carry is *unknown*, and so is
+  anything computed from it (a comparison, arithmetic, a builtin). `has(x)`
+  asks about presence without being undone by it.
+- **Faults.** Integer division or remainder by zero, a result outside `int`
+  (overflow), a value of the wrong type, selecting into something that is not
+  a message.
+
+`false && e` is `false` and `true || e` is `true` whatever `e` is — unknown or
+faulted — and so are `e && false` and `e || true`. So a guard protects what it
+guards, in either order:
+
+```
+b.rate > 0 && b.used / b.rate > 10      // rate 0: false, not a division fault
+b.rate == 0 || b.used / b.rate < 5      // rate 0: true
+```
+
+When the other side does not decide, the result is unknown if either side is
+unknown (unknowns take precedence over faults), otherwise the fault — the left
+operand's when both fault. A decision whose `when` ends unknown or faulted decides
+nothing: it fails closed — no later rule and no default fires — with its
+reason (an absent field, or the fault). A fault anywhere else — under an arithmetic or comparison
+operator with no `&&` / `||` above it, in a constructed field, in a `cel.bind`
+value — is raised where it happens, unchanged.
+
+Both operands are evaluated: there is no branching in the VM, so a guarded side
+still costs its instructions (within the program's derived cost bound) — it
+just cannot fail the expression. The compiled program is the same as before;
+the VM carries a fault on the stack slot it would have filled until an `&&` /
+`||` absorbs it or it reaches the result.
+
 ## Guarantees
 
 - **Deterministic identity** — identical source ⇒ identical plan + artefact

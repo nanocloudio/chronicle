@@ -129,6 +129,8 @@ metrics = [
     # Records forwarded untouched as a relay; records whose carry did not fit;
     # records refused for exceeding the field table or a map stage's maximum.
     "relayed", "carry_refused", "over_bound",
+    # Raw bytes dropped resynchronising a decoded byte stream on `record_in`.
+    "resync_bytes",
 ]
 
 # The sink role's terms. `transport`: a 200 means the record's output was

@@ -96,6 +96,42 @@ A program is terminated by `op::FINISH_MSG`.
 | `SET_FIELD` | `n:u32` | pop a value into a record field |
 | `FINISH_MSG` | — | terminate |
 
+### Raw-stream framing (`record_in`)
+
+On a `pipeline`'s `record_in`, `decode` reads a raw byte STREAM: a channel read
+may carry several records, or part of one. The node holds bytes across reads
+and frames records out of them (`deser_core::rd_frame`), so the records decoded
+are the same, in the same order, however the stream was cut:
+
+- **The program frames** (default). A record is exactly the bytes the
+  program's reads advance over; what follows stays held for the next record.
+  A read past the held bytes — `TAKE`/`TAKEN`/`INT`/`LIT`/`SKIP` short,
+  `UNTIL`/`SEEK` not finding their bytes, an HTTP/2 frame not all there —
+  means the record is incomplete: it waits for the next read and is decoded
+  again from its start. A stream codec therefore ends each record on something
+  that must be there — a length, a delimiter, a literal. `REST`, `UNTIL_OPT`
+  and a final `DECINT` are tolerant of the end and end the record where the
+  held bytes end, which suits a datagram edge, never a stream.
+- **`decode_len: N`** declares fixed-width records: every record is exactly
+  `N` bytes, it waits until all `N` are held, and the program reads within
+  them — bytes it leaves unread are still that record's (padding, a field the
+  plan does not use). `N` past the record buffer, or without `decode`, is a
+  configuration fault.
+
+What is not a record is dropped and counted, never passed on and never
+silently lost:
+
+| condition | rule | counted |
+|---|---|---|
+| fixed-width record the program refuses | its `N` bytes dropped whole, so the next stays aligned | admitted, `inputs_failed` |
+| a byte no record starts with (the program fails other than by running short, or reads nothing) | that byte dropped, decoding resumes at the next (resync); at most 64 bytes a step | a run of them up to the next record is ONE `inputs_rejected`; its bytes in `resync_bytes` |
+| held bytes fill the record buffer and still do not complete a record | all of them dropped; what follows is resynchronised on in the same run | `over_bound`, and the run as above |
+| a record that builds more fields than the table holds | refused as malformed (above) | also `over_bound` |
+
+Resynchronising is only as good as what the program checks: a codec that
+starts each record with a literal (a magic, a version byte) finds the next
+record after garbage; a bare length prefix reads garbage as a length.
+
 Both VMs are bounded and never-panic: malformed input returns a structured error,
 proven by the deterministic fuzzing in
 [`robustness.rs`](../../tests/harness/tests/aggregation_suites/robustness.rs).

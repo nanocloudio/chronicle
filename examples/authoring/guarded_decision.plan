@@ -1,0 +1,30 @@
+// A decision whose rules GUARD a divisor with `&&` / `||`.
+//
+// `u.used / u.rate` faults when the rate is 0, and the guard beside it decides
+// the rule without it: `false && fault` is false, `true || fault` is true, in
+// either order (CEL's commutative error semantics — docs/guides/authoring.md).
+// tools/e2e/guarded-decision.sh lowers this document on device and drives a
+// zero rate through the running graph.
+plan t.guarded {
+
+  message t.Usage {
+    id: string = 1;
+    rate: int = 2;
+    used: int = 3;
+  }
+
+  decision classify(u: t.Usage) -> t.Usage {
+    when u.rate > 0 && u.used / u.rate > 10 -> t.Usage { id: u.id, rate: u.rate, used: 1 };
+    when u.used / u.rate < 0 || u.rate == 0 -> t.Usage { id: u.id, rate: u.rate, used: 2 };
+    default -> t.Usage { id: u.id, rate: u.rate, used: 0 };
+  }
+
+  pipeline process(u: t.Usage) -> t.Usage {
+    call c = classify(u);
+    return c;
+  }
+
+  entry process = process;
+
+  provenance revision "example" toolchain "chronicle";
+}

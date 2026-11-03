@@ -1341,6 +1341,95 @@ pub fn eval_decode_scratch<'a>(
     builder: &mut Builder<'a>,
     max_cost: u64,
 ) -> Result<(), EvalError> {
+    let mut short = false;
+    rd_run(code, input, scratch, builder, max_cost, &mut short).map(|_| ())
+}
+
+/// What a decode program makes of the bytes a raw intake holds for it
+/// ([`rd_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdFrame {
+    /// One record, built into the builder; it is the first `n` held bytes.
+    Record(usize),
+    /// The held bytes begin a record they do not yet complete: keep them and
+    /// read more.
+    Need,
+    /// The held bytes do not begin a record the program reads: drop the first
+    /// `n` and decode again (one byte with stream framing, the whole slot with
+    /// a fixed width), for the reason given.
+    Malformed(usize, EvalError),
+    /// The held bytes fill the intake's buffer and still do not complete a
+    /// record: it cannot be held whole.
+    Overflow,
+}
+
+/// Frame ONE record at the front of `held`, a raw byte stream's buffered
+/// bytes, and build it into `builder`.
+///
+/// `fixed` is the record's declared width (`decode_len`). Zero means the
+/// program frames the record itself: the record is exactly the bytes its reads
+/// advance over, and what follows stays held for the next one — so a stream
+/// read in arbitrary pieces decodes the same records, in order, whether a read
+/// carries several or a part of one. A read that runs past the held bytes
+/// (`take`, `UNTIL`, `SEEK`, a length past the end) means the record is not
+/// all here yet ([`RdFrame::Need`]) — unless `held` already fills `cap`, the
+/// largest record the intake can hold ([`RdFrame::Overflow`]). A program that
+/// fails on its input any other way, or reads nothing, is a byte that starts
+/// no record ([`RdFrame::Malformed`] of one): dropping it and decoding again
+/// resynchronises on the next record the program recognises. A reader that is
+/// tolerant of the end (`REST`, `UNTIL_OPT`, a final `DECINT`) ends the record
+/// where the held bytes end, so a stream codec ends each record on something
+/// that must be there — a length, a delimiter, a literal.
+///
+/// A nonzero `fixed` makes every record exactly that many bytes: the program
+/// reads within one record's bytes (what it leaves unread is still that
+/// record's), a record waits until all of it is held, and one the program
+/// refuses is dropped whole, so the next record keeps its alignment.
+pub fn rd_frame<'a>(
+    code: &'a [u8],
+    held: &'a [u8],
+    fixed: usize,
+    cap: usize,
+    scratch: &'a mut [u8],
+    builder: &mut Builder<'a>,
+    max_cost: u64,
+) -> RdFrame {
+    let mut short = false;
+    if fixed > 0 {
+        let Some(record) = held.get(..fixed) else {
+            return if fixed > cap {
+                RdFrame::Overflow
+            } else {
+                RdFrame::Need
+            };
+        };
+        return match rd_run(code, record, scratch, builder, max_cost, &mut short) {
+            Ok(_) => RdFrame::Record(fixed),
+            Err(e) => RdFrame::Malformed(fixed, e),
+        };
+    }
+    if held.is_empty() {
+        return RdFrame::Need;
+    }
+    match rd_run(code, held, scratch, builder, max_cost, &mut short) {
+        Ok(0) => RdFrame::Malformed(1, EvalError::TypeError),
+        Ok(n) => RdFrame::Record(n),
+        Err(_) if short && held.len() >= cap => RdFrame::Overflow,
+        Err(_) if short => RdFrame::Need,
+        Err(e) => RdFrame::Malformed(1, e),
+    }
+}
+
+/// The decode VM. `Ok` is how many input bytes the program's reads advanced
+/// over; `short` is set when it failed by reading past the end of `input`.
+fn rd_run<'a>(
+    code: &'a [u8],
+    input: &'a [u8],
+    scratch: &'a mut [u8],
+    builder: &mut Builder<'a>,
+    max_cost: u64,
+    short: &mut bool,
+) -> Result<usize, EvalError> {
     let mut free: &'a mut [u8] = scratch;
     let mut locals: [Value<'a>; MAX_LOCALS] = [Value::Null; MAX_LOCALS];
     let mut stack: [Value<'a>; DEC_STACK] = [Value::Null; DEC_STACK];
@@ -1370,10 +1459,10 @@ pub fn eval_decode_scratch<'a>(
     macro_rules! take {
         ($n:expr) => {{
             let n = $n;
-            let slice = pos
-                .checked_add(n)
-                .and_then(|end| input.get(pos..end))
-                .ok_or(EvalError::Truncated)?;
+            let Some(slice) = pos.checked_add(n).and_then(|end| input.get(pos..end)) else {
+                *short = true;
+                return Err(EvalError::Truncated);
+            };
             pos += n;
             slice
         }};
@@ -1398,7 +1487,7 @@ pub fn eval_decode_scratch<'a>(
         }
 
         match opcode {
-            op::FINISH_MSG => return Ok(()),
+            op::FINISH_MSG => return Ok(pos),
             // A literal — a key separator, a scheme prefix — to build with.
             op::PUSH_STR => {
                 let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
@@ -1679,6 +1768,7 @@ pub fn eval_decode_scratch<'a>(
                     pos += 1;
                 }
                 if pos >= input.len() {
+                    *short = true;
                     return Err(EvalError::Truncated);
                 }
                 let slice = &input[start..pos];
@@ -1714,7 +1804,10 @@ pub fn eval_decode_scratch<'a>(
                     _ => return Err(EvalError::TypeError),
                 };
                 // A count past the address space is more than the input holds.
-                let n = usize::try_from(n).map_err(|_| EvalError::Truncated)?;
+                let Ok(n) = usize::try_from(n) else {
+                    *short = true;
+                    return Err(EvalError::Truncated);
+                };
                 push!(Value::Bytes(take!(n)));
             }
             rd::INT => {
@@ -1762,7 +1855,8 @@ pub fn eval_decode_scratch<'a>(
                     pos += 1;
                 }
                 if !found {
-                    return Err(EvalError::Truncated); // sequence not present
+                    *short = true;
+                    return Err(EvalError::Truncated); // sequence not present (yet)
                 }
             }
             rd::REST => {
@@ -1779,14 +1873,18 @@ pub fn eval_decode_scratch<'a>(
                 // A PADDED DATA frame, or a message whose compressed flag is set,
                 // is refused (`TypeError`): neither is read as plain protobuf.
                 loop {
-                    let hdr = input.get(pos..pos + 9).ok_or(EvalError::Truncated)?;
+                    let Some(hdr) = input.get(pos..pos + 9) else {
+                        *short = true;
+                        return Err(EvalError::Truncated);
+                    };
                     let flen =
                         ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
                     let ftype = hdr[3];
                     let body_start = pos + 9;
-                    let body = input
-                        .get(body_start..body_start + flen)
-                        .ok_or(EvalError::Truncated)?;
+                    let Some(body) = input.get(body_start..body_start + flen) else {
+                        *short = true;
+                        return Err(EvalError::Truncated);
+                    };
                     pos = body_start + flen;
                     if ftype == 0x00 {
                         // DATA frame: parse the single length-prefixed gRPC message.
@@ -1855,6 +1953,8 @@ pub fn eval_decode_scratch<'a>(
                     any = true;
                 }
                 if !any {
+                    // No digit yet at the end of the input: one may follow.
+                    *short = input.get(pos).is_none();
                     return Err(EvalError::TypeError);
                 }
                 push!(Value::Int(v));

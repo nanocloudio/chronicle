@@ -1,0 +1,26 @@
+# SELF-FRAMED RAW RECORDS — a stream codec whose own reads delimit each record:
+# a sync byte `R`, a u8 length, that many bytes.
+#
+# The record is exactly what the program reads; what follows stays held for
+# the next one. Several records in one read decode in order, a record split
+# across reads waits for the rest, and bytes that start no record are dropped
+# one at a time until the sync byte lines up again (counted `resync_bytes`,
+# each run one rejected input). `encode` writes each record's body as a line.
+#
+#   printf 'R\x02abR\x03cde' | fluxor run examples/raw_stream/framed.yaml   # ab\ncde\n
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: pipeline
+    params:
+      # LIT "R", INT 1, TAKEN, SET_FIELD 1, FINISH_MSG.
+      decode: {hex: "7101005275010174400100000041"}
+      # field 1, VAL, LIT "\n", FINISH.
+      encode: {hex: "01000201000000616001000a6a"}
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

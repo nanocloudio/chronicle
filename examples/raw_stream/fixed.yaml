@@ -1,0 +1,27 @@
+# FIXED-WIDTH RAW RECORDS — a producer that writes records of a declared width
+# on a byte stream, read however the stream happens to be cut.
+#
+# `decode_len: 8` makes every record exactly eight bytes: a u32 LE amount the
+# program reads, then four bytes of padding it never does. Two records in one
+# read decode as two; a record split over two reads decodes once its last byte
+# arrives. `encode` writes each record's amount as a line of text.
+#
+#   printf '\x07\x00\x00\x00pad.\x09\x00\x00\x00pad.' \
+#     | fluxor run examples/raw_stream/fixed.yaml          # 7\n9\n
+target: linux
+tick_us: 100
+platform:
+  cli: {}
+modules:
+  - name: pipeline
+    params:
+      # INT 4 LE, SET_FIELD 1, FINISH_MSG.
+      decode: {hex: "750401400100000041"}
+      decode_len: 8
+      # field 1, VAL, LIT "\n", FINISH.
+      encode: {hex: "01000201000000616001000a6a"}
+wiring:
+  - from: cli_in.stdin_out
+    to: pipeline.record_in
+  - from: pipeline.result_out
+    to: cli_out.bytes_in

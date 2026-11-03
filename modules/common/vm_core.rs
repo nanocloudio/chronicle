@@ -360,6 +360,21 @@ fn eval_in<'a>(
         }};
     }
 
+    // CEL's commutative error semantics for `&&` / `||`: a FAULT in one
+    // operand (`absorbable`) is absorbed when the other operand decides —
+    // `false && 1/0 > 0` is false, `1/0 > 0 || true` is true, in either
+    // order. A fault whose slot an `&&`/`||` may consume (`reaches_logic`, a
+    // walk of the straight-line code that follows) is held as a pending
+    // fault on that stack slot (`fault`, the slot's value a `Null`
+    // placeholder) and evaluation goes on; any other op that consumes a
+    // pending slot propagates it to its own result, unexecuted; the
+    // `&&`/`||` that consumes it absorbs it when decided, and otherwise
+    // leaves its result faulted. A fault that nothing can absorb — or that
+    // reaches a field, a local, the result — is returned at once, exactly as
+    // it was raised.
+    let mut fault: [Option<EvalError>; STACK_CAP] = [None; STACK_CAP];
+    let mut pending = false;
+
     loop {
         if pc >= code.len() {
             return Err(EvalError::Truncated);
@@ -368,173 +383,368 @@ fn eval_in<'a>(
         if *spent > max_cost {
             return Err(EvalError::CostExceeded);
         }
+        let at = pc;
         let opcode = code[pc];
+        let sp0 = sp;
+        let shape = op_shape(opcode, code, at + 1);
+        // The slots this op consumes, when it would consume a pending fault.
+        let mut logic_over_fault: Option<(usize, EvalError, bool)> = None;
+        if pending {
+            if let Some(sh) = shape {
+                if sp0 >= sh.pops {
+                    let base = sp0 - sh.pops;
+                    if let Some(e) = fault[base..sp0].iter().find_map(|f| *f) {
+                        if opcode == op::AND || opcode == op::OR {
+                            // An operand that is genuinely UNKNOWN (absent)
+                            // keeps an undecided result unknown, as CEL's
+                            // unknowns take precedence over errors.
+                            let unknown = (base..sp0)
+                                .any(|i| fault[i].is_none() && matches!(stack[i], Value::Null));
+                            logic_over_fault = Some((base, e, unknown));
+                        } else {
+                            if sh.pushes != 1 {
+                                return Err(e);
+                            }
+                            // Propagate: the op's result is the fault.
+                            for f in fault.iter_mut().take(sp0).skip(base) {
+                                *f = None;
+                            }
+                            stack[base] = Value::Null;
+                            fault[base] = Some(e);
+                            sp = base + 1;
+                            pc = at + 1 + sh.operand;
+                            if !reaches_logic(code, pc, base, sp) {
+                                return Err(e);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         pc += 1;
 
-        // Shared value-load and arithmetic ops (one implementation for all VMs).
-        if let Some(res) = load_op(opcode, code, &mut pc, params, &mut stack, &mut sp) {
-            res?;
-            continue;
-        }
-        if let Some(res) = arith_op(opcode, code, &mut pc, &mut stack, &mut sp) {
-            res?;
-            continue;
-        }
+        // One op, run where its own faults can be caught: `?` and the stack
+        // macros leave this closure, not the evaluator.
+        #[allow(
+            clippy::redundant_closure_call,
+            reason = "the op body returns through `?` and `return`; the closure is \
+                      the scope those leave, so a fault reaches the absorption below"
+        )]
+        let step = (|| -> Result<Option<EvalResult<'a>>, EvalError> {
+            // Shared value-load and arithmetic ops (one implementation for all VMs).
+            if let Some(res) = load_op(opcode, code, &mut pc, params, &mut stack, &mut sp) {
+                res?;
+                return Ok(None);
+            }
+            if let Some(res) = arith_op(opcode, code, &mut pc, &mut stack, &mut sp) {
+                res?;
+                return Ok(None);
+            }
 
-        match opcode {
-            op::RET => {
-                if sp != 1 {
-                    return Err(EvalError::BadResultArity);
-                }
-                return Ok(EvalResult::Scalar(stack[0]));
-            }
-            op::FINISH_MSG => return Ok(EvalResult::Constructed),
-            op::PUSH_BOOL => {
-                let v = *code.get(pc).ok_or(EvalError::Truncated)?;
-                pc += 1;
-                push!(Value::Bool(v != 0));
-            }
-            op::CMP_EQ | op::CMP_NE | op::CMP_LT | op::CMP_LE | op::CMP_GT | op::CMP_GE => {
-                let b = pop!();
-                let a = pop!();
-                // A comparison with an ABSENT operand is UNKNOWN, not false and
-                // not an error yet: `&&`/`||` may still absorb it (CEL's
-                // commutative error semantics), and a predicate left unknown
-                // fails its decision closed. A present value of the wrong type
-                // stays a TypeError.
-                if matches!(a, Value::Null) || matches!(b, Value::Null) {
-                    push!(Value::Null);
-                    continue;
-                }
-                let ord = compare(a, b, scratch).ok_or(EvalError::TypeError)?;
-                let r = match opcode {
-                    op::CMP_EQ => ord == Ordering::Equal,
-                    op::CMP_NE => ord != Ordering::Equal,
-                    op::CMP_LT => ord == Ordering::Less,
-                    op::CMP_LE => ord != Ordering::Greater,
-                    op::CMP_GT => ord == Ordering::Greater,
-                    _ => ord != Ordering::Less, // CMP_GE
-                };
-                push!(Value::Bool(r));
-            }
-            op::AND | op::OR => {
-                // Three-valued, as CEL specifies `&&`/`||` over errors: a
-                // decisive operand wins whatever the other is (`false && ?` is
-                // false, `true || ?` is true, in either order); otherwise an
-                // unknown operand leaves the result unknown.
-                let b = as_tri(pop!())?;
-                let a = as_tri(pop!())?;
-                let r = if opcode == op::AND {
-                    match (a, b) {
-                        (Some(false), _) | (_, Some(false)) => Some(false),
-                        (Some(true), Some(true)) => Some(true),
-                        _ => None,
+            match opcode {
+                op::RET => {
+                    if sp != 1 {
+                        return Err(EvalError::BadResultArity);
                     }
-                } else {
-                    match (a, b) {
-                        (Some(true), _) | (_, Some(true)) => Some(true),
-                        (Some(false), Some(false)) => Some(false),
-                        _ => None,
+                    return Ok(Some(EvalResult::Scalar(stack[0])));
+                }
+                op::FINISH_MSG => return Ok(Some(EvalResult::Constructed)),
+                op::PUSH_BOOL => {
+                    let v = *code.get(pc).ok_or(EvalError::Truncated)?;
+                    pc += 1;
+                    push!(Value::Bool(v != 0));
+                }
+                op::CMP_EQ | op::CMP_NE | op::CMP_LT | op::CMP_LE | op::CMP_GT | op::CMP_GE => {
+                    let b = pop!();
+                    let a = pop!();
+                    // A comparison with an ABSENT operand is UNKNOWN, not false and
+                    // not an error yet: `&&`/`||` may still absorb it (CEL's
+                    // commutative error semantics), and a predicate left unknown
+                    // fails its decision closed. A present value of the wrong type
+                    // stays a TypeError.
+                    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                        push!(Value::Null);
+                        return Ok(None);
                     }
-                };
-                push!(match r {
-                    Some(v) => Value::Bool(v),
-                    None => Value::Null,
-                });
-            }
-            op::NOT => {
-                let a = as_tri(pop!())?;
-                push!(match a {
-                    Some(v) => Value::Bool(!v),
-                    None => Value::Null,
-                });
-            }
-            op::IS_SET => {
-                // `has(x)`: presence, never an error — the one way a predicate
-                // asks about absence instead of being undone by it.
-                let a = pop!();
-                push!(Value::Bool(!matches!(a, Value::Null)));
-            }
-            op::SET_FIELD => {
-                let number = read_u32(code, pc)?;
-                pc += 4;
-                let value = pop!();
-                let Some(builder) = builder.as_deref_mut() else {
-                    return Err(EvalError::BadResultArity);
-                };
-                if builder.len >= MAX_BUILD_FIELDS {
-                    return Err(EvalError::BuildOverflow);
+                    let ord = compare(a, b, scratch).ok_or(EvalError::TypeError)?;
+                    let r = match opcode {
+                        op::CMP_EQ => ord == Ordering::Equal,
+                        op::CMP_NE => ord != Ordering::Equal,
+                        op::CMP_LT => ord == Ordering::Less,
+                        op::CMP_LE => ord != Ordering::Greater,
+                        op::CMP_GT => ord == Ordering::Greater,
+                        _ => ord != Ordering::Less, // CMP_GE
+                    };
+                    push!(Value::Bool(r));
                 }
-                builder.fields[builder.len] = Field { number, value };
-                builder.len += 1;
-            }
-            op::CALL => {
-                let id = {
-                    let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
-                    u16::from_le_bytes([b[0], b[1]])
-                };
-                pc += 2;
-                let arity = builtin_arity(id).ok_or(EvalError::BadBuiltin(id))?;
-                // Each call costs its arity on top of the step, so a builtin
-                // is never cheaper than the loads it consumed.
-                *spent += arity as u64;
-                if sp < arity {
-                    return Err(EvalError::StackUnderflow);
+                op::AND | op::OR => {
+                    // Three-valued, as CEL specifies `&&`/`||` over errors: a
+                    // decisive operand wins whatever the other is (`false && ?` is
+                    // false, `true || ?` is true, in either order); otherwise an
+                    // unknown operand leaves the result unknown.
+                    let b = as_tri(pop!())?;
+                    let a = as_tri(pop!())?;
+                    let r = if opcode == op::AND {
+                        match (a, b) {
+                            (Some(false), _) | (_, Some(false)) => Some(false),
+                            (Some(true), Some(true)) => Some(true),
+                            _ => None,
+                        }
+                    } else {
+                        match (a, b) {
+                            (Some(true), _) | (_, Some(true)) => Some(true),
+                            (Some(false), Some(false)) => Some(false),
+                            _ => None,
+                        }
+                    };
+                    push!(match r {
+                        Some(v) => Value::Bool(v),
+                        None => Value::Null,
+                    });
                 }
-                sp -= arity;
-                let mut args: [Value<'a>; 3] = [Value::Null; 3];
-                let mut i = 0;
-                let mut absent = false;
-                while i < arity {
-                    args[i] = stack[sp + i];
-                    absent |= matches!(args[i], Value::Null);
-                    i += 1;
+                op::NOT => {
+                    let a = as_tri(pop!())?;
+                    push!(match a {
+                        Some(v) => Value::Bool(!v),
+                        None => Value::Null,
+                    });
                 }
-                // Absence propagates through a builtin as through an operator:
-                // `contains(absent)` is UNKNOWN, which `has(x) && …` absorbs.
-                if absent {
-                    push!(Value::Null);
-                } else {
-                    push!(call_builtin(id, &args[..arity], scratch)?);
+                op::IS_SET => {
+                    // `has(x)`: presence, never an error — the one way a predicate
+                    // asks about absence instead of being undone by it.
+                    let a = pop!();
+                    push!(Value::Bool(!matches!(a, Value::Null)));
+                }
+                op::SET_FIELD => {
+                    let number = read_u32(code, pc)?;
+                    pc += 4;
+                    let value = pop!();
+                    let Some(builder) = builder.as_deref_mut() else {
+                        return Err(EvalError::BadResultArity);
+                    };
+                    if builder.len >= MAX_BUILD_FIELDS {
+                        return Err(EvalError::BuildOverflow);
+                    }
+                    builder.fields[builder.len] = Field { number, value };
+                    builder.len += 1;
+                }
+                op::CALL => {
+                    let id = {
+                        let b = code.get(pc..pc + 2).ok_or(EvalError::Truncated)?;
+                        u16::from_le_bytes([b[0], b[1]])
+                    };
+                    pc += 2;
+                    let arity = builtin_arity(id).ok_or(EvalError::BadBuiltin(id))?;
+                    // Each call costs its arity on top of the step, so a builtin
+                    // is never cheaper than the loads it consumed.
+                    *spent += arity as u64;
+                    if sp < arity {
+                        return Err(EvalError::StackUnderflow);
+                    }
+                    sp -= arity;
+                    let mut args: [Value<'a>; 3] = [Value::Null; 3];
+                    let mut i = 0;
+                    let mut absent = false;
+                    while i < arity {
+                        args[i] = stack[sp + i];
+                        absent |= matches!(args[i], Value::Null);
+                        i += 1;
+                    }
+                    // Absence propagates through a builtin as through an operator:
+                    // `contains(absent)` is UNKNOWN, which `has(x) && …` absorbs.
+                    if absent {
+                        push!(Value::Null);
+                    } else {
+                        push!(call_builtin(id, &args[..arity], scratch)?);
+                    }
+                }
+                op::FRAME_PACK => {
+                    let n = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
+                    let nums = code.get(pc + 1..pc + 1 + n).ok_or(EvalError::Truncated)?;
+                    pc += 1 + n;
+                    // Charged like a call: one unit per value it consumes.
+                    *spent += n as u64;
+                    if sp < n {
+                        return Err(EvalError::StackUnderflow);
+                    }
+                    sp -= n;
+                    let vals = stack.get(sp..sp + n).ok_or(EvalError::StackUnderflow)?;
+                    let v = frame_pack(nums, vals, scratch)?;
+                    push!(v);
+                }
+                #[cfg(feature = "bindings")]
+                op::STORE_LOCAL => {
+                    let idx = *code.get(pc).ok_or(EvalError::Truncated)?;
+                    pc += 1;
+                    if idx as usize >= MAX_LOCALS {
+                        return Err(EvalError::BadLocal(idx));
+                    }
+                    locals[idx as usize] = Some(pop!());
+                }
+                #[cfg(feature = "bindings")]
+                op::LOAD_LOCAL => {
+                    let idx = *code.get(pc).ok_or(EvalError::Truncated)?;
+                    pc += 1;
+                    let v = *locals
+                        .get(idx as usize)
+                        .ok_or(EvalError::BadLocal(idx))?
+                        .as_ref()
+                        .ok_or(EvalError::BadLocal(idx))?;
+                    push!(v);
+                }
+                other => return Err(EvalError::BadOpcode(other)),
+            }
+            Ok(None)
+        })();
+
+        match step {
+            Ok(Some(done)) => {
+                // A result (or a constructed message) never carries a fault.
+                if pending {
+                    if let Some(e) = fault[..sp].iter().find_map(|f| *f) {
+                        return Err(e);
+                    }
+                }
+                return Ok(done);
+            }
+            Ok(None) => {
+                if pending {
+                    // The slots this op wrote hold values, not faults — but
+                    // an `&&`/`||` left undecided over a fault is that fault.
+                    let base = shape.map_or(sp0, |sh| sp0.saturating_sub(sh.pops));
+                    for f in fault.iter_mut().take(sp.max(sp0)).skip(base) {
+                        *f = None;
+                    }
+                    if let Some((lb, e, unknown)) = logic_over_fault {
+                        if matches!(stack[lb], Value::Null) && !unknown {
+                            fault[lb] = Some(e);
+                            if !reaches_logic(code, pc, lb, sp) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    pending = fault[..sp].iter().any(Option::is_some);
+                    if !pending {
+                        fault = [None; STACK_CAP];
+                    }
                 }
             }
-            op::FRAME_PACK => {
-                let n = *code.get(pc).ok_or(EvalError::Truncated)? as usize;
-                let nums = code.get(pc + 1..pc + 1 + n).ok_or(EvalError::Truncated)?;
-                pc += 1 + n;
-                // Charged like a call: one unit per value it consumes.
-                *spent += n as u64;
-                if sp < n {
-                    return Err(EvalError::StackUnderflow);
+            Err(e) => {
+                // Absorbable only when the op yields one value an `&&`/`||`
+                // downstream may consume; otherwise raised as it stands.
+                let Some(sh) = shape else { return Err(e) };
+                if !absorbable(e) || sh.pushes != 1 || sp0 < sh.pops {
+                    return Err(e);
                 }
-                sp -= n;
-                let vals = stack.get(sp..sp + n).ok_or(EvalError::StackUnderflow)?;
-                let v = frame_pack(nums, vals, scratch)?;
-                push!(v);
-            }
-            #[cfg(feature = "bindings")]
-            op::STORE_LOCAL => {
-                let idx = *code.get(pc).ok_or(EvalError::Truncated)?;
-                pc += 1;
-                if idx as usize >= MAX_LOCALS {
-                    return Err(EvalError::BadLocal(idx));
+                let base = sp0 - sh.pops;
+                let next = at + 1 + sh.operand;
+                if !reaches_logic(code, next, base, base + 1) {
+                    return Err(e);
                 }
-                locals[idx as usize] = Some(pop!());
+                for f in fault.iter_mut().take(sp0).skip(base) {
+                    *f = None;
+                }
+                stack[base] = Value::Null;
+                fault[base] = Some(e);
+                sp = base + 1;
+                pc = next;
+                pending = true;
             }
-            #[cfg(feature = "bindings")]
-            op::LOAD_LOCAL => {
-                let idx = *code.get(pc).ok_or(EvalError::Truncated)?;
-                pc += 1;
-                let v = *locals
-                    .get(idx as usize)
-                    .ok_or(EvalError::BadLocal(idx))?
-                    .as_ref()
-                    .ok_or(EvalError::BadLocal(idx))?;
-                push!(v);
-            }
-            other => return Err(EvalError::BadOpcode(other)),
         }
     }
+}
+
+/// An op's encoded shape: its operand bytes and how many values it pops and
+/// pushes. `None` for an opcode the evaluator does not run or an operand that
+/// does not fit `code` (the op itself then fails as it always did).
+#[derive(Clone, Copy)]
+struct OpShape {
+    operand: usize,
+    pops: usize,
+    pushes: usize,
+}
+
+fn op_shape(opcode: u8, code: &[u8], at: usize) -> Option<OpShape> {
+    let s = |operand, pops, pushes| {
+        Some(OpShape {
+            operand,
+            pops,
+            pushes,
+        })
+    };
+    match opcode {
+        op::RET => s(0, 1, 0),
+        op::FINISH_MSG => s(0, 0, 0),
+        op::LOAD_PARAM | op::PUSH_BOOL | op::LOAD_LOCAL => s(1, 0, 1),
+        op::GET_FIELD => s(4, 1, 1),
+        op::PUSH_I64 => s(8, 0, 1),
+        op::PUSH_STR => {
+            let b = code.get(at..at + 2)?;
+            s(2 + u16::from_le_bytes([b[0], b[1]]) as usize, 0, 1)
+        }
+        op::CMP_EQ
+        | op::CMP_NE
+        | op::CMP_LT
+        | op::CMP_LE
+        | op::CMP_GT
+        | op::CMP_GE
+        | op::AND
+        | op::OR
+        | op::ADD
+        | op::SUB
+        | op::MUL
+        | op::DIV
+        | op::REM => s(0, 2, 1),
+        op::NOT | op::IS_SET => s(0, 1, 1),
+        op::FRAME_PACK => {
+            let n = *code.get(at)? as usize;
+            s(1 + n, n, 1)
+        }
+        op::SET_FIELD => s(4, 1, 0),
+        op::STORE_LOCAL => s(1, 1, 0),
+        op::CALL => {
+            let b = code.get(at..at + 2)?;
+            s(2, builtin_arity(u16::from_le_bytes([b[0], b[1]]))?, 1)
+        }
+        _ => None,
+    }
+}
+
+/// A fault CEL treats as an error VALUE — one `&&`/`||` may absorb. A
+/// malformed program, a spent budget or an exhausted bound is never absorbed.
+fn absorbable(e: EvalError) -> bool {
+    matches!(
+        e,
+        EvalError::DivByZero | EvalError::Overflow | EvalError::TypeError | EvalError::NotAMessage
+    )
+}
+
+/// Whether the value in stack slot `slot` (stack depth `depth`, code resuming
+/// at `pc`) is consumed — directly or through the ops that would propagate it
+/// — by an `&&`/`||`. The code is straight-line, so the walk is exact.
+fn reaches_logic(code: &[u8], mut pc: usize, mut slot: usize, mut depth: usize) -> bool {
+    while let Some(&opcode) = code.get(pc) {
+        let Some(sh) = op_shape(opcode, code, pc + 1) else {
+            return false;
+        };
+        if opcode == op::RET || opcode == op::FINISH_MSG || depth < sh.pops {
+            return false;
+        }
+        let base = depth - sh.pops;
+        if base <= slot {
+            if opcode == op::AND || opcode == op::OR {
+                return true;
+            }
+            if sh.pushes != 1 {
+                return false;
+            }
+            slot = base;
+        }
+        depth = base + sh.pushes;
+        pc += 1 + sh.operand;
+    }
+    false
 }
 
 /// Total ordering across numeric variants; `None` for incomparable types.

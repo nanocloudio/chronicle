@@ -141,6 +141,7 @@ MAX_BUILD_FIELDS <= u8::MAX as usize | modules/common/vm_core.rs
 | `VBIN_BUF` | `if TINY { 3072 } else { 8192 }` — 8192 / 8192 / 3072 | B | per module | capacity | candidate table past the ceiling → reload rejected, active table untouched | held in TWO copies, active and candidate, so it costs twice what it says: 16 KiB at the full tier, 6 KiB at tiny | the compiled version table, holding every stage of every loaded version. Staging a candidate beside the active table is what lets a reload be rejected without disturbing what is running. A tiny target carries one program plus headroom instead, since a node that size is reconfigured by OTA rather than by hot-swapping versions under load | larger variant | none — no suite stages a candidate past `VBIN_BUF`; `pipeline_lifecycle::a_valid_add_produces_a_scannable_candidate` covers the candidate path within it |
 | `PROG_BUF` | 2048 | B | per program | capacity | program > 2 KiB → load fault (`faulted`) | per encoder/decoder slot | one compiled stage/encoder/decoder program | larger variant | none — no suite loads a program past 2 KiB; `tools/e2e/fault.sh` covers the same FAULT refusal with an invalid-hex param |
 | `DEC_SCRATCH` | `if TINY { 1024 } else { 3 * REC_BUF }` — 12288 / 12288 / 1024 | B | per record (pipeline decoder) | capacity | a decoder building past it → `ScratchOverflow` → the record fails to decode (counted, consumed) | one arena, reset per record | what a decode program BUILDS rather than borrows: keys and hex (`CAT`, `HEX`), and a document with a policy's defaults applied (`JSONDEF`, one copy per default — three of a full-ceiling body at the full tier) | tracks `REC_BUF` | `deser::jsondef_that_does_not_fit_fails_closed` (the `ScratchOverflow` path, at a harness-chosen size) |
+| `RESYNC_STEP` | 64 | B | per step (pipeline raw intake) | work | a longer run of bytes that start no record → resynchronised over several steps, never dropped unaccounted (each run one `inputs_rejected`, its bytes in `resync_bytes`) | one decode attempt per byte dropped | bounds the decode attempts one step spends resynchronising a raw stream on `record_in`, so garbage cannot hold the scheduler; the run continues next step | larger slice per step | `deser::garbage_is_resynchronised_past_as_one_rejected_run` (the resync rule; the per-step slice is the module's) |
 
 ## Decision
 
@@ -321,6 +322,7 @@ SNAPSHOT_LANE_BYTES | modules/app/aggregation/mod.rs | 1 + 2 + KEY_CAP + 8 + 1
 SNAPSHOT_PANE_BYTES | modules/app/aggregation/mod.rs | 1 + 8 + 16 * MAX_OPS + 4 + 1 + 8 * COLL_CAP
 VBIN_BUF | modules/app/pipeline/mod.rs | if TINY { 3072 } else { 8192 }
 PROG_BUF | modules/app/pipeline/mod.rs | 2048
+RESYNC_STEP | modules/app/pipeline/mod.rs | 64
 ARGV_BUF | modules/app/chronicle_cli/mod.rs | 2 * PLAN_BUF
 PLAN_BUF | modules/app/chronicle_cli/mod.rs | 65536
 OUT_BUF | modules/app/chronicle_cli/mod.rs | 2 * tc::BIN_BUF + 4096

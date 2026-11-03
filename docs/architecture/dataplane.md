@@ -11,7 +11,7 @@ emits the params.
 | Module | Role | Param(s) |
 |--------|------|----------|
 | `app/expression` | one checked-CEL Expression | `program`, `max_cost` |
-| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning + the exchange roles | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `reply_decode`; exchange: `id_field`, `method_field`, `target_field`, `headers_field`, `status_field`, `content_type_field`, `method`, `content_type`, `answer`, `ack` |
+| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning + the exchange roles | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `decode_len`, `reply_decode`; exchange: `id_field`, `method_field`, `target_field`, `headers_field`, `status_field`, `content_type_field`, `method`, `content_type`, `answer`, `ack` |
 | `app/aggregation` | event-time stateful engine | `ir_def` |
 | `app/decision` | first-hit rule container | `decision` |
 | `app/sensor_intake` | `SensorSample` → typed record frame | — |
@@ -71,8 +71,12 @@ input ─▶ [decode] ─▶ select version ─▶ stages ─▶ [encode] ─▶
 ```
 
 - **decode** (optional `decode` param): a [byte-deserialization](../guides/wire-codec.md)
-  program that parses the bytes arriving — a raw chunk on `record_in`, or a
-  collected request's body — into a record frame before the stages.
+  program that parses the bytes arriving — the next record of the raw byte
+  stream on `record_in`, or a collected request's body — into a record frame
+  before the stages. On `record_in` the program frames each record by what it
+  reads, or `decode_len` declares a fixed width; either way several records in
+  one read and a record split across reads decode the same
+  ([raw-stream framing](../guides/wire-codec.md#raw-stream-framing-record_in)).
   `reply_decode` does the same for a requester's answer bodies.
 - **version select**: the record's `X-Pipeline-Version` selector (field 255) resolves
   to one of the loaded [versions](versioning.md); unknown ⇒ fail closed.
