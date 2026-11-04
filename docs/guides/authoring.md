@@ -124,6 +124,58 @@ just cannot fail the expression. The compiled program is the same as before;
 the VM carries a fault on the stack slot it would have filled until an `&&` /
 `||` absorbs it or it reaches the result.
 
+## Strings a decision builds
+
+A string a program reads — a field, a literal, a `substring`, a `trim` — is
+borrowed where it lies. A string it *builds* is written into the stage's
+scratch arena: `+`, `lowerAscii` / `upperAscii`, `replace`, `reverse`,
+`base64`, and every nested message a construction packs (`ctx: Ctx{ … }`
+becomes one frame field, so it copies what it packs). The arena is
+`STAGE_SCRATCH_CAP`: 12288 B on a 64-bit core — three full-tier records — and
+512 B on a 32-bit one, where it shares a 2 KiB stack. It is the same arena in
+the `decision` node, in a pipeline's decision stage, and in `chronicle decide`,
+so a dry run and the node agree on what fits.
+
+What a run spends:
+
+- **A chain of `+` costs its result once.** `"{\"items\":[" + doc + "]}"`
+  writes the opening, the document and the close once each: every `+` whose
+  left side is the string the previous `+` built extends it in place. A `+`
+  whose left side is something else (a field, a literal, an older built
+  string) copies that side.
+- **A predicate's strings are handed back** once it has answered. Every arm's
+  `when` up to the one that matches is evaluated, and none of what they built
+  stays under the outcome, so concatenating in many conditions costs only the
+  largest of them.
+- **A nested message copies its fields once more.** A kilobyte document inside
+  a context message costs about two kilobytes; inside a context inside a
+  context, three.
+
+So an outcome the size of a record — 4096 B at the full tier, the most a
+`decision` node emits — fits with two levels of nesting around its strings.
+
+Running out is a named fault, never a clipped string:
+
+- **On a record**, building past the arena fails the run closed. The `decision`
+  node counts it in `inputs_failed` and logs `[decision] failed closed at rule
+  <i>: scratch arena overflow: the strings this branch builds pass
+  STAGE_SCRATCH_CAP`; `chronicle decide <decision_hex> <record_hex>` prints
+  `error: decision failed at rule <i>: scratch arena overflow: …` for the same
+  record, and `chronicle eval` names a compute stage's overflow the same way.
+  An outcome that builds within the arena but encodes past one record is a
+  different bound, named as such: `error: outcome frame larger than a decision
+  node's record (REC_BUF 4096 B)` (the node counts it in `errors_encode`).
+- **Before any record**, a branch whose *literals alone* pass the arena —
+  whatever the record holds, with every field taken as empty — can never
+  complete, so it is refused where it is written. `chronicle author` and
+  `chronicle graph` print `error: <decision>: rule <i> outcome builds at least
+  <N> B of strings on any record; a stage's scratch arena (STAGE_SCRATCH_CAP)
+  holds 12288 B` (`a branch` from `graph`, `program <k>` from `decision`), and
+  an engine handed such a container refuses it at load: `[decision] FAULT: a
+  branch builds more strings than STAGE_SCRATCH_CAP on any record`. This is a
+  floor, not an estimate of the record-dependent part: what a branch builds
+  from its fields is bounded by the record, and only a run can measure it.
+
 ## Guarantees
 
 - **Deterministic identity** — identical source ⇒ identical plan + artefact
@@ -132,7 +184,15 @@ the VM carries a fault on the stack slot it would have filled until an `&&` /
   parser or compiler change that alters a document's artefacts is a visible,
   breaking change (`document_parsing_matches_the_corpus`, `rejection_matches_the_corpus`).
 - **Structured errors** — parse errors carry a 1-based line/column; reference and
-  type errors are typed `PlanError` values, never panics.
+  type errors are typed `PlanError` values, never panics. A body that does not
+  compile is named with the compiler's reason and its place in the document —
+  `error: compile failed for label (the body): unknown field 'nope' at line 12
+  column 20` from `author`, `error: decision 'route' did not compile (rule 1
+  when): …` from `graph` — and `compile`/`compile-source`/`compile-stages` say
+  the same of a bare source (`CelcFault`: every refusal carries the byte it
+  points at; `every_compile_refusal_says_where`,
+  `author_names_the_reason_and_the_place_a_body_did_not_compile`,
+  `graph_names_the_reason_and_the_place_a_stage_did_not_compile`).
 
 ## Aggregation
 

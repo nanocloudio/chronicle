@@ -112,9 +112,10 @@ use tc::{
     add_version_msg,
     agg_from_argv,
     append,
-    append_celc_err,
+    append_celc_fault,
     append_hex,
     append_plan_reason,
+    append_reg_why,
     append_release_reason,
     append_slot_reason,
     append_u32,
@@ -169,6 +170,8 @@ use tc::{
     run_decision_metered,
     run_stages,
     scan_decision_container,
+    scratch_over,
+    scratch_refused,
     seal_aggregation,
     seal_decision,
     seal_expression,
@@ -304,6 +307,18 @@ const ARGV_BUF: usize = 2 * PLAN_BUF;
 /// becomes an argv record the channel never delivers, leaving the applet to
 /// print its help and exit 0.
 const PLAN_BUF: usize = 65536;
+/// One typed record frame: what `eval` and `decide` admit and emit.
+///
+/// The SAME derivation as the `decision`, `pipeline` and `expression`
+/// engines' `REC_BUF` (the `limit-register` gate couples them), because these
+/// commands are the diagnosis path for those engines: a dry run holding less
+/// than the node refuses records and outcomes the node carries, and one
+/// holding more passes what the node refuses. The stage scratch the run
+/// builds strings in is `STAGE_SCRATCH_CAP`, the engines' own constant.
+const TINY: bool = abi::config::TARGET_CLASS == abi::config::target_class::TINY;
+const REC_BUF: usize = if TINY { 512 } else { 4096 };
+// A record and its outcome print as hex into stdout.
+const _: () = assert!(2 * REC_BUF + 64 <= OUT_BUF);
 /// The CLI's stdout buffer, in module state.
 ///
 /// Every artefact prints as HEX — twice its bytes — and `graph` wraps its
@@ -383,15 +398,17 @@ struct Work {
     /// Compiled program, or the schema text `author` generates from a
     /// document — which scales with the document.
     prog: [u8; PLAN_BUF],
-    record: [u8; 512],
-    buf_a: [u8; 512],
-    buf_b: [u8; 512],
+    /// A record to dry-run, and the stage ping-pong and output frame — each one
+    /// `REC_BUF`, the bound the engines it dry-runs for hold a record to.
+    record: [u8; REC_BUF],
+    buf_a: [u8; REC_BUF],
+    buf_b: [u8; REC_BUF],
     /// Container assembly + per-program lowering scratch (`decision`/`agg`).
     cont: [u8; BIN_BUF],
     code: [u8; BIN_BUF],
     /// Digest-free artefact encoding, for the two-pass seal.
     scratch: [u8; BIN_BUF],
-    frame: [u8; 512],
+    frame: [u8; REC_BUF],
     out: [u8; OUT_BUF],
     // `.plan` declaration arena. In module state, not on the stack: the
     // arrays total several KiB and a PIC frame cannot hold them alongside the
@@ -481,9 +498,9 @@ fn cmd_help(out: &mut [u8]) -> usize {
 fn cmd_compile(s: &mut Work, schema: &[u8], params: &[u8], src: &[u8]) -> (usize, i32) {
     match celc_compile_auto(schema, params, src, &mut s.cont) {
         Ok(n) => emit_hex_buf(&s.cont, n, &mut s.out),
-        Err(e) => {
+        Err(f) => {
             let mut p = append(&mut s.out, 0, b"error: compile failed: ");
-            p = append_celc_err(&mut s.out, p, e);
+            p = append_celc_fault(&mut s.out, p, f, src, 0);
             p = append(&mut s.out, p, b"\n");
             (p, 1)
         }
@@ -555,6 +572,12 @@ fn cmd_decision(s: &mut Work, arec: &[u8], argv: &[(usize, usize)], argc: usize)
             p = append(&mut s.out, p, b" is not valid IR hex or failed to lower\n");
             return (p, 1);
         };
+        if let Some(f) = scratch_over(&s.code[..clen]) {
+            let mut what = [0u8; 16];
+            let q = append(&mut what, 0, b"program ");
+            let q = append_u32(&mut what, q, k as u32);
+            return (scratch_refused(&mut s.out, b"decision", &what[..q], f), 1);
+        }
         if !put_prog(&mut s.cont, &mut w, &s.code[..clen], cost) {
             return (append(&mut s.out, 0, b"error: container too large\n"), 1);
         }
@@ -1052,10 +1075,11 @@ fn cmd_compile_source(
             );
             (p, 0)
         }
-        Err(_) => (
-            append(&mut s.out, 0, b"error: source did not type-check\n"),
-            1,
-        ),
+        Err(e) => {
+            let mut p = append(&mut s.out, 0, b"error: source did not type-check: ");
+            p = append_reg_why(&mut s.out, p, e, source, 0);
+            (append(&mut s.out, p, b"\n"), 1)
+        }
     }
 }
 
@@ -1114,18 +1138,30 @@ fn cmd_compile_stages(
             p = append(&mut s.out, p, b"\n");
             (p, 0)
         }
-        Err(RegError::NotAMessage) => (
-            append(
+        Err(RegError::NotAMessage(i)) => {
+            let mut p = append(
                 &mut s.out,
                 0,
-                b"error: every stage must construct a message\n",
-            ),
-            1,
-        ),
-        Err(_) => (
-            append(&mut s.out, 0, b"error: a stage did not type-check\n"),
-            1,
-        ),
+                b"error: every stage must construct a message: stage ",
+            );
+            p = append_u32(&mut s.out, p, i as u32);
+            (append(&mut s.out, p, b" does not\n"), 1)
+        }
+        Err(e) => {
+            let mut p = append(&mut s.out, 0, b"error: a stage did not type-check");
+            // The source the refusal names is that stage's own argument.
+            let text = match e.item() {
+                Some(i) => {
+                    p = append(&mut s.out, p, b": stage ");
+                    p = append_u32(&mut s.out, p, i as u32);
+                    stages.get(i as usize).map_or(&b""[..], |st| st.source)
+                }
+                None => b"",
+            };
+            p = append(&mut s.out, p, b": ");
+            p = append_reg_why(&mut s.out, p, e, text, 0);
+            (append(&mut s.out, p, b"\n"), 1)
+        }
     }
 }
 
@@ -1744,6 +1780,9 @@ fn cmd_eval(s: &mut Work, ir_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
         let p = append(&mut s.out, 0, b"error: ir_hex is not valid hex\n");
         return (p, 1);
     };
+    if rec_hex.len() > 2 * REC_BUF {
+        return (record_too_large(&mut s.out), 1);
+    }
     let Some(rlen) = hex_decode(rec_hex, &mut s.record) else {
         let p = append(&mut s.out, 0, b"error: record_hex is not valid hex\n");
         return (p, 1);
@@ -1787,12 +1826,9 @@ fn cmd_eval(s: &mut Work, ir_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
         &mut s.frame,
     ) {
         Ok(flen) => {
-            let mut hexed = [0u8; 1024];
-            let Some(hl) = hex_encode(&s.frame[..flen], &mut hexed) else {
-                let p = append(&mut s.out, 0, b"error: output frame too large to print\n");
-                return (p, 1);
-            };
-            let mut p = append(&mut s.out, 0, &hexed[..hl]);
+            // Straight into stdout (module state): a frame is at most
+            // `REC_BUF`, and stdout holds twice that as hex.
+            let mut p = append_hex(&mut s.out, 0, &s.frame[..flen]);
             p = append(&mut s.out, p, b"\n");
             (p, 0)
         }
@@ -1823,17 +1859,34 @@ fn cmd_decide(s: &mut Work, dec_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
             1,
         );
     };
+    if rec_hex.len() > 2 * REC_BUF {
+        return (record_too_large(&mut s.out), 1);
+    }
     let Some(rlen) = hex_decode(rec_hex, &mut s.record) else {
         return (
             append(&mut s.out, 0, b"error: record_hex is not valid hex\n"),
             1,
         );
     };
-    if scan_decision_container(&s.prog[..dlen]).is_err() {
-        return (
-            append(&mut s.out, 0, b"error: decision container failed to load\n"),
-            1,
-        );
+    match scan_decision_container(&s.prog[..dlen]) {
+        Ok(()) => {}
+        // The node's own load refusal, named as the node names it.
+        Err(tc::DecisionError::Eval(tc::EvalError::ScratchOverflow)) => {
+            let mut p = append(
+                &mut s.out,
+                0,
+                b"error: decision container failed to load: a branch builds more than STAGE_SCRATCH_CAP (",
+            );
+            p = append_u32(&mut s.out, p, STAGE_SCRATCH_CAP as u32);
+            p = append(&mut s.out, p, b" B) of strings whatever the record holds\n");
+            return (p, 1);
+        }
+        Err(_) => {
+            return (
+                append(&mut s.out, 0, b"error: decision container failed to load\n"),
+                1,
+            );
+        }
     }
     let mut fields = [Field {
         number: 0,
@@ -1871,25 +1924,36 @@ fn cmd_decide(s: &mut Work, dec_hex: &[u8], rec_hex: &[u8]) -> (usize, i32) {
         p = append(&mut s.out, p, b" drop\n");
         return (p, 0);
     }
+    // `s.frame` is the node's `REC_BUF`: an outcome refused here is one the
+    // node refuses too (`errors_encode`), and nothing smaller is.
     let flen = match encode_frame_scratch(&builder.message(), &scratch, &mut s.frame) {
         Ok(n) => n,
         Err(_) => {
-            p = append(&mut s.out, p, b"\nerror: outcome frame too large\n");
+            p = append(
+                &mut s.out,
+                p,
+                b"\nerror: outcome frame larger than a decision node's record (REC_BUF ",
+            );
+            p = append_u32(&mut s.out, p, REC_BUF as u32);
+            p = append(&mut s.out, p, b" B)\n");
             return (p, 1);
         }
     };
-    let mut hexed = [0u8; 1024];
-    let Some(hl) = hex_encode(&s.frame[..flen], &mut hexed) else {
-        p = append(
-            &mut s.out,
-            p,
-            b"\nerror: outcome frame too large to print\n",
-        );
-        return (p, 1);
-    };
     p = append(&mut s.out, p, b" ");
-    p = append(&mut s.out, p, &hexed[..hl]);
+    p = append_hex(&mut s.out, p, &s.frame[..flen]);
     (append(&mut s.out, p, b"\n"), 0)
+}
+
+/// A record argument past the engines' `REC_BUF`: named as the bound it is,
+/// not reported as bad hex.
+fn record_too_large(out: &mut [u8]) -> usize {
+    let mut p = append(
+        out,
+        0,
+        b"error: record frame larger than the engine admits (REC_BUF ",
+    );
+    p = append_u32(out, p, REC_BUF as u32);
+    append(out, p, b" B)\n")
 }
 
 fn dec_u8(v: u8, out: &mut [u8; 4]) -> usize {
@@ -1969,7 +2033,7 @@ fn append_pipe_err(out: &mut [u8], at: usize, e: tc::PipeError) -> usize {
             EvalError::ScratchOverflow => append(
                 out,
                 at,
-                b"stage eval: scratch arena overflow (STAGE_SCRATCH_CAP)",
+                b"stage eval: scratch arena overflow: the strings this stage builds pass STAGE_SCRATCH_CAP",
             ),
             EvalError::BadLocal(_) => append(out, at, b"stage eval: bad cel.bind local slot"),
         },
@@ -2473,9 +2537,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.w.out.as_ptr().add(s.out_off as usize),
                 remaining,
             );
+            // A full ring answers EAGAIN (writes are all-or-nothing):
+            // retry next step. Any other negative is a broken channel.
             if w > 0 {
                 s.out_off += w as u16;
-            } else if w == 0 {
+            } else if w == 0 || w == abi::kernel_abi::errno::EAGAIN {
                 return 0;
             } else {
                 s.done = 1;
@@ -2490,7 +2556,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let w = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
             if w == c.len() as i32 {
                 s.exit_done = 1;
-            } else if w == 0 {
+            } else if w == 0 || w == abi::kernel_abi::errno::EAGAIN {
                 return 0;
             } else {
                 s.done = 1;

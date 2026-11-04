@@ -76,7 +76,10 @@ buffer_size  = { default = 40960, thumbv6m = 4096 }
 # consensus.proposals_tagged as MSG_CLIENT_PROPOSAL [0x10][corr:u64][snapshot],
 # learns the assigned log index on assigned_in (in[2], MSG_PROPOSAL_ASSIGNED) and
 # the current term on leader_in (in[3], MSG_LEADER_HINT), and stages itself until
-# barrier_in's commit horizon crosses that index. Unwired ⇒ no raft producer.
+# barrier_in's commit horizon crosses that index. A MSG_PROPOSAL_REFUSED
+# [0x27][corr:u64][status][leader] on assigned_in frees that correlation at once
+# and the checkpoint is proposed again under a fresh one (TOO_LARGE while staged
+# is a terminal fault). Unwired ⇒ no raft producer.
 [[ports]]
 name         = "proposal_out"
 index        = 2
@@ -107,7 +110,8 @@ buffer_size  = 256
 # instruments: `module_mode`, then the saturation / late / correction, checkpoint
 # and term state an edge counter cannot express. `emit_overflow` and the overflow
 # counters refine `outputs_failed`; `arith_overflows` counts emissions that
-# withheld a value because its exact result overflowed i64.
+# withheld a value because its exact result overflowed i64; `proposals_refused`
+# counts checkpoint proposals consensus refused (MSG_PROPOSAL_REFUSED).
 metrics = [
     "bytes_in", "bytes_out",
     "inputs_observed", "inputs_admitted", "inputs_rejected",
@@ -118,4 +122,5 @@ metrics = [
     "emit_overflow", "lane_overflows", "late_drops", "corrections",
     "pane_overflows", "coll_overflows", "non_retractable_drops",
     "events_since_ckpt", "current_term", "work_units", "arith_overflows",
+    "proposals_refused",
 ]

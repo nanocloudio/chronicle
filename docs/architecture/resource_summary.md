@@ -16,13 +16,13 @@ buffer behind it are one number on every target rather than two that can disagre
 
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
-| aggregation | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | barrier_in | input | 64 | 256 | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | checkpoint_out | output | 40960 (thumbv6m 4096) | 40960 (thumbv6m 4096) | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | proposal_out | output | 512 | 512 | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | assigned_in | input | 64 | 256 | 26 |
-| aggregation | bcm2712,rp2350,rp2040,linux | leader_in | input | 64 | 256 | 26 |
+| aggregation | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | barrier_in | input | 64 | 256 | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | checkpoint_out | output | 40960 (thumbv6m 4096) | 40960 (thumbv6m 4096) | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | proposal_out | output | 512 | 512 | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | assigned_in | input | 64 | 256 | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | leader_in | input | 64 | 256 | 27 |
 | chronicle_cli | bcm2712,linux | args | input |  | 131328 |  |
 | chronicle_cli | bcm2712,linux | stdout | output |  | 40960 |  |
 | chronicle_cli | bcm2712,linux | exit | output |  | 16 |  |

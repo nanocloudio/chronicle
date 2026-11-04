@@ -1,0 +1,46 @@
+// A decision that BUILDS strings: every arm's predicate concatenates, and the
+// outcome wraps a field into a document inside a nested context message.
+//
+// Strings a decision builds live in its stage scratch arena
+// (`STAGE_SCRATCH_CAP`, docs/guides/authoring.md "Strings a decision
+// builds"). A chain of `+` costs its result once, each predicate's strings are
+// handed back once it has answered, and a nested message copies what it
+// packs. tools/e2e/decision-scratch.sh lowers this document on device, drives
+// kilobyte records through the running graph, and requires `chronicle decide`
+// to answer each one byte for byte as the graph did.
+plan t.scratch {
+
+  message t.Ctx {
+    key: string = 31;
+    doc: string = 32;
+  }
+
+  message t.Req {
+    id: int = 1;
+    name: string = 2;
+    body: string = 3;
+    ctx: t.Ctx = 254;
+  }
+
+  decision route(r: t.Req) -> t.Req {
+    when "k/" + r.name + "/a" == "k/" + r.body + "/a" ->
+      t.Req { id: 1, name: r.name, ctx: t.Ctx { key: r.name, doc: "{\"same\":\"" + r.body + "\"}" } };
+    when "k/" + r.body == "k/" + r.name + "/b" ->
+      t.Req { id: 2, name: r.name };
+    when "k/" + r.body + "/c" == "k/c" ->
+      t.Req { id: 3, name: r.name };
+    default ->
+      t.Req { id: 0, name: r.name,
+              ctx: t.Ctx { key: "/items/" + r.name,
+                           doc: "{\"kind\":\"List\",\"items\":[" + r.body + "],\"name\":\"" + r.name + "\"}" } };
+  }
+
+  pipeline process(r: t.Req) -> t.Req {
+    call c = route(r);
+    return c;
+  }
+
+  entry process = process;
+
+  provenance revision "example" toolchain "chronicle";
+}

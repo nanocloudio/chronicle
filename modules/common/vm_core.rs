@@ -1055,6 +1055,184 @@ pub fn scan_code(code: &[u8]) -> Result<(), EvalError> {
     Ok(())
 }
 
+/// What [`scratch_floor`] knows about one stack slot or local.
+#[derive(Clone, Copy)]
+enum Floor {
+    /// May be absent, or of any type but a message.
+    Maybe,
+    /// A param message (`LOAD_PARAM`): packing it is a `TypeError`.
+    Msg,
+    /// A present integer or bool: 8 bytes in a frame.
+    Scalar,
+    /// A present string of at least `min` bytes. `id` names the scratch
+    /// reservation that made it (0: it lives outside the arena — a literal).
+    Str { min: usize, id: u16 },
+}
+
+/// The fewest scratch-arena bytes `code` builds on ANY record that lets it
+/// finish: what its literals force, and what it builds from them, with every
+/// field taken as empty or absent. Straight-line code, so the walk is the
+/// evaluator's own order, and it counts a reservation only where the
+/// evaluator certainly makes one — a `+` of two present strings, a case map
+/// or base64 encoding of one, `string()` of a scalar, a nested message packed
+/// from values none of which is a param message — at the smallest size it can
+/// have. A `+` whose left operand certainly ends the arena counts its right
+/// operand only, as [`call_builtin`] extends it in place; one whose left
+/// operand certainly does not counts both. Anything less certain counts what both cases share.
+///
+/// So the floor never exceeds what a run that completes uses: a program
+/// whose floor passes the arena it will run with can never complete there,
+/// and is refused once at load ([`scan_stage_code`]) and at authoring rather
+/// than failing every record. A malformed program floors at what was walked
+/// before the fault; `scan_code` is what refuses it.
+pub fn scratch_floor(code: &[u8]) -> usize {
+    let mut stack = [Floor::Maybe; STACK_CAP];
+    let mut locals = [Floor::Maybe; MAX_LOCALS];
+    let mut sp = 0usize;
+    let mut pc = 0usize;
+    let mut a = FloorArena {
+        used: 0,
+        next: 1,
+        top: 0,
+        gone: 0,
+    };
+    while let Some(&opcode) = code.get(pc) {
+        let Some(sh) = op_shape(opcode, code, pc + 1) else {
+            break;
+        };
+        if sp < sh.pops || sp - sh.pops + sh.pushes > STACK_CAP {
+            break;
+        }
+        let base = sp - sh.pops;
+        let arg = |k: usize| stack.get(base + k).copied().unwrap_or(Floor::Maybe);
+        let operand = |k: usize| code.get(pc + 1 + k).copied().unwrap_or(0);
+        let out = match opcode {
+            op::LOAD_PARAM => Floor::Msg,
+            op::PUSH_I64 | op::PUSH_BOOL => Floor::Scalar,
+            op::PUSH_STR => Floor::Str {
+                min: u16::from_le_bytes([operand(0), operand(1)]) as usize,
+                id: 0,
+            },
+            op::LOAD_LOCAL => locals
+                .get(operand(0) as usize)
+                .copied()
+                .unwrap_or(Floor::Maybe),
+            op::STORE_LOCAL => {
+                if let Some(l) = locals.get_mut(operand(0) as usize) {
+                    *l = arg(0);
+                }
+                Floor::Maybe
+            }
+            op::FRAME_PACK => {
+                let mut size = 1usize;
+                let mut certain = true;
+                for k in 0..sh.pops {
+                    match arg(k) {
+                        Floor::Msg => certain = false,
+                        Floor::Maybe => {}
+                        Floor::Scalar => size += 4 + 8,
+                        Floor::Str { min, .. } => size = size.saturating_add(4 + min),
+                    }
+                }
+                if certain {
+                    // A frame is packed, never concatenated: no id to keep.
+                    a.reserve(size);
+                } else {
+                    a.top = 0;
+                }
+                Floor::Maybe
+            }
+            op::CALL => {
+                let id = u16::from_le_bytes([operand(0), operand(1)]);
+                let second = if sh.pops > 1 { arg(1) } else { Floor::Maybe };
+                match (id, arg(0), second) {
+                    (
+                        builtin::CONCAT,
+                        Floor::Str { min: l, id: lid },
+                        Floor::Str { min: r, .. },
+                    ) => {
+                        let n = if lid != 0 && lid == a.top {
+                            r
+                        } else if lid == 0 || lid < a.gone {
+                            l.saturating_add(r)
+                        } else {
+                            r
+                        };
+                        Floor::Str {
+                            min: l.saturating_add(r),
+                            id: a.reserve(n),
+                        }
+                    }
+                    (
+                        builtin::REVERSE_BYTES | builtin::LOWER_ASCII | builtin::UPPER_ASCII,
+                        Floor::Str { min, .. },
+                        _,
+                    ) => Floor::Str {
+                        min,
+                        id: a.reserve(min),
+                    },
+                    // `string()` of a present int, uint or bool writes its
+                    // text — at least one byte; of a string it is that string,
+                    // written nowhere.
+                    (builtin::STRING_OF, Floor::Scalar, _) => Floor::Str {
+                        min: 1,
+                        id: a.reserve(1),
+                    },
+                    (builtin::STRING_OF, Floor::Str { min, id }, _) => Floor::Str { min, id },
+                    (builtin::B64_ENCODE, Floor::Str { min, .. }, _) => {
+                        let n = min.div_ceil(3).saturating_mul(4);
+                        Floor::Str {
+                            min: n,
+                            id: a.reserve(n),
+                        }
+                    }
+                    _ => {
+                        // Any other builtin may write the arena (or fault and
+                        // not): nothing is certainly its top any more.
+                        a.top = 0;
+                        Floor::Maybe
+                    }
+                }
+            }
+            _ => Floor::Maybe,
+        };
+        sp = base;
+        if sh.pushes == 1 {
+            if let Some(slot) = stack.get_mut(sp) {
+                *slot = out;
+            }
+            sp += 1;
+        }
+        pc += 1 + sh.operand;
+    }
+    a.used
+}
+
+/// [`scratch_floor`]'s view of the arena. Reservation ids: `next` is the next
+/// to hand out; `top` the one whose value certainly ends the arena (0: none
+/// certainly does); every id below `gone` certainly does not — a later
+/// reservation of at least one byte certainly happened.
+struct FloorArena {
+    used: usize,
+    next: u16,
+    top: u16,
+    gone: u16,
+}
+
+impl FloorArena {
+    /// A reservation the evaluator certainly makes, of at least `n` bytes.
+    fn reserve(&mut self, n: usize) -> u16 {
+        let id = self.next;
+        self.next = self.next.saturating_add(1);
+        self.used = self.used.saturating_add(n);
+        self.top = id;
+        if n > 0 {
+            self.gone = id;
+        }
+        id
+    }
+}
+
 /// An integer operand as an `i64` VALUE: a `Uint` above `i64::MAX` has none,
 /// so it is `Overflow` rather than a wrapped negative number.
 fn as_arith_int(v: Value<'_>) -> Result<i64, EvalError> {

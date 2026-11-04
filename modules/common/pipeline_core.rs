@@ -305,15 +305,16 @@ pub fn stage_at(container: &[u8], index: usize) -> Option<Stage<'_>> {
 }
 
 /// Load-time validation of a bytecode-stages container: every stage must
-/// parse AND pass [`scan_code`] — no unknown opcodes, no truncation, no
-/// builtin this build does not carry. Engines call this at init/reload so a
+/// parse AND pass [`scan_stage_code`] — no unknown opcodes, no truncation, no
+/// builtin this build does not carry, no program past the scratch floor.
+/// Engines call this at init/reload so a
 /// broken container is refused once, loudly, instead of failing per record.
 pub fn scan_stage_container(container: &[u8]) -> Result<(), EvalError> {
     let n = stage_count(container);
     let mut i = 0;
     while i < n {
         let st = stage_at(container, i).ok_or(EvalError::Truncated)?;
-        scan_code(st.code)?;
+        scan_stage_code(st.code)?;
         i += 1;
     }
     Ok(())
@@ -443,12 +444,48 @@ pub fn encode_frame_scratch(
     Ok(off)
 }
 
-/// Scratch-arena bytes available to one stage's writing builtins (reverse,
-/// case mapping, replace, base64). Stage-local and reset per stage — a
+/// Scratch-arena bytes available to one stage's — or one decision run's —
+/// writing builtins: string `+`, case mapping, `replace`, base64, and the
+/// nested messages a construction packs. Stage-local and reset per stage — a
 /// stage's outputs are SERIALIZED into the frame before the next stage runs,
-/// so nothing outlives the stage. Overflow fails the stage closed
-/// (`ScratchOverflow`), like every other bound here.
-pub const STAGE_SCRATCH_CAP: usize = 512;
+/// so nothing outlives the stage; a decision hands back what each predicate
+/// built once it has answered. Overflow fails the stage closed
+/// (`ScratchOverflow`), like every other bound here, and a program that
+/// overflows whatever the record says is refused at load
+/// ([`scan_stage_code`]).
+///
+/// Sized from the record, not from a guess at string lengths: an outcome is
+/// at most one `REC_BUF` (4096 B at the full tier) frame, a chain of `+`
+/// costs its result once (it extends in place), and each level of nested
+/// message the strings are packed into copies them once more. Three records
+/// carry the built strings and two levels of nesting around them — the
+/// pipeline decoder's `DEC_SCRATCH` reaches the same figure for its own
+/// copies.
+///
+/// Keyed on pointer width, as `MAX_BUILD_FIELDS` is, because the arena is on
+/// the step's STACK (every engine that runs a stage, and the CLI that dry-runs
+/// one, declares it the same way, so the two cannot disagree): a 64-bit core
+/// gives a module at least 64 KiB of stack, an isolated 32-bit RP core 2 KiB,
+/// where 512 B is what fits beside the field tables.
+pub const STAGE_SCRATCH_CAP: usize = if cfg!(target_pointer_width = "64") {
+    12288
+} else {
+    512
+};
+
+/// [`scan_code`] plus the scratch floor: a program that builds at least
+/// [`STAGE_SCRATCH_CAP`] bytes whatever its record holds (literals, and what
+/// it builds from them — [`scratch_floor`]) can never complete here, so it is
+/// refused once, at load, as `ScratchOverflow`, rather than failing every
+/// record. Engines scan every compute stage, map predicate and decision branch
+/// with this.
+pub fn scan_stage_code(code: &[u8]) -> Result<(), EvalError> {
+    scan_code(code)?;
+    if scratch_floor(code) > STAGE_SCRATCH_CAP {
+        return Err(EvalError::ScratchOverflow);
+    }
+    Ok(())
+}
 
 /// Run one stage: decode `src`, evaluate, and serialize the constructed message
 /// into `dst`, adding the stage program's VM instructions to `spent`. Returns the
@@ -513,7 +550,7 @@ pub fn scan_map_container(c: &[u8]) -> Result<(), PipeError> {
     if MAP_HEADER + 6 + len != c.len() {
         return Err(PipeError::BadFrame);
     }
-    scan_code(code).map_err(PipeError::StageEval)
+    scan_stage_code(code).map_err(PipeError::StageEval)
 }
 
 /// Run one MAP stage over the record `src`, writing the record with its

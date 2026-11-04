@@ -60,6 +60,39 @@ case "$out" in
   *) no dynamic "expected a type-check refusal, got: '$out'" ;;
 esac
 
+# A refusal says why and where, not only that it was refused.
+out=$(cli compile-source "$SCHEMA" order Order 'order.total + order.nope' 2>/dev/null)
+case "$out" in
+  *"did not type-check: unknown field 'nope' at line 1 column 21"*)
+    ok "a refusal names the reason and the place" ;;
+  *) no dynamic "expected the reason and place, got: '$out'" ;;
+esac
+out=$(cli compile-source "$SCHEMA" order Order 'Receipt{id: str(order.total), amount: 1}' 2>/dev/null)
+case "$out" in
+  *"unknown function 'str' at line 1 column 13"*) ok "an unknown function is named where it is called" ;;
+  *) no dynamic "expected the unknown function named, got: '$out'" ;;
+esac
+
+# CEL's string(): an int becomes its decimal text, run on device. The record is
+# Order{customer_id: "c", total: -42}; the stage builds
+# Receipt{id: "o" + string(total), amount: total}.
+conv=$(cli compile-stages "$SCHEMA" order Order \
+  'Receipt{id: "o" + string(order.total), amount: order.total}' 2>/dev/null | head -1)
+rec=$(python3 -c 'import struct
+f = bytes([2]) + bytes([2, 0]) + struct.pack("<H", 1) + b"c"
+f += bytes([3, 1]) + struct.pack("<H", 8) + struct.pack("<q", -42)
+print(f.hex())')
+want=$(python3 -c 'import struct
+f = bytes([2]) + bytes([1, 0]) + struct.pack("<H", 4) + b"o-42"
+f += bytes([2, 1]) + struct.pack("<H", 8) + struct.pack("<q", -42)
+print(f.hex())')
+out=$(cli eval "$conv" "$rec" 2>/dev/null)
+case "$out" in
+  "$want"*)
+    ok "string(int) compiles and runs: \"o\" + string(-42) is \"o-42\"" ;;
+  *) no dynamic "string(int) did not run as CEL says: ir '$conv' out '$out'" ;;
+esac
+
 # A chain of stages becomes the ir_stages container the pipeline module loads.
 stages=$(cli compile-stages "$SCHEMA" order Order \
   'Receipt{id: order.customer_id, amount: order.total}' 2>/dev/null | head -1)

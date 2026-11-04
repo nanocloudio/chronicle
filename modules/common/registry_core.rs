@@ -28,20 +28,52 @@
 /// Why a dynamic compile was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegError {
-    /// The source did not type-check.
-    Compile(CelcErr),
+    /// A source did not type-check: the compiler's refusal (with the byte of
+    /// that source it points at) and which source of the call it was — see
+    /// [`RegError::item`].
+    Compile { fault: CelcFault, item: u8 },
     /// Lowering the checked IR to bytecode failed.
     Lower(LowerError),
     /// Packing the result into its container failed.
     Pack(PackError),
-    /// A stage or outcome did not construct a message.
-    NotAMessage,
-    /// A decision predicate did not type-check to Bool.
-    NotBool,
+    /// A stage or outcome (this item) did not construct a message.
+    NotAMessage(u8),
+    /// A decision predicate (this item) did not type-check to Bool.
+    NotBool(u8),
     /// A scratch or output buffer was too small.
     Capacity,
     /// More stages or rules than the container's one-byte count allows.
     TooManyItems,
+    /// A decision branch builds this many bytes of strings on any record
+    /// ([`scratch_floor`]), past [`STAGE_SCRATCH_CAP`]: it could never
+    /// complete in an engine, so it is refused when it is compiled.
+    Scratch(usize),
+}
+
+impl RegError {
+    /// Which source of the call a source-level refusal names. The item is the
+    /// source's position in the call: `0` for [`compile_ir`]; the stage index
+    /// for [`compile_pipeline_ir`]; for [`compile_decision`], rule `k`'s `when`
+    /// is `2k`, its outcome `2k + 1`, and the default `2 * rules`.
+    pub fn item(&self) -> Option<u8> {
+        match *self {
+            RegError::Compile { item, .. }
+            | RegError::NotAMessage(item)
+            | RegError::NotBool(item) => Some(item),
+            _ => None,
+        }
+    }
+
+    /// The same refusal, naming item `i` of the call.
+    fn at_item(self, i: usize) -> Self {
+        let i = i.min(u8::MAX as usize) as u8;
+        match self {
+            RegError::Compile { fault, .. } => RegError::Compile { fault, item: i },
+            RegError::NotAMessage(_) => RegError::NotAMessage(i),
+            RegError::NotBool(_) => RegError::NotBool(i),
+            e => e,
+        }
+    }
 }
 
 /// One dynamically-compiled stage: its source, its single parameter name, and
@@ -95,7 +127,8 @@ pub fn compile_ir(
 ) -> Result<(usize, bool), RegError> {
     let mut params = [0u8; 128];
     let pn = bind(param_name, input_type, &mut params)?;
-    let (n, ty) = celc_compile_ty(schema, &params[..pn], source, out).map_err(RegError::Compile)?;
+    let (n, ty) = celc_compile_ty(schema, &params[..pn], source, out)
+        .map_err(|fault| RegError::Compile { fault, item: 0 })?;
     let is_msg = matches!(ty, CTy::Msg(..));
     if is_msg {
         return Ok((n, true));
@@ -153,9 +186,10 @@ pub fn compile_pipeline_ir(
             st.param_name,
             st.input_type,
             scratch.get_mut(used..).ok_or(RegError::Capacity)?,
-        )?;
+        )
+        .map_err(|e| e.at_item(i))?;
         if !is_msg {
-            return Err(RegError::NotAMessage);
+            return Err(RegError::NotAMessage(i as u8));
         }
         spans[i] = (used, n);
         used += n;
@@ -215,6 +249,10 @@ fn compile_bytecode(
     let ir = hi.get(..irn).ok_or(RegError::Capacity)?;
     let dst = lo.get_mut(*used..).ok_or(RegError::Capacity)?;
     let (bn, cost) = lower_flat(ir, dst).map_err(RegError::Lower)?;
+    let floor = scratch_floor(dst.get(..bn).ok_or(RegError::Capacity)?);
+    if floor > STAGE_SCRATCH_CAP {
+        return Err(RegError::Scratch(floor));
+    }
     let off = *used;
     *used += bn;
     Ok((off, bn, cost, is_msg))
@@ -244,24 +282,28 @@ pub fn compile_decision(
 
     for (i, r) in rules.iter().enumerate() {
         let (woff, wlen, wcost, w_is_msg) =
-            compile_bytecode(schema, r.when, param_name, input_type, scratch, &mut used)?;
+            compile_bytecode(schema, r.when, param_name, input_type, scratch, &mut used)
+                .map_err(|e| e.at_item(2 * i))?;
         if w_is_msg {
-            return Err(RegError::NotBool);
+            return Err(RegError::NotBool((2 * i) as u8));
         }
         wspans[i] = (woff, wlen, wcost);
 
         let (ooff, olen, ocost, o_is_msg) = compile_bytecode(
             schema, r.outcome, param_name, input_type, scratch, &mut used,
-        )?;
+        )
+        .map_err(|e| e.at_item(2 * i + 1))?;
         if !o_is_msg {
-            return Err(RegError::NotAMessage);
+            return Err(RegError::NotAMessage((2 * i + 1) as u8));
         }
         ospans[i] = (ooff, olen, ocost);
     }
+    let def_item = 2 * rules.len();
     let (doff, dlen, dcost, d_is_msg) =
-        compile_bytecode(schema, default, param_name, input_type, scratch, &mut used)?;
+        compile_bytecode(schema, default, param_name, input_type, scratch, &mut used)
+            .map_err(|e| e.at_item(def_item))?;
     if !d_is_msg {
-        return Err(RegError::NotAMessage);
+        return Err(RegError::NotAMessage(def_item as u8));
     }
 
     let mut packed = [(Prog { cost: 0, code: &[] }, Prog { cost: 0, code: &[] }); MAX_ITEMS];

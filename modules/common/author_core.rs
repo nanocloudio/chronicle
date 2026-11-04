@@ -359,16 +359,20 @@ pub fn compile_to_code_buf(
     let mut ir = [0u8; 512];
     let ilen = match celc_compile_auto(schema, params, src, &mut ir) {
         Ok(n) => n,
-        Err(e) => {
+        Err(f) => {
             let mut p = append(out, 0, b"error: compile failed: ");
-            p = append_celc_err(out, p, e);
+            p = append_celc_fault(out, p, f, src, 0);
             p = append(out, p, b"\n");
             return Err(p);
         }
     };
     match lower_flat(&ir[..ilen], code) {
         Ok(v) => Ok(v),
-        Err(_) => Err(append(out, 0, b"error: IR failed to lower\n")),
+        Err(e) => {
+            let mut p = append(out, 0, b"error: compile failed: ");
+            p = append_compile_why(out, p, CompileWhy::Lower(e), src, 0);
+            Err(append(out, p, b"\n"))
+        }
     }
 }
 
@@ -429,6 +433,18 @@ pub fn append_u32(dst: &mut [u8], at: usize, mut n: u32) -> usize {
     p
 }
 
+/// Why one body did not become bytecode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileWhy {
+    /// The compiler refused it, at a byte of the body.
+    Celc(CelcFault),
+    /// It type-checked, and lowering the IR to bytecode failed.
+    Lower(LowerError),
+    /// A map declaration does not resolve against the schema
+    /// ([`map_validate`]); its predicate was never compiled.
+    Map,
+}
+
 /// Compile one CEL body against a schema+params into flat IR, then lower it to
 /// bytecode. Returns `(bytecode_len, cost_bound)`.
 pub fn compile_one(
@@ -437,16 +453,189 @@ pub fn compile_one(
     body: &[u8],
     ir: &mut [u8],
     code: &mut [u8],
-) -> Result<(usize, u64), ()> {
-    let ilen = celc_compile_auto(schema, params, body, ir).map_err(|_| ())?;
-    lower_flat(&ir[..ilen], code).map_err(|_| ())
+) -> Result<(usize, u64), CompileWhy> {
+    let ilen = celc_compile_auto(schema, params, body, ir).map_err(CompileWhy::Celc)?;
+    lower_flat(&ir[..ilen], code).map_err(CompileWhy::Lower)
 }
 
-/// The stable "compile failed for <name>" reply line.
-pub fn compile_failed(out: &mut [u8], name: &[u8]) -> usize {
+/// Append why a source did not compile: the refusal's stable name, the source
+/// text it names (the identifier, field, type or function it could not
+/// resolve) and where — `line L column C` of `text`, the buffer the source sits
+/// in at byte `base` (a `.plan` document and the body's span start, or the
+/// source itself and 0).
+pub fn append_celc_fault(
+    out: &mut [u8],
+    at: usize,
+    f: CelcFault,
+    text: &[u8],
+    base: usize,
+) -> usize {
+    use CelcErr as E;
+    let mut p = append_celc_err(out, at, f.err);
+    let named = match f.err {
+        E::UnknownName(s, e)
+        | E::UnknownParam(s, e)
+        | E::UnknownFunction(s, e)
+        | E::BadCallArgs(s, e) => Some((s, e)),
+        E::UnknownField {
+            field_s, field_e, ..
+        } => Some((field_s, field_e)),
+        E::UnknownMessageType { buf: BUF_SRC, s, e } => Some((s, e)),
+        E::NotAMessage { path_s, path_e, .. } => Some((path_s, path_e)),
+        _ => None,
+    };
+    if let Some((s, e)) = named {
+        let lo = base.saturating_add(s as usize);
+        let hi = base.saturating_add(e as usize);
+        if let Some(name) = text.get(lo..hi) {
+            p = append(out, p, b" '");
+            p = append(out, p, name);
+            p = append(out, p, b"'");
+        }
+    }
+    let (line, col) = plan_line_col(text, base.saturating_add(f.at as usize));
+    p = append(out, p, b" at line ");
+    p = append_u32(out, p, line as u32);
+    p = append(out, p, b" column ");
+    append_u32(out, p, col as u32)
+}
+
+/// Append why a body did not become bytecode ([`CompileWhy`]); `text`/`base`
+/// as for [`append_celc_fault`].
+pub fn append_compile_why(
+    out: &mut [u8],
+    at: usize,
+    why: CompileWhy,
+    text: &[u8],
+    base: usize,
+) -> usize {
+    match why {
+        CompileWhy::Celc(f) => append_celc_fault(out, at, f, text, base),
+        CompileWhy::Lower(LowerError::Overflow | LowerError::ProgramTooLong) => {
+            append(out, at, b"the compiled program is larger than its buffer")
+        }
+        CompileWhy::Lower(_) => append(out, at, b"the checked IR failed to lower"),
+        CompileWhy::Map => append(
+            out,
+            at,
+            b"the map's over/count fields, max or result type do not resolve against the schema",
+        ),
+    }
+}
+
+/// The stable "compile failed for <name>" reply line, with the reason:
+/// `error: compile failed for <name> (<part>): <why>` — `part` says which
+/// body of the declaration (`the body`, `rule 2 when`, …; empty for none) and
+/// `body` is its span in the document `src`.
+pub fn compile_failed(
+    out: &mut [u8],
+    name: &[u8],
+    part: &[u8],
+    why: CompileWhy,
+    src: &[u8],
+    body: Span,
+) -> usize {
     let mut p = append(out, 0, b"error: compile failed for ");
     p = append(out, p, name);
+    if !part.is_empty() {
+        p = append(out, p, b" (");
+        p = append(out, p, part);
+        p = append(out, p, b")");
+    }
+    p = append(out, p, b": ");
+    p = append_compile_why(out, p, why, src, body.start as usize);
     append(out, p, b"\n")
+}
+
+/// The reply line for a graph stage the registry refused ([`RegError`]):
+/// `error: <what><name>' did not compile[ (<part>)]: <why>`. The call compiled
+/// `items` sources and `body` is the document span of the one the refusal
+/// names ([`RegError::item`]); with more than one the part is named — a
+/// decision's `rule k when`, `rule k outcome`, or `the default` for the last.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a flat reply renderer over the caller's buffers: the refusal, its document and the body it names"
+)]
+pub fn reg_refused(
+    out: &mut [u8],
+    what: &[u8],
+    name: &[u8],
+    e: RegError,
+    src: &[u8],
+    items: usize,
+    body: Span,
+) -> usize {
+    let mut p = append(out, 0, b"error: ");
+    p = append(out, p, what);
+    p = append(out, p, name);
+    p = append(out, p, b"' did not compile");
+    if let Some(i) = e.item().map(|i| i as usize).filter(|_| items > 1) {
+        let mut part = [0u8; 24];
+        let q = if i + 1 == items {
+            append(&mut part, 0, b"the default")
+        } else {
+            rule_part(
+                &mut part,
+                i / 2,
+                if i % 2 == 0 { b" when" } else { b" outcome" },
+            )
+        };
+        p = append(out, p, b" (");
+        p = append(out, p, &part[..q]);
+        p = append(out, p, b")");
+    }
+    p = append(out, p, b": ");
+    p = append_reg_why(out, p, e, src, body.start as usize);
+    append(out, p, b"\n")
+}
+
+/// Append why the registry refused a compile ([`RegError`]); a source-level
+/// refusal is placed in `text` at `base` as [`append_celc_fault`] does.
+pub fn append_reg_why(out: &mut [u8], at: usize, e: RegError, text: &[u8], base: usize) -> usize {
+    match e {
+        RegError::Compile { fault, .. } => append_celc_fault(out, at, fault, text, base),
+        RegError::Lower(l) => append_compile_why(out, at, CompileWhy::Lower(l), text, base),
+        RegError::Pack(_) => append(out, at, b"the compiled programs do not fit their container"),
+        RegError::NotAMessage(_) => append(out, at, b"it must construct a message"),
+        RegError::NotBool(_) => append(out, at, b"a `when` must be a bool"),
+        RegError::Capacity => append(out, at, b"a compile buffer is too small for it"),
+        RegError::TooManyItems => append(out, at, b"too many stages or rules"),
+        RegError::Scratch(_) => append(out, at, b"it builds more strings than STAGE_SCRATCH_CAP"),
+    }
+}
+
+/// `rule <k><what>` into `buf` — the part name of one decision rule's body.
+pub fn rule_part(buf: &mut [u8; 24], k: usize, what: &[u8]) -> usize {
+    let q = append(buf, 0, b"rule ");
+    let q = append_u32(buf, q, k.min(u32::MAX as usize) as u32);
+    append(buf, q, what)
+}
+
+/// `Some(floor)` when `code` builds more than an engine's stage scratch on
+/// every record that lets it finish ([`scratch_floor`] past
+/// [`STAGE_SCRATCH_CAP`]): the program can never complete, so it is refused
+/// when it is authored, with the numbers, rather than at load or per record.
+pub fn scratch_over(code: &[u8]) -> Option<usize> {
+    let f = scratch_floor(code);
+    (f > STAGE_SCRATCH_CAP).then_some(f)
+}
+
+/// The stable reply line for a program [`scratch_over`] refuses: what it is,
+/// the floor, and the arena.
+pub fn scratch_refused(out: &mut [u8], name: &[u8], what: &[u8], floor: usize) -> usize {
+    let mut p = append(out, 0, b"error: ");
+    p = append(out, p, name);
+    p = append(out, p, b": ");
+    p = append(out, p, what);
+    p = append(out, p, b" builds at least ");
+    p = append_u32(out, p, floor.min(u32::MAX as usize) as u32);
+    p = append(
+        out,
+        p,
+        b" B of strings on any record; a stage's scratch arena (STAGE_SCRATCH_CAP) holds ",
+    );
+    p = append_u32(out, p, STAGE_SCRATCH_CAP as u32);
+    append(out, p, b" B\n")
 }
 
 /// `ArtefactKind::Resource` — the kind an `effect` stage targets.
@@ -591,16 +780,17 @@ pub fn map_container(
     d: &MapDecl,
     st_ir: &mut [u8],
     out: &mut [u8],
-) -> Result<usize, ()> {
-    let hdr = map_validate(schema, src, d)?;
+) -> Result<usize, CompileWhy> {
+    let full = CompileWhy::Lower(LowerError::Overflow);
+    let hdr = map_validate(schema, src, d).map_err(|()| CompileWhy::Map)?;
     let mut params = [0u8; 256];
-    let pl = map_params_text(src, d, &mut params)?;
-    let code = out.get_mut(MAP_HEADER + 6..).ok_or(())?;
+    let pl = map_params_text(src, d, &mut params).map_err(|()| full)?;
+    let code = out.get_mut(MAP_HEADER + 6..).ok_or(full)?;
     let (clen, cost) = compile_one(schema, &params[..pl], d.when.of(src), st_ir, code)?;
     if clen > u16::MAX as usize {
-        return Err(());
+        return Err(CompileWhy::Lower(LowerError::ProgramTooLong));
     }
-    let head = out.get_mut(..MAP_HEADER + 6).ok_or(())?;
+    let head = out.get_mut(..MAP_HEADER + 6).ok_or(full)?;
     for (x, y) in head.iter_mut().zip(hdr.iter()) {
         *x = *y;
     }
@@ -722,8 +912,19 @@ pub fn author_document(
             &mut code,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(&mut *st_out, d.name.of(src), b"the body", why, src, d.body),
+                    1,
+                )
+            }
         };
+        if let Some(f) = scratch_over(&code[..clen]) {
+            return (
+                scratch_refused(&mut *st_out, d.name.of(src), b"the body", f),
+                1,
+            );
+        }
         // Each artefact kind declares its own capability; they are part of the
         // sealed header and therefore part of the identity.
         let header = HeaderSpec {
@@ -813,7 +1014,19 @@ pub fn author_document(
             &mut code,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(
+                        &mut *st_out,
+                        d.name.of(src),
+                        b"the predicate",
+                        why,
+                        src,
+                        d.when,
+                    ),
+                    1,
+                )
+            }
         };
         let header = HeaderSpec {
             package: pkg,
@@ -886,7 +1099,25 @@ pub fn author_document(
                     wlen[k] = l;
                     wcost[k] = c;
                 }
-                Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+                Err(why) => {
+                    let mut part = [0u8; 24];
+                    let q = rule_part(&mut part, k, b" when");
+                    let name = d.name.of(src);
+                    return (
+                        compile_failed(&mut *st_out, name, &part[..q], why, src, r.when),
+                        1,
+                    );
+                }
+            }
+            if let Some(f) = scratch_over(&wcode[k][..wlen[k]]) {
+                let mut what = [0u8; 24];
+                let q = append(&mut what, 0, b"rule ");
+                let q = append_u32(&mut what, q, k as u32);
+                let q = append(&mut what, q, b" when");
+                return (
+                    scratch_refused(&mut *st_out, d.name.of(src), &what[..q], f),
+                    1,
+                );
             }
             match compile_one(
                 &st_prog[..slen],
@@ -899,7 +1130,25 @@ pub fn author_document(
                     olen[k] = l;
                     ocost[k] = c;
                 }
-                Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+                Err(why) => {
+                    let mut part = [0u8; 24];
+                    let q = rule_part(&mut part, k, b" outcome");
+                    let name = d.name.of(src);
+                    return (
+                        compile_failed(&mut *st_out, name, &part[..q], why, src, r.outcome),
+                        1,
+                    );
+                }
+            }
+            if let Some(f) = scratch_over(&ocode[k][..olen[k]]) {
+                let mut what = [0u8; 24];
+                let q = append(&mut what, 0, b"rule ");
+                let q = append_u32(&mut what, q, k as u32);
+                let q = append(&mut what, q, b" outcome");
+                return (
+                    scratch_refused(&mut *st_out, d.name.of(src), &what[..q], f),
+                    1,
+                );
             }
         }
         let mut dcode = [0u8; 256];
@@ -911,8 +1160,26 @@ pub fn author_document(
             &mut dcode,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, d.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(
+                        &mut *st_out,
+                        d.name.of(src),
+                        b"the default",
+                        why,
+                        src,
+                        d.default,
+                    ),
+                    1,
+                )
+            }
         };
+        if let Some(f) = scratch_over(&dcode[..dlen]) {
+            return (
+                scratch_refused(&mut *st_out, d.name.of(src), b"the default", f),
+                1,
+            );
+        }
         let mut rules = [RuleSpec {
             name: b"",
             priority: 0,
@@ -1135,7 +1402,12 @@ pub fn author_document(
             &mut kcode,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, ag.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(&mut *st_out, ag.name.of(src), b"the key", why, src, ag.key),
+                    1,
+                )
+            }
         };
         let mut tcode = [0u8; 256];
         let (tlen, tcost) = match compile_one(
@@ -1146,7 +1418,19 @@ pub fn author_document(
             &mut tcode,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, ag.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(
+                        &mut *st_out,
+                        ag.name.of(src),
+                        b"the event_time",
+                        why,
+                        src,
+                        ag.event_time,
+                    ),
+                    1,
+                )
+            }
         };
 
         let mut scode = [[0u8; 256]; MAX_OP];
@@ -1169,7 +1453,17 @@ pub fn author_document(
                     slen_op[k] = l;
                     scost[k] = c;
                 }
-                Err(()) => return (compile_failed(&mut *st_out, ag.name.of(src)), 1),
+                Err(why) => {
+                    let mut part = [0u8; 24];
+                    let q = append(&mut part, 0, b"operator ");
+                    let q = append_u32(&mut part, q, k as u32);
+                    let q = append(&mut part, q, b" selector");
+                    let name = ag.name.of(src);
+                    return (
+                        compile_failed(&mut *st_out, name, &part[..q], why, src, o.selector),
+                        1,
+                    );
+                }
             }
         }
 
@@ -1194,7 +1488,19 @@ pub fn author_document(
             &mut ecode,
         ) {
             Ok(v) => v,
-            Err(()) => return (compile_failed(&mut *st_out, ag.name.of(src)), 1),
+            Err(why) => {
+                return (
+                    compile_failed(
+                        &mut *st_out,
+                        ag.name.of(src),
+                        b"the emit",
+                        why,
+                        src,
+                        ag.emit,
+                    ),
+                    1,
+                )
+            }
         };
 
         let mut ops = [OperatorSpec {
@@ -1518,11 +1824,11 @@ pub fn graph_document(
                 &mut st_cont[used..],
             ) {
                 Ok(v) => v,
-                Err(_) => {
-                    let mut p = append(&mut *st_out, 0, b"error: stage '");
-                    p = append(&mut *st_out, p, target_name);
-                    p = append(&mut *st_out, p, b"' did not compile\n");
-                    return (p, 1);
+                Err(e) => {
+                    return (
+                        reg_refused(&mut *st_out, b"stage '", target_name, e, src, 1, f.body),
+                        1,
+                    );
                 }
             };
             if !is_msg {
@@ -1553,11 +1859,12 @@ pub fn graph_document(
                     n_stages += 1;
                     continue;
                 }
-                Err(()) => {
+                Err(why) => {
                     let mut p = append(&mut *st_out, 0, b"error: map '");
                     p = append(&mut *st_out, p, target_name);
-                    p = append(&mut *st_out, p, b"' did not compile\n");
-                    return (p, 1);
+                    p = append(&mut *st_out, p, b"' did not compile: ");
+                    p = append_compile_why(&mut *st_out, p, why, src, m.when.start as usize);
+                    return (append(&mut *st_out, p, b"\n"), 1);
                 }
             }
         }
@@ -1597,11 +1904,26 @@ pub fn graph_document(
                 &mut *st_code,
             ) {
                 Ok(v) => v,
-                Err(_) => {
-                    let mut p = append(&mut *st_out, 0, b"error: decision '");
-                    p = append(&mut *st_out, p, target_name);
-                    p = append(&mut *st_out, p, b"' did not compile\n");
-                    return (p, 1);
+                Err(RegError::Scratch(f)) => {
+                    return (
+                        scratch_refused(&mut *st_out, target_name, b"a branch", f),
+                        1,
+                    );
+                }
+                Err(e) => {
+                    // The item a refusal names is rule k's `when` (2k), its
+                    // outcome (2k + 1) or the default (2 * rules).
+                    let i = e.item().map_or(2 * nr, |i| i as usize);
+                    let body = match arena.rules.get(d.first_rule as usize + i / 2) {
+                        Some(rd) if i < 2 * nr && i % 2 == 0 => rd.when,
+                        Some(rd) if i < 2 * nr => rd.outcome,
+                        _ => d.default,
+                    };
+                    let n = 2 * nr + 1;
+                    return (
+                        reg_refused(&mut *st_out, b"decision '", target_name, e, src, n, body),
+                        1,
+                    );
                 }
             };
             spans[n_stages] = (used, dn);

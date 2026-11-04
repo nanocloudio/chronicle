@@ -1033,6 +1033,131 @@ impl BarrierGate {
     }
 }
 
+/// Framed `MSG_PROPOSAL_ASSIGNED` on `consensus.proposal_assigned`:
+/// `[0x14][len:u16][corr:u64 LE][pid:u16][index:u64 LE][term:u64 LE]` — the
+/// term the entry was appended in (an index names an entry only with its
+/// term; a shorter, term-less form is read as such).
+pub const MSG_PROPOSAL_ASSIGNED: u8 = 0x14;
+/// Framed `MSG_PROPOSAL_REFUSED` on the same port:
+/// `[0x27][len:u16][corr:u64 LE][status:u8][leader:u8]` — the tagged proposal
+/// `corr` was refused and is in no log (or, for `REFUSED_OUTCOME_UNKNOWN`, may
+/// be in one): no assignment for it will ever follow. `leader` 0xFF = none
+/// known.
+pub const MSG_PROPOSAL_REFUSED: u8 = 0x27;
+/// Refusal statuses (Clustor's `CLIENT_REJECT_*`). All but
+/// `REFUSED_OUTCOME_UNKNOWN` are "not appended anywhere".
+pub const REFUSED_THROTTLED: u8 = 0x01;
+pub const REFUSED_NOT_LEADER: u8 = 0x02;
+pub const REFUSED_FALLBACK: u8 = 0x04;
+pub const REFUSED_TOO_LARGE: u8 = 0x06;
+/// The forward reached a leader that may have appended it and none could say:
+/// it may or may not commit.
+pub const REFUSED_OUTCOME_UNKNOWN: u8 = 0x07;
+
+/// One message on `consensus.proposal_assigned`, decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalReply {
+    /// Proposal `corr` was appended at log `index`, in `term` when the
+    /// message carries it.
+    Assigned {
+        corr: u64,
+        index: u64,
+        term: Option<u64>,
+    },
+    /// Proposal `corr` was refused with `status` (`REFUSED_*`); `leader` is the
+    /// leader the refusing node knows (0xFF none).
+    Refused { corr: u64, status: u8, leader: u8 },
+    /// Anything else (another message, or one too short to be either).
+    Other,
+}
+
+/// Decode one framed message from `consensus.proposal_assigned`.
+pub fn decode_proposal_reply(buf: &[u8]) -> ProposalReply {
+    let u64_at = |at: usize| -> Option<u64> {
+        let b = buf.get(at..at + 8)?;
+        Some(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    };
+    match buf.first() {
+        Some(&MSG_PROPOSAL_ASSIGNED) if buf.len() >= 21 => match (u64_at(3), u64_at(13)) {
+            (Some(corr), Some(index)) => ProposalReply::Assigned {
+                corr,
+                index,
+                term: u64_at(21),
+            },
+            _ => ProposalReply::Other,
+        },
+        Some(&MSG_PROPOSAL_REFUSED) if buf.len() >= 13 => match u64_at(3) {
+            Some(corr) => ProposalReply::Refused {
+                corr,
+                status: buf[11],
+                leader: buf[12],
+            },
+            None => ProposalReply::Other,
+        },
+        _ => ProposalReply::Other,
+    }
+}
+
+/// How long a refused checkpoint proposal waits before it is proposed again
+/// under a fresh correlation. A refusal is the leader saying "not now"
+/// (backpressure, no leader yet, frozen); answering it on the very next step
+/// would only draw the same answer at step rate.
+pub const REFUSED_RETRY_MS: u64 = 250;
+
+/// What a checkpoint producer does with one reply on `proposal_assigned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyAction {
+    /// Its in-flight proposal was appended at this `(index, term)` while it
+    /// is staged: hand it to the barrier gate. `term` is `None` when the
+    /// assignment does not carry one (the producer stamps the term it knows).
+    Append { index: u64, term: Option<u64> },
+    /// Its in-flight proposal was refused: the correlation is spent (nothing
+    /// will ever answer it), so it proposes again under a fresh one, no sooner
+    /// than `retry_at_ms` (never 0).
+    Retry { retry_at_ms: u64 },
+    /// Its in-flight proposal was refused as `TOO_LARGE`, which the same state
+    /// would draw again: the proposal fails for good.
+    Fail,
+    /// Not about its in-flight proposal (another correlation, an assignment
+    /// after activation, or another message).
+    Ignore,
+}
+
+/// Judge one reply for a producer whose in-flight proposal is `corr`
+/// (`proposed`: one is in flight), `staged` until the barrier crosses, at
+/// `now_ms`. Any refusal of `corr` — every status, `OUTCOME_UNKNOWN` included,
+/// since a checkpoint is the whole state and proposing it again is harmless —
+/// ends the wait for an assignment at once.
+pub fn proposal_reply_action(
+    buf: &[u8],
+    corr: u64,
+    proposed: bool,
+    staged: bool,
+    now_ms: u64,
+) -> ReplyAction {
+    match decode_proposal_reply(buf) {
+        ProposalReply::Assigned {
+            corr: c,
+            index,
+            term,
+        } if c == corr && proposed && staged => ReplyAction::Append { index, term },
+        ProposalReply::Refused {
+            corr: c, status, ..
+        } if c == corr && proposed => {
+            if status == REFUSED_TOO_LARGE {
+                ReplyAction::Fail
+            } else {
+                ReplyAction::Retry {
+                    retry_at_ms: now_ms.wrapping_add(REFUSED_RETRY_MS).max(1),
+                }
+            }
+        }
+        _ => ReplyAction::Ignore,
+    }
+}
+
 /// Bounded LE write into `out` at `*p`; advances `*p`. `None` on overflow.
 fn ckpt_put(out: &mut [u8], p: &mut usize, b: &[u8]) -> Option<()> {
     let end = p.checked_add(b.len())?;

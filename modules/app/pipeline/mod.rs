@@ -651,7 +651,7 @@ fn scan_kinded_versions(vbin: &[u8], kinds: &[u8]) -> bool {
                 return true;
             };
             let bad = match kinds.get(i).copied().unwrap_or(STAGE_KIND_COMPUTE) {
-                STAGE_KIND_COMPUTE => scan_code(st.code).is_err(),
+                STAGE_KIND_COMPUTE => scan_stage_code(st.code).is_err(),
                 STAGE_KIND_DECISION => scan_decision_container(st.code).is_err(),
                 STAGE_KIND_MAP => scan_map_container(st.code).is_err(),
                 _ => true,
@@ -730,12 +730,12 @@ use pipe::{
     eval_decode_scratch, frame_len, is_data_field, lower_stages_kinded, parse_version_table,
     pipeline_reload_kinded, rd_frame, record_id, request_fields, request_head, response_fields,
     response_head, run_decision_metered, run_map_stage, run_stage_metered, run_stages_metered,
-    run_stages_with, scan_code, scan_decision_container, scan_map_container, scan_version_table,
-    stage_at, stage_count, version_selector_from_frame, Accounting, Admit, Answer, BlobIn, Builder,
-    EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError, RdFrame, Scratch,
-    Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD,
-    EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE,
-    STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
+    run_stages_with, scan_decision_container, scan_map_container, scan_stage_code,
+    scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
+    Answer, BlobIn, Builder, EvalError, Field, FieldMap, Inflight, Message, Mode, Pending,
+    PipeError, RdFrame, Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE,
+    ACCT_METRIC_COUNT, CARRY_FIELD, EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS,
+    STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -1255,7 +1255,8 @@ pub extern "C" fn module_new(
         s.rdec_len = whole(&s.rdec_in);
         s.dec_len = whole(&s.dec_in);
         // Load-time scan of every version's stage programs: unknown opcodes,
-        // truncation, builtins not in this build's variant. Refused here,
+        // truncation, builtins not in this build's variant, a program whose
+        // literals alone pass STAGE_SCRATCH_CAP (`scan_stage_code`). Refused here,
         // once — never per-record. (`encode`/`decode` are ser/rd byte-VM
         // programs with their own opcode space; they carry no CALL and are
         // validated by their own evaluators' fail-closed paths.)
@@ -1273,7 +1274,7 @@ pub extern "C" fn module_new(
                 scan_version_table(&s.vbin[..s.vbin_len as usize]).is_err()
             };
             if bad {
-                fault = b"[pipeline] FAULT: a stage needs an opcode/builtin not in this build";
+                fault = b"[pipeline] FAULT: a stage needs an opcode/builtin not in this build, or builds more strings than STAGE_SCRATCH_CAP on any record";
             }
         }
         if s.param_overflow || cut {

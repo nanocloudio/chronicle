@@ -82,6 +82,7 @@ use agg::{
     Staged, SysChan, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, COLL_CAP, KEY_CAP, MAX_LANES, MAX_OPS,
     MAX_PANES,
 };
+use agg::{proposal_reply_action, ReplyAction};
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
 include!("../../common/telemetry_core.rs");
@@ -262,6 +263,16 @@ struct ModuleState {
     current_term: u64,
     corr: u64,
     proposed: bool,
+    /// The correlation whose append the gate holds (0: none yet) — so a
+    /// `Superseded` verdict re-proposes once, not on every horizon.
+    awaiting: u64,
+    /// Proposals consensus refused (`MSG_PROPOSAL_REFUSED`), every status.
+    refused: u32,
+    /// No proposal before this `dev_millis` — set by a refusal.
+    retry_at_ms: u64,
+    /// A post-activation proposal was refused: propose again without waiting
+    /// for the next `checkpoint_every` events.
+    repropose: bool,
     /// 1 = a present-but-invalid supplied checkpoint. Distinct from "no checkpoint"
     /// (absent state starts fresh); a malformed/oversized one is a terminal
     /// activation fault — the module refuses to process rather than silently
@@ -384,6 +395,10 @@ pub extern "C" fn module_new(
         s.current_term = 0;
         s.corr = 1;
         s.proposed = false;
+        s.awaiting = 0;
+        s.refused = 0;
+        s.retry_at_ms = 0;
+        s.repropose = false;
         s.faulted = false;
         s.agg.reset();
 
@@ -547,6 +562,9 @@ unsafe fn try_propose(s: &mut ModuleState, sys: &SyscallTable) {
     if s.proposed || s.proposal_chan < 0 || s.current_term == 0 {
         return;
     }
+    if s.retry_at_ms != 0 && dev_millis(sys) < s.retry_at_ms {
+        return;
+    }
     let mut snap = [0u8; 512];
     let sn = match s.agg.snapshot(&mut snap) {
         Some(n) if n <= 512 - 11 => n,
@@ -578,11 +596,22 @@ unsafe fn try_propose(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
-/// Drain assigned_in (in[2]): on MSG_PROPOSAL_ASSIGNED for OUR correlation id,
-/// record the assigned (current_term, wal_index) in the barrier gate so the
-/// commit horizon on barrier_in can rule it durable. Bounded / panic-free.
+/// Drain assigned_in (in[2]), one message a step, before and after activation.
+///
+/// MSG_PROPOSAL_ASSIGNED for OUR correlation id, while staged: record the
+/// assigned (current_term, wal_index) in the barrier gate so the commit horizon
+/// on barrier_in can rule it durable.
+///
+/// MSG_PROPOSAL_REFUSED for OUR correlation id: consensus will never assign it,
+/// so the correlation is freed at once rather than waited on, the refusal is
+/// counted (`proposals_refused`), and the checkpoint is proposed again under a
+/// fresh correlation after `REFUSED_RETRY_MS` — before activation by the staged
+/// loop, after it by the ongoing one. `TOO_LARGE` the same state would draw
+/// again: while staged that is a terminal fault (the boot state can never be
+/// fenced), after activation the proposal is dropped and the next interval
+/// proposes a newer snapshot. Bounded / panic-free.
 unsafe fn drain_assigned(s: &mut ModuleState, sys: &SyscallTable) {
-    if s.assigned_chan < 0 || s.gate.is_pending() {
+    if s.assigned_chan < 0 {
         return;
     }
     let poll = (sys.channel_poll)(s.assigned_chan, 0x01);
@@ -598,16 +627,13 @@ unsafe fn drain_assigned(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
     let buf = &s.barrier_buf[..n as usize];
-    // [msg=0x14][len:u16][corr:u64][pid:u16][index:u64] — 21 bytes framed.
-    if buf.len() >= 21 && buf[0] == 0x14 {
-        let corr = u64::from_le_bytes([
-            buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10],
-        ]);
-        let index = u64::from_le_bytes([
-            buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19], buf[20],
-        ]);
-        if corr == s.corr {
-            s.gate.appended(s.current_term, index);
+    match proposal_reply_action(buf, s.corr, s.proposed, !s.active, dev_millis(sys)) {
+        ReplyAction::Append { index, term } => {
+            // The term the entry was appended in, when consensus says it:
+            // the gate's fence is that term, not whichever this module
+            // last heard.
+            s.gate.appended(term.unwrap_or(s.current_term), index);
+            s.awaiting = s.corr;
             dev_log(
                 sys,
                 3,
@@ -615,6 +641,31 @@ unsafe fn drain_assigned(s: &mut ModuleState, sys: &SyscallTable) {
                 45,
             );
         }
+        ReplyAction::Retry { retry_at_ms } => {
+            s.refused = s.refused.wrapping_add(1);
+            s.corr = s.corr.wrapping_add(1);
+            s.proposed = false;
+            s.retry_at_ms = retry_at_ms;
+            s.repropose = s.active;
+            let m: &'static [u8] = b"[aggregation] checkpoint proposal refused: retrying";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+        }
+        ReplyAction::Fail => {
+            s.refused = s.refused.wrapping_add(1);
+            s.corr = s.corr.wrapping_add(1);
+            s.proposed = false;
+            if s.active {
+                let m: &'static [u8] =
+                    b"[aggregation] checkpoint proposal refused as too large: dropped";
+                dev_log(sys, 2, m.as_ptr(), m.len());
+            } else {
+                s.faulted = true;
+                let m: &'static [u8] =
+                    b"[aggregation] FAULT: checkpoint proposal refused as too large";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+            }
+        }
+        ReplyAction::Ignore => {}
     }
 }
 
@@ -664,14 +715,24 @@ unsafe fn drain_barrier(s: &mut ModuleState, sys: &SyscallTable) {
         payload[14],
         payload[15],
     ]);
-    if let Durability::Durable { .. } = s.gate.horizon(term, index) {
-        s.active = true;
-        dev_log(
-            sys,
-            3,
-            b"[aggregation] barrier crossed: activated".as_ptr(),
-            40,
-        );
+    match s.gate.horizon(term, index) {
+        Durability::Durable { .. } => {
+            s.active = true;
+            dev_log(
+                sys,
+                3,
+                b"[aggregation] barrier crossed: activated".as_ptr(),
+                40,
+            );
+        }
+        // A newer term committed past our append: the entry may be gone. The
+        // gate keeps it pending for a re-append, so propose the state again
+        // under a fresh correlation — once per append, not once per horizon.
+        Durability::Superseded { .. } if s.proposed && s.awaiting == s.corr => {
+            s.corr = s.corr.wrapping_add(1);
+            s.proposed = false;
+        }
+        _ => {}
     }
 }
 
@@ -837,6 +898,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Emissions that withheld a value because a Count/Sum/Avg or a
             // TopK sum overflowed i64.
             tlm_counter(sys, midx, t, b + 11, s.agg.arith_overflows() as u64);
+            // Checkpoint proposals consensus refused (MSG_PROPOSAL_REFUSED).
+            tlm_counter(sys, midx, t, b + 12, s.refused as u64);
         }
 
         // A present-but-invalid supplied checkpoint is a terminal fault: refuse
@@ -899,7 +962,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // term (drain_leader keeps `current_term` current). Delivery is checked in
         // `try_propose`; the boot gate is not re-driven here — commit-acknowledged
         // retry-until-durable is clustor-coordinated.
-        if s.raft_mode && s.ckpt_every > 0 && s.events_since_ckpt >= s.ckpt_every {
+        if s.raft_mode {
+            // Refusals of an ongoing proposal, so its correlation is freed and
+            // it is proposed again (`repropose`) rather than lost.
+            drain_assigned(s, sys);
+        }
+        if s.raft_mode && s.ckpt_every > 0 && (s.events_since_ckpt >= s.ckpt_every || s.repropose) {
             drain_leader(s, sys);
             if s.proposed {
                 s.corr = s.corr.wrapping_add(1);
@@ -908,6 +976,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             try_propose(s, sys);
             if s.proposed {
                 s.events_since_ckpt = 0;
+                s.repropose = false;
             }
         }
 

@@ -251,6 +251,7 @@ ids outside the pinned table entirely.
 | `math` | `ext.math`, integer subset | `greatest`/`least` (2-arg pin), `abs`, `sign`, `bitAnd`, `bitOr`, `bitXor`, `bitShiftLeft`, `bitShiftRight` | scalars |
 | `encoders` | `ext.encoders` | `base64.encode`, `base64.decode` (strict: canonical padding or error) | scratch arena |
 | every build | CEL stdlib conversion | `int(x)` (int, uint, or a decimal string) | scalars |
+| every build | CEL stdlib conversion | `string(x)` (int or uint → decimal text, bool → `true`/`false`, a string unchanged, bytes → text when valid UTF-8, else `TypeError`); builtin id 34. CEL's `string(double)` overload has no argument here: there are no doubles | scratch arena (a string argument: returned as is) |
 | `bindings` | `ext.bindings` | `cel.bind(x, init, result)` | compiler + 2 slot opcodes, no runtime table entry |
 
 **Numbers.** Every number is an integer. `int` arithmetic divides toward zero
@@ -286,8 +287,12 @@ absence distinct from an empty value.
 
 **Scratch arena:** writing builtins append into a bounded caller-owned arena
 (`STAGE_SCRATCH_CAP` per stage/record) and return offset-addressed values,
-resolved at serialization. Overflow fails the evaluation closed
-(`ScratchOverflow`). The aggregation engine passes no arena — its programs may
+resolved at serialization. A `CONCAT` whose left operand ends the arena
+extends it in place rather than copying it, so a chain of `+` costs its result
+once; the bytes of the value it extended are left as they were. A decision
+rewinds the arena after each predicate. Overflow fails the evaluation closed
+(`ScratchOverflow`), and a program whose literals alone pass the arena
+(`scratch_floor`) is refused at load (`scan_stage_code`) and when authored. The aggregation engine passes no arena — its programs may
 use every non-writing builtin; a writing builtin there fails closed with
 `ScratchOverflow`.
 

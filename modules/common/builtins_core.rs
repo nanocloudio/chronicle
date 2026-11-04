@@ -73,6 +73,7 @@ pub mod builtin {
                                     // (docs/bytecode_policy.md, "Unassigned codes").
     pub const CONCAT: u16 = 31; //  a + b (strings) -> str      [scratch]
     pub const INT_OF: u16 = 32; //  int(x): int|uint|str -> int     [conversion]
+    pub const STRING_OF: u16 = 34; //  string(x): int|uint|bool|str|bytes -> str [conversion]
 }
 
 /// Bounded output arena for scratch-producing builtins. The caller owns the
@@ -121,7 +122,7 @@ pub fn builtin_available(id: u16) -> bool {
         #[cfg(feature = "encoders")]
         B64_ENCODE | B64_DECODE => true,
         // CEL's standard conversions: every build.
-        INT_OF => true,
+        INT_OF | STRING_OF => true,
         _ => false,
     }
 }
@@ -135,7 +136,7 @@ pub fn builtin_arity(id: u16) -> Option<usize> {
     use builtin::*;
     Some(match id {
         SIZE | TRIM | REVERSE_STR | REVERSE_BYTES | LOWER_ASCII | UPPER_ASCII | MATH_ABS
-        | MATH_SIGN | B64_ENCODE | B64_DECODE | INT_OF => 1,
+        | MATH_SIGN | B64_ENCODE | B64_DECODE | INT_OF | STRING_OF => 1,
         CONTAINS | STARTS_WITH | ENDS_WITH | INDEX_OF | LAST_INDEX_OF | CHAR_AT | SUBSTRING
         | MATH_GREATEST | MATH_LEAST | BIT_AND | BIT_OR | BIT_XOR | BIT_SHL | BIT_SHR | CONCAT => 2,
         SUBSTRING_RANGE | REPLACE => 3,
@@ -294,6 +295,47 @@ fn utf8_claim(lead: u8) -> usize {
     }
 }
 
+/// Whether `b` is well-formed UTF-8 (RFC 3629): no stray continuation byte,
+/// no truncated sequence, no overlong form, no surrogate, nothing past
+/// U+10FFFF. Written out rather than `core::str::from_utf8`, which a PIC
+/// module does not link.
+fn utf8_valid(b: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < b.len() {
+        let lead = b[i];
+        if lead < 0x80 {
+            i += 1;
+            continue;
+        }
+        let n = utf8_claim(lead);
+        // A continuation byte in lead position, or a lead past U+10FFFF.
+        if n == 1 || lead > 0xF4 || i + n > b.len() {
+            return false;
+        }
+        // The second byte's range is where overlongs, surrogates and the
+        // top of the code space are told apart.
+        let second = b[i + 1];
+        let (lo, hi) = match lead {
+            0xC0 | 0xC1 => return false,
+            0xE0 => (0xA0, 0xBF),
+            0xED => (0x80, 0x9F),
+            0xF0 => (0x90, 0xBF),
+            0xF4 => (0x80, 0x8F),
+            _ => (0x80, 0xBF),
+        };
+        if second < lo || second > hi {
+            return false;
+        }
+        for k in 2..n {
+            if b[i + k] & 0b1100_0000 != 0b1000_0000 {
+                return false;
+            }
+        }
+        i += n;
+    }
+    true
+}
+
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_val(c: u8) -> Option<u8> {
@@ -334,6 +376,37 @@ pub fn call_builtin<'a>(
                     .ok_or(EvalError::TypeError)
             }
         },
+        STRING_OF => match args[0] {
+            // CEL's `string(int)` / `string(uint)`: the decimal text, sign
+            // first, no padding — `string(-7) == "-7"`.
+            Value::Int(i) => decimal_into(s, i < 0, i.unsigned_abs()),
+            Value::Uint(u) => decimal_into(s, false, u),
+            // `string(true) == "true"`. Written into the arena rather than
+            // returned as a literal: a literal's address is a relocation a PIC
+            // build does not make.
+            Value::Bool(b) => {
+                let n = if b { 4 } else { 5 };
+                let off = s.reserve(n)?;
+                for (i, slot) in s.buf[off..off + n].iter_mut().enumerate() {
+                    *slot = if b { b"true"[i] } else { b"false"[i] };
+                }
+                Ok(Value::Scratch {
+                    off: off as u32,
+                    len: n as u32,
+                })
+            }
+            // `string(string)` is the value itself. `string(bytes)` is the same
+            // bytes read as text, which CEL allows only for valid UTF-8 — any
+            // other byte string is an error, never a lossy substitute.
+            Value::Str(x) => Ok(Value::Str(x)),
+            v => {
+                let src = Source::of(&v)?;
+                if !utf8_valid(src.bytes(s)) {
+                    return Err(EvalError::TypeError);
+                }
+                Ok(v)
+            }
+        },
         #[cfg(feature = "strings")]
         SIZE => Ok(Value::Int(Source::of(&args[0])?.len() as i64)),
         #[cfg(feature = "strings")]
@@ -341,6 +414,25 @@ pub fn call_builtin<'a>(
             let a = Source::of(&args[0])?;
             let b = Source::of(&args[1])?;
             let (al, bl) = (a.len(), b.len());
+            // A left operand that ENDS the arena — the previous `+` of a
+            // chain — is extended in place: only `b` is written. So
+            // `a + b + c + …` costs its result once rather than once per
+            // `+`. Nothing is moved: the old value's bytes stay where they
+            // were (an earlier holder of it still reads the same string), the
+            // new one simply runs on past them. Any other left operand is
+            // copied, as before.
+            if let Source::Arena { off, len } = a {
+                if off + len == s.used {
+                    let at = s.reserve(bl)?;
+                    for i in 0..bl {
+                        s.buf[at + i] = b.at(i, s);
+                    }
+                    return Ok(Value::Scratch {
+                        off: off as u32,
+                        len: (al + bl) as u32,
+                    });
+                }
+            }
             let off = s.reserve(al + bl)?;
             for i in 0..al {
                 s.buf[off + i] = a.at(i, s);
@@ -631,6 +723,36 @@ pub fn call_builtin<'a>(
 }
 
 /// A decimal integer (`[-+]digits`), checked; `None` otherwise.
+/// `magnitude` as decimal text (after a `-` when `negative`) appended into the
+/// arena: its exact length is counted first and the digits written back to
+/// front into that reservation, so no digit buffer sits on the stack.
+fn decimal_into<'a>(
+    s: &mut Scratch<'_>,
+    negative: bool,
+    magnitude: u64,
+) -> Result<Value<'a>, EvalError> {
+    let mut digits = 1usize;
+    let mut m = magnitude / 10;
+    while m > 0 {
+        digits += 1;
+        m /= 10;
+    }
+    let n = digits + negative as usize;
+    let off = s.reserve(n)?;
+    if negative {
+        s.buf[off] = b'-';
+    }
+    let mut m = magnitude;
+    for i in (off + n - digits..off + n).rev() {
+        s.buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+    }
+    Ok(Value::Scratch {
+        off: off as u32,
+        len: n as u32,
+    })
+}
+
 fn parse_i64_text(b: &[u8]) -> Option<i64> {
     let (neg, d) = match b.first() {
         Some(b'-') => (true, &b[1..]),

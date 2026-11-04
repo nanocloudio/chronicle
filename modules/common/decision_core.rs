@@ -77,7 +77,9 @@ pub fn describe_decision_error(e: DecisionError, put: &mut impl FnMut(&[u8])) {
             EvalError::BadBuiltin(_) => put(b"builtin not in this build"),
             EvalError::DivByZero => put(b"division by zero"),
             EvalError::Overflow => put(b"integer overflow"),
-            EvalError::ScratchOverflow => put(b"scratch arena overflow"),
+            EvalError::ScratchOverflow => put(
+                b"scratch arena overflow: the strings this branch builds pass STAGE_SCRATCH_CAP",
+            ),
             EvalError::BadLocal(_) => put(b"bad cel.bind local slot"),
         },
     }
@@ -103,7 +105,10 @@ fn dec_read_prog<'a>(
 }
 
 /// Load-time validation of a decision container: every rule's `when` and
-/// `outcome`, plus the default, must parse and pass [`scan_code`]. Same
+/// `outcome`, plus the default, must parse and pass [`scan_stage_code`] — the
+/// opcode scan, and the scratch floor: a branch that builds more strings than
+/// this target's `STAGE_SCRATCH_CAP` whatever the record says is refused here
+/// (`Eval(ScratchOverflow)`), not on every record it would have failed. Same
 /// refuse-at-load contract as `scan_stage_container`.
 pub fn scan_decision_container(container: &[u8]) -> Result<(), DecisionError> {
     let nrules = *container.first().ok_or(DecisionError::Truncated)? as usize;
@@ -112,12 +117,12 @@ pub fn scan_decision_container(container: &[u8]) -> Result<(), DecisionError> {
     while i < nrules {
         let (_, when_code) = dec_read_prog(container, &mut off)?;
         let (_, out_code) = dec_read_prog(container, &mut off)?;
-        scan_code(when_code).map_err(DecisionError::Eval)?;
-        scan_code(out_code).map_err(DecisionError::Eval)?;
+        scan_stage_code(when_code).map_err(DecisionError::Eval)?;
+        scan_stage_code(out_code).map_err(DecisionError::Eval)?;
         i += 1;
     }
     let (_, def_code) = dec_read_prog(container, &mut off)?;
-    scan_code(def_code).map_err(DecisionError::Eval)?;
+    scan_stage_code(def_code).map_err(DecisionError::Eval)?;
     Ok(())
 }
 
@@ -183,7 +188,13 @@ fn walk<'a>(
         let (when_cost, when_code) = dec_read_prog(container, &mut off)?;
         let (out_cost, out_code) = dec_read_prog(container, &mut off)?;
         let mut w = 0u64;
+        // A predicate's answer is a Bool: nothing it built in the scratch arena
+        // outlives it, so the arena is handed back once it has answered. Every
+        // arm's `when` is evaluated up to the one that matches, and without the
+        // rewind each one's strings would stack up under the outcome's.
+        let mark = scratch.used;
         let r = eval_scratch_metered(when_code, params, scratch, when_cost, &mut w);
+        scratch.used = mark;
         // Charged before any outcome is inspected: a predicate that faults
         // (cost ceiling, type error) spent its instructions all the same.
         *spent += w;

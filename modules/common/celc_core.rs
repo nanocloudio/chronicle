@@ -14,7 +14,7 @@
 //   cmp := add (CMPOP add)? ; add := mul (('+'|'-') mul)*
 //   mul := unary (('*'|'/'|'%') unary)* ; unary := '!' unary | '-' INT | primary
 //   primary := (INT | STR | 'true' | 'false' | '(' expr ')'
-//            | IDENT '(' args ')'                  — `size`, `int`, `has`
+//            | IDENT '(' args ')'                  — `size`, `int`, `string`, `has`
 //            | DOTTED ('{' name ':' expr, … '}')?
 //            | DOTTED '(' args ')') ('.' IDENT '(' args ')')*
 // Comparisons accept any operand types except a message construction,
@@ -47,8 +47,8 @@ pub const BUF_SCHEMA: u8 = 1;
 pub const BUF_PARAMS: u8 = 2;
 
 /// Structured, deterministic compile errors. Codes plus SPANS, never strings —
-/// a renderer slices names from the referenced buffer; the device CLI renders
-/// the code alone. `Parse`/`BadSchema` carry the
+/// a renderer slices names from the referenced buffer. The entry points refuse
+/// with a [`CelcFault`], which adds the source byte the refusal points at. `Parse`/`BadSchema` carry the
 /// byte offset that stopped the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CelcErr {
@@ -99,6 +99,39 @@ pub enum CelcErr {
     /// A field numbered in the engine's reserved block (`240..=255`) other
     /// than as that number's fixed type: schema offset of the number.
     ReservedField(u16),
+}
+
+/// A compile refusal and WHERE it happened: `at` is the byte of the source the
+/// refusal points at — the start of the name it could not resolve (an unknown
+/// name, parameter, field, construct type, function, or a call no overload
+/// takes), the byte a parse stopped on, or for a refusal with no span of its
+/// own (an ill-typed operand, nesting, capacity…) the byte the compiler had
+/// reached. Every `celc_compile*` entry point refuses with one, so a renderer
+/// can always say where, not just what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CelcFault {
+    pub err: CelcErr,
+    pub at: u16,
+}
+
+impl CelcFault {
+    /// `err` raised with the compiler `stopped` at this byte of the source.
+    fn new(err: CelcErr, stopped: usize) -> Self {
+        let at = match err {
+            CelcErr::Parse(o) => o,
+            CelcErr::UnknownName(s, _)
+            | CelcErr::UnknownParam(s, _)
+            | CelcErr::UnknownFunction(s, _)
+            | CelcErr::BadCallArgs(s, _) => s,
+            CelcErr::UnknownField { field_s, .. } => field_s,
+            CelcErr::UnknownMessageType {
+                buf: BUF_SRC, s, ..
+            } => s,
+            CelcErr::NotAMessage { path_s, .. } => path_s,
+            _ => stopped.min(u16::MAX as usize) as u16,
+        };
+        Self { err, at }
+    }
 }
 
 /// The first of the field numbers the engines reserve. `253` (the exchange
@@ -165,7 +198,7 @@ pub fn celc_compile_ty(
     params: &[u8],
     src: &[u8],
     out: &mut [u8],
-) -> Result<(usize, CTy), CelcErr> {
+) -> Result<(usize, CTy), CelcFault> {
     celc_compile_scoped(schema, params, src, out, false)
 }
 
@@ -182,7 +215,7 @@ pub fn celc_compile_implicit(
     params: &[u8],
     src: &[u8],
     out: &mut [u8],
-) -> Result<(usize, CTy), CelcErr> {
+) -> Result<(usize, CTy), CelcFault> {
     celc_compile_scoped(schema, params, src, out, true)
 }
 
@@ -192,11 +225,11 @@ fn celc_compile_scoped(
     src: &[u8],
     out: &mut [u8],
     receiver: bool,
-) -> Result<(usize, CTy), CelcErr> {
+) -> Result<(usize, CTy), CelcFault> {
     // Every span is a u16; a longer buffer would wrap one and slice backwards.
     let max = u16::MAX as usize;
     if src.len() > max || schema.len() > max || params.len() > max {
-        return Err(CelcErr::Capacity);
+        return Err(CelcFault::new(CelcErr::Capacity, 0));
     }
     let mut p = Celc {
         schema,
@@ -213,12 +246,15 @@ fn celc_compile_scoped(
     };
     p.skip_ws();
     if p.pos >= p.src.len() {
-        return Err(CelcErr::Empty);
+        return Err(CelcFault::new(CelcErr::Empty, 0));
     }
-    let (ty, _) = p.expr()?;
+    let ty = match p.expr() {
+        Ok((ty, _)) => ty,
+        Err(e) => return Err(CelcFault::new(e, p.pos)),
+    };
     p.skip_ws();
     if p.pos != p.src.len() {
-        return Err(CelcErr::Trailing);
+        return Err(CelcFault::new(CelcErr::Trailing, p.pos));
     }
     Ok((p.w, ty))
 }
@@ -229,7 +265,7 @@ pub fn celc_compile(
     params: &[u8],
     src: &[u8],
     out: &mut [u8],
-) -> Result<(usize, bool), CelcErr> {
+) -> Result<(usize, bool), CelcFault> {
     let (n, ty) = celc_compile_ty(schema, params, src, out)?;
     Ok((n, matches!(ty, CTy::Msg(..))))
 }
@@ -241,11 +277,11 @@ pub fn celc_compile_auto(
     params: &[u8],
     src: &[u8],
     out: &mut [u8],
-) -> Result<usize, CelcErr> {
+) -> Result<usize, CelcFault> {
     let (mut n, is_msg) = celc_compile(schema, params, src, out)?;
     if !is_msg {
         if n >= out.len() {
-            return Err(CelcErr::Capacity);
+            return Err(CelcFault::new(CelcErr::Capacity, src.len()));
         }
         out[n] = ir::RET;
         n += 1;
@@ -656,7 +692,7 @@ impl Celc<'_> {
         let mut segs = [Seg { s: 0, e: 0 }; CELC_MAX_SEGS];
         let first = self.ident().ok_or(CelcErr::Parse(self.pos as u16))?;
 
-        // Global function form: `ident(` — `size(x)`, `int(x)`, and CEL's `has(m.f)`.
+        // Global function form: `ident(` — `size(x)`, `int(x)`, `string(x)`, and CEL's `has(m.f)`.
         self.skip_ws();
         if self.src.get(self.pos) == Some(&b'(') {
             self.pos += 1;
@@ -1185,7 +1221,7 @@ impl Celc<'_> {
 
 /// Call forms for [`resolve_builtin`].
 const NS_METHOD: u8 = 0; // recv.name(args)
-const NS_GLOBAL: u8 = 1; // name(args)         — `size`, `int`
+const NS_GLOBAL: u8 = 1; // name(args)         — `size`, `int`, `string`
 const NS_MATH: u8 = 2; // math.name(args)
 const NS_B64: u8 = 3; // base64.name(args)
 
@@ -1320,6 +1356,16 @@ fn resolve_builtin(
                     return Err(true);
                 }
                 Ok((b::INT_OF, CTy::Int))
+            }
+            // CEL's conversion to a string: decimal text of an int or uint,
+            // `true`/`false`, a string unchanged, bytes as (UTF-8) text. There
+            // is no `double` here to convert — every number is an integer —
+            // so CEL's `string(double)` overload has no argument to take.
+            b"string" => {
+                if args.len() != 1 || matches!(args[0], CTy::Msg(..)) {
+                    return Err(true);
+                }
+                Ok((b::STRING_OF, CTy::Str))
             }
             _ => Err(false),
         },

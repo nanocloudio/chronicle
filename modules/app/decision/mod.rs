@@ -251,8 +251,17 @@ pub extern "C" fn module_new(
         if s.cont_len > 0 {
             // Load-time scan of every rule's when/outcome and the default:
             // unknown opcodes, truncation, builtins not in this variant.
-            if scan_decision_container(&s.cont[..s.cont_len as usize]).is_err() {
-                fault = b"[decision] FAULT: container invalid or needs a builtin not in this build";
+            match scan_decision_container(&s.cont[..s.cont_len as usize]) {
+                Ok(()) => {}
+                // A branch whose literals alone pass the stage scratch: it
+                // could never complete here, whatever record arrives.
+                Err(DecisionError::Eval(dec::EvalError::ScratchOverflow)) => {
+                    fault = b"[decision] FAULT: a branch builds more strings than STAGE_SCRATCH_CAP on any record";
+                }
+                Err(_) => {
+                    fault =
+                        b"[decision] FAULT: container invalid or needs a builtin not in this build";
+                }
             }
         }
         if !fault.is_empty() {
