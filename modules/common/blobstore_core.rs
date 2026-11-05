@@ -44,7 +44,7 @@ pub const OBJ_GET: u32 = 0x1421;
 pub const OBJ_RANGE_GET: u32 = 0x1423;
 pub const OBJ_CLOSE: u32 = 0x1425;
 
-use crate::abi::contracts::storage::object::{write_answer, WriteAnswer};
+use crate::abi::contracts::storage::object::{write_answer, Kept, WriteAnswer};
 use crate::abi::kernel_abi::errno::{EAGAIN, ENOENT, ENXIO};
 
 /// Longest key this core builds: the prefix plus 64 hex characters.
@@ -225,7 +225,7 @@ unsafe fn put_raw(
     // storage.object PUT argument layout:
     //   [key_len:u16][key][content_type_len:u8]
     //   [body_ptr:u64][body_len:u64][precondition:u8][etag_len:u8]
-    //   [fence_ptr:u64][fence_cap:u16]
+    //   [Kept block][fence_ptr:u64][fence_cap:u16]
     let mut fence = [0u8; 62];
     let mut arg = [0u8; BLOB_KEY_MAX + 64];
     let mut p = 0usize;
@@ -242,6 +242,11 @@ unsafe fn put_raw(
     arg[p] = 0; // precondition = ANY
     arg[p + 1] = 0; // etag_len
     p += 2;
+    // A blob's name is its content: no key reference, no retention, no hold.
+    p += match Kept::none().encode(&mut arg[p..]) {
+        Some(n) => n,
+        None => return Err(BlobError::PutFailed),
+    };
     arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
     p += 8;
     arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
