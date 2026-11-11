@@ -14,8 +14,9 @@
 #
 #   aggregation     23,744
 #   sensor_intake      256
+#   adc_rp             128
 #   temp_sensor         64
-#   total           24,064   36% of 65,536, slack 41,472
+#   total           24,192   36% of 65,536, slack 41,344
 #
 # `aggregation` holds four lanes of four panes here against sixteen of eight on a
 # Pi 5, because its lane, pane, operator and collection ceilings are keyed on the
@@ -44,6 +45,10 @@
 target: pico
 
 modules:
+  # The `adc` provider `temp_sensor` reads: the RP ADC, including the
+  # on-die temperature channel.
+  - name: adc_rp
+
   - name: temp_sensor
     interval_ms: 5000
     sensor_id: 1

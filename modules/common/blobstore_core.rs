@@ -39,10 +39,10 @@
 // `SyscallTable` and the `storage.object` write answer).
 
 /// `storage.object` opcodes (fluxor contract vocabulary).
-pub const OBJ_PUT: u32 = 0x1420;
-pub const OBJ_GET: u32 = 0x1421;
-pub const OBJ_RANGE_GET: u32 = 0x1423;
-pub const OBJ_CLOSE: u32 = 0x1425;
+pub const OBJ_PUT: u32 = crate::abi::registry::storage_object::PUT;
+pub const OBJ_GET: u32 = crate::abi::registry::storage_object::GET;
+pub const OBJ_RANGE_GET: u32 = crate::abi::registry::storage_object::RANGE_GET;
+pub const OBJ_CLOSE: u32 = crate::abi::registry::storage_object::CLOSE;
 
 use crate::abi::contracts::storage::object::{write_answer, Kept, WriteAnswer};
 use crate::abi::kernel_abi::errno::{EAGAIN, ENOENT, ENXIO};

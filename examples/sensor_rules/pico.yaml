@@ -28,13 +28,18 @@
 #
 #   decision        19,648
 #   sensor_intake      256
+#   adc_rp             128
 #   temp_sensor         64
-#   total           19,968   30% of 65,536, slack 45,568
+#   total           20,096   30% of 65,536, slack 45,440
 #
 # `fluxor build` reports it and refuses the graph if it overruns.
 target: pico
 
 modules:
+  # The `adc` provider `temp_sensor` reads: the RP ADC, including the
+  # on-die temperature channel.
+  - name: adc_rp
+
   - name: temp_sensor
     interval_ms: 5000
     sensor_id: 1
