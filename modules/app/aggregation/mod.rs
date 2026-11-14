@@ -12,24 +12,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Evaluator + frame codec + aggregation engine + hex codec — identical source to
 // the host harness (tests/harness), all in ONE module so cross-references resolve.
@@ -288,7 +282,7 @@ struct ModuleState {
     agg: AggState,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // Every program param is a `blob`: its own bytes, in chunks of at most
@@ -321,16 +315,11 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 // The same figure as data, so `pack` records this engine's resident footprint
 // in its manifest and a graph's state-arena demand is summable at compose time
 // rather than discovered when the device fails to load it.
-declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -854,7 +843,7 @@ unsafe fn try_checkpoint(s: &mut ModuleState, sys: &SyscallTable) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -905,7 +894,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // A present-but-invalid supplied checkpoint is a terminal fault: refuse
         // input rather than run with silently-erased history.
         if s.faulted {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Distributed activation barrier: while staged behind an unmet barrier,
@@ -921,7 +910,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             drain_barrier(s, sys);
             if !s.active {
-                return 0;
+                return StepReturn::Continue;
             }
         }
 
@@ -948,7 +937,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Checkpoint only when no emissions are pending — a checkpoint must not get
@@ -981,7 +970,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if s.in_chan < 0 || s.cont_len < 36 {
-            return 0;
+            return StepReturn::Continue;
         }
         let cont_len = s.cont_len as usize;
 
@@ -994,7 +983,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }; MAX_OPS];
         let cont = core::slice::from_raw_parts(s.cont.as_ptr(), cont_len);
         let Some((spec, _nops)) = build_spec(cont, &mut ops) else {
-            return 0;
+            return StepReturn::Continue;
         };
 
         // Admit exactly one whole typed event frame (peek-confirmed, never partial).
@@ -1004,15 +993,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.acct.admit_input(nn as u64);
                 nn
             }
-            Admit::Empty | Admit::NeedMore => return 0,
+            Admit::Empty | Admit::NeedMore => return StepReturn::Continue,
             Admit::BoundaryLost => {
                 // An event frame beyond max_record: observed and rejected.
                 let _ = drain_all(&inch, &mut s.in_buf);
                 s.acct.reject_input(0);
-                return 0;
+                return StepReturn::Continue;
             }
             // A channel fault before an event is framed is a dependency error.
-            Admit::ChanError(_) => return 0,
+            Admit::ChanError(_) => return StepReturn::Continue,
         };
         let frame = core::slice::from_raw_parts(s.in_buf.as_ptr(), read);
 
@@ -1064,6 +1053,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // work units: this event's window emissions are its fold/finalize work.
         s.acct.add_work(captured as u64);
         s.events_since_ckpt = s.events_since_ckpt.wrapping_add(1);
-        0
+        StepReturn::Continue
     }
 }

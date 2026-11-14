@@ -37,24 +37,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 // Evaluator + staged executor + hex codec + IR lowerer — identical source to
 // the on-device engines, all in ONE module so cross-references resolve.
@@ -96,13 +90,12 @@ mod tc {
     include!("../../common/slot_core.rs");
     // fluxor SDK crypto — the repo set's single crypto owner. Include ORDER is
     // load-bearing: ed25519 needs the SHA-512 that lives in sha384.rs.
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
+
+    pub use fluxor_sdk::crypto::sha256::*;
+
     // p256 carries the shared U256 arithmetic ed25519 builds on — the SDK's
     // documented include set, not an unused import.
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+    pub use fluxor_sdk::crypto::ed25519::*;
 
     // Authoring orchestration + shared CLI helpers, mounted last so it
     // sees every core it composes (celc/lower/plan/artefact).
@@ -123,15 +116,10 @@ use tc::{
     blob_get,
     blob_put,
     blob_range,
-    // The release control plane.
-    build_versions_param,
     celc_compile_auto,
     ckpt_load_latest,
     ckpt_save,
-    compile_decision,
-    compile_failed,
     compile_ir,
-    compile_one,
     // The dynamic ("POST source") compile path.
     compile_pipeline_ir,
     compile_to_code_buf,
@@ -144,25 +132,16 @@ use tc::{
     hex_encode,
     kind_from_name,
     lower_arg_buf,
-    lower_flat,
-    lower_pipeline_with,
     lower_stages,
     oci_fetch,
     oci_init,
     oci_push,
     oci_resolve_tag,
-    param_message_name,
     parse_bindings,
-    parse_i64,
-    plan_agg_emit_params,
-    plan_agg_emit_schema,
     plan_line_col,
-    plan_params_text,
     plan_parse,
-    plan_schema_text,
     plan_verify,
     print_digest,
-    put_ir_prog,
     put_prog,
     release_from_argv,
     remove_version_msg,
@@ -172,80 +151,51 @@ use tc::{
     scan_decision_container,
     scratch_over,
     scratch_refused,
-    seal_aggregation,
-    seal_decision,
     seal_expression,
-    seal_pipeline,
     seal_plan,
     seal_transformation,
     set_default_msg,
     sha256,
-    // OTA slot inspection.
-    slot_decode,
-    slot_verify,
     split_argv,
     split_csv,
     split_digests,
-    split_qname,
     split_qualified,
     stage_at,
     stage_count,
     version_digest,
     ActivationError,
-    AggregationSpec,
     BindingParamStore,
-    BindingSpec,
     BlobError,
     Branch,
     Builder,
     CkptError,
     CkptLoad,
     Connector,
-    DecisionSpec,
-    Doc,
-    EntrySpec,
     ExpressionSpec,
     Field,
-    GraphStage,
     HeaderSpec,
     Layer,
-    ManifestRef,
     Message,
     NodeState,
     OciError,
     OciFetch,
-    OperatorSpec,
-    PipelineSpec,
     PlanArena,
     PlanEntry,
-    PlanErrorKind,
     PlanSpec,
     PushBufs,
     ReadHold,
     RegError,
-    ReleaseError,
     ResourceBinding,
-    RuleSource,
-    RuleSpec,
     Scratch,
-    SlotError,
     SlotVerifier,
     Stage,
     StageSource,
-    StageSpec as ArtStageSpec,
-    TargetProfile,
     TransformationSpec,
     Value,
     VerifyError,
-    VersionRef,
-    VersionSpec,
     BIN_BUF,
-    KIND_AGGREGATION,
-    KIND_DECISION,
     KIND_EXPRESSION,
-    KIND_PIPELINE,
     KIND_PLAN,
-    KIND_SCHEMA,
     KIND_TRANSFORMATION,
     MAX_ARGV,
     MAX_BINDINGS,
@@ -254,23 +204,11 @@ use tc::{
     MAX_NODE_STAGES,
     MAX_PIPE_FIELDS,
     MAX_SET,
-    MAX_VERSIONS,
     MEDIA_TYPE_PLAN,
-    OP_AVG,
-    OP_COUNT,
-    OP_DISTINCT,
-    OP_MAX,
-    OP_MIN,
-    OP_QUANTILE,
-    OP_SUM,
-    OP_TOPK,
     PROVENANCE_LOCAL_BUILD,
     ROUTE_NONE,
-    // The deployment half: document -> graph stages -> graph, all on device.
-    STAGE_EFFECT,
     STAGE_KIND_COMPUTE,
     STAGE_SCRATCH_CAP,
-    VERSION_DIGEST_LEN,
 };
 
 const PORT_INPUT: u8 = 0;
@@ -2051,16 +1989,11 @@ fn cmd_digest(s: &mut Work, hex: &[u8]) -> (usize, i32) {
     print_digest(&mut s.out, &d)
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, stack: tc::CELC_MAX_DEPTH * 1024 + 16 * 1024 }
 
 // The same figure as data, so `pack` records this engine's resident footprint
 // in its manifest and a graph's state-arena demand is summable at compose time
 // rather than discovered when the device fails to load it.
-declare_module_state_bytes!(State);
 
 // Its stack depth. The build's call-graph walk measures every path except the
 // compiler's recursive descent (`Celc::expr` -> ... -> `Celc::expr`), which it
@@ -2077,7 +2010,6 @@ declare_module_state_bytes!(State);
 // Declared as 1 KiB per level plus 16 KiB, which covers both with margin.
 // Every large work buffer lives in `Work`, so no command frame scales with an
 // artefact or argv bound; re-derive this if one is added to a frame.
-declare_module_stack_bytes!(tc::CELC_MAX_DEPTH * 1024 + 16 * 1024);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -2136,18 +2068,18 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let s = &mut *(state as *mut State);
         if s.w.syscalls.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let sys = &*s.w.syscalls;
         if s.done != 0 {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         if s.exit_chan < 0 {
             s.exit_chan = dev_channel_port(sys, PORT_OUTPUT, 1);
@@ -2169,7 +2101,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if an <= 0 && s.held == 0 {
                 s.waited += 1;
                 if s.waited < ARGV_WAIT {
-                    return 0; // keep waiting for argv
+                    return StepReturn::Continue; // keep waiting for argv
                 }
             }
             let alen = if an > 0 { an as usize } else { 0 };
@@ -2516,7 +2448,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // store frees room only between steps.
                 s.held = 1;
                 s.held_alen = alen as u32;
-                return 0;
+                return StepReturn::Continue;
             }
             s.held = 0;
             s.res_olen = olen as u16;
@@ -2542,13 +2474,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if w > 0 {
                 s.out_off += w as u16;
             } else if w == 0 || w == abi::kernel_abi::errno::EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             } else {
                 s.done = 1;
-                return STEP_DONE;
+                return StepReturn::Done;
             }
             if s.out_off < s.res_olen {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         if s.exit_chan >= 0 && s.exit_done == 0 {
@@ -2557,15 +2489,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if w == c.len() as i32 {
                 s.exit_done = 1;
             } else if w == 0 || w == abi::kernel_abi::errno::EAGAIN {
-                return 0;
+                return StepReturn::Continue;
             } else {
                 s.done = 1;
-                return STEP_DONE;
+                return StepReturn::Done;
             }
         }
         s.done = 1;
-        STEP_DONE
+        StepReturn::Done
     }
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

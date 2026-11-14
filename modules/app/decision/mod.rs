@@ -22,24 +22,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 mod dec {
     use super::abi::SyscallTable;
@@ -165,7 +159,7 @@ struct ModuleState {
     last_rule: u16,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // `blob`: the container's own bytes, in chunks of at most 255, the first
@@ -175,16 +169,11 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 // The same figure as data, so `pack` records this engine's resident footprint
 // in its manifest and a graph's state-arena demand is summable at compose time
 // rather than discovered when the device fails to load it.
-declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -279,7 +268,7 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -313,7 +302,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if s.in_chan < 0 || s.cont_len == 0 || s.faulted != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let inch = SysChan::new(sys, s.in_chan);
         let outch = SysChan::new(sys, s.out_chan);
@@ -360,7 +349,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             _ => {}
         }
-        0
+        StepReturn::Continue
     }
 }
 

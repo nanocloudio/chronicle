@@ -62,10 +62,10 @@ want1=$(python3 -c 'import struct;print((bytes([1])+struct.pack("<BBH",1,1,8)+st
 # the count of records refused for exceeding the field table or a map stage's
 # maximum. `observe` drains the telemetry ring to stderr as MON_METRIC lines,
 # naming a module by its instance index, which the runtime's own load log gives
-# (`module N caps: …` then `loaded pipeline`) — read, not assumed.
+# (`module N grants: …` then `loaded pipeline`) — read, not assumed.
 OBSERVE='/^wiring:/i\  - name: observe\n    params:\n      interval_ms: 100'
 mod_index() { # <stderr file> <module name>
-  awk -v m="$2" '/\[inst\] module [0-9]+ caps:/ { for (i = 1; i < NF; i++) if ($i == "module") n = $(i + 1) }
+  awk -v m="$2" '/\[inst\] module [0-9]+ grants:/ { for (i = 1; i < NF; i++) if ($i == "module") n = $(i + 1) }
                  $0 ~ ("loaded " m "$") { print n; exit }' "$1" 2>/dev/null
 }
 over_bound() { # <stderr file> -> the highest over_bound value reported

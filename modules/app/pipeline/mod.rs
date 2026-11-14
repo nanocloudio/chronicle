@@ -22,34 +22,23 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The exchange contract: one definition shared with every requester and
 // provider in the workspace.
-#[allow(dead_code, reason = "this module consumes a subset of the contract")]
-#[rustfmt::skip]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-mod exchange;
-use exchange::{
-    flag, kind, record_kind, Collector, ExchangeId, Refuse, KEY_MAX, PAYLOAD_MAX, RECORD_MAX,
-};
+use exchange::{kind, record_kind, Collector, ExchangeId, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
+use fluxor_abi::contracts::exchange;
 
 /// A decode program's scratch arena (values it builds rather than borrows):
 /// room for three whole-record documents at the full tier, so a decoder can
@@ -729,13 +718,13 @@ use pipe::{
     admit_frame, decode_frame, drain_all, encode_frame, encode_frame_scratch, eval_bytes,
     eval_decode_scratch, frame_len, is_data_field, lower_stages_kinded, parse_version_table,
     pipeline_reload_kinded, rd_frame, record_id, request_fields, request_head, response_fields,
-    response_head, run_decision_metered, run_map_stage, run_stage_metered, run_stages_metered,
-    run_stages_with, scan_decision_container, scan_map_container, scan_stage_code,
-    scan_version_table, stage_at, stage_count, version_selector_from_frame, Accounting, Admit,
-    Answer, BlobIn, Builder, EvalError, Field, FieldMap, Inflight, Message, Mode, Pending,
-    PipeError, RdFrame, Scratch, Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE,
-    ACCT_METRIC_COUNT, CARRY_FIELD, EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS,
-    STAGE_KIND_COMPUTE, STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
+    response_head, run_decision_metered, run_map_stage, run_stage_metered, run_stages_with,
+    scan_decision_container, scan_map_container, scan_stage_code, scan_version_table, stage_at,
+    stage_count, version_selector_from_frame, Accounting, Admit, Answer, BlobIn, Builder,
+    EvalError, Field, FieldMap, Inflight, Message, Mode, Pending, PipeError, RdFrame, Scratch,
+    Stage, StageEval, Staged, SysChan, Value, ACCT_IS_GAUGE, ACCT_METRIC_COUNT, CARRY_FIELD,
+    EXCHANGE_STATUS_FIELD, MAX_NODE_STAGES, MAX_PIPE_FIELDS, STAGE_KIND_COMPUTE,
+    STAGE_KIND_DECISION, STAGE_KIND_MAP, STAGE_SCRATCH_CAP,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime so its primitives are in scope.
@@ -963,7 +952,7 @@ struct ModuleState {
     tlm_last_ms: u64,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // Every program param is a `blob`: the program's own bytes, in chunks of
@@ -1045,16 +1034,11 @@ define_params! {
     18, decode_len, u32, 0 => |s, d, len| { s.dec_fixed = p_u32(d, len, 0, 0); };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 // The same figure as data, so `pack` records this engine's resident footprint
 // in its manifest and a graph's state-arena demand is summable at compose time
 // rather than discovered when the device fails to load it.
-declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -1338,7 +1322,7 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -1410,7 +1394,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !s.req_box.flush(sys, s.req_out_chan, &s.req_buf)
             || !s.resp_box.flush(sys, s.resp_out_chan, &s.resp_buf)
         {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // 0b. The requester's answers, and the replays a LINK_DOWN owes.
@@ -1418,14 +1402,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             requester_step(s, sys);
             replay_step(s, sys);
             if s.req_box.holding() {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         // 0c. Another node's answers passing through to the requester.
         if relay_resp {
             relay_response(s, sys);
             if s.resp_box.holding() {
-                return 0;
+                return StepReturn::Continue;
             }
         }
 
@@ -1480,7 +1464,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if (s.in_chan < 0 && s.req_in_chan < 0) || s.faulted != 0 || unconfigured {
-            return 0;
+            return StepReturn::Continue;
         }
         let outch = SysChan::new(sys, s.out_chan);
 
@@ -1496,20 +1480,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.acct.output_drained(plen);
                     record_succeeded(s, sys);
                 }
-                Staged::Pending => return 0,
+                Staged::Pending => return StepReturn::Continue,
                 Staged::Failed(_) => {
                     s.pending = Pending { off: 0, len: 0 };
                     s.acct.output_failed_pending(plen);
                     record_failed(s, sys);
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         // A full in-flight window is backpressure: nothing is admitted until the
         // provider answers, so this module never runs ahead of it.
         if requester && !s.inflight.has_room() {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // 3. Admit ONE input unit: a whole collected request (provider), a
@@ -1525,7 +1509,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     frame_ptr = s.xframe.as_ptr();
                     frame_bytes = n;
                 }
-                None => return 0,
+                None => return StepReturn::Continue,
             }
         } else if s.req_in_chan >= 0 {
             match provider_intake(s, sys) {
@@ -1533,7 +1517,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     frame_ptr = s.xframe.as_ptr();
                     frame_bytes = n;
                 }
-                None => return 0,
+                None => return StepReturn::Continue,
             }
         } else if s.dec_len > 0 {
             match raw_intake(s, sys) {
@@ -1541,7 +1525,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     frame_ptr = s.dec_out.as_ptr();
                     frame_bytes = rl;
                 }
-                None => return 0,
+                None => return StepReturn::Continue,
             }
         } else {
             let inch = SysChan::new(sys, s.in_chan);
@@ -1551,17 +1535,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     frame_ptr = s.in_buf.as_ptr();
                     frame_bytes = nn;
                 }
-                Admit::Empty | Admit::NeedMore => return 0,
+                Admit::Empty | Admit::NeedMore => return StepReturn::Continue,
                 Admit::BoundaryLost => {
                     // A frame beyond max_record: a complete-but-untrusted unit,
                     // observed and rejected; nothing was read (no input bytes).
                     let _ = drain_all(&inch, &mut s.in_buf);
                     s.acct.reject_input(0);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // A channel fault before a frame is framed is a dependency error,
                 // not a received record — it enters no input bucket.
-                Admit::ChanError(_) => return 0,
+                Admit::ChanError(_) => return StepReturn::Continue,
             }
         }
         let frame_in = core::slice::from_raw_parts(frame_ptr, frame_bytes);
@@ -1660,7 +1644,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         };
         if out_len == 0 {
-            return 0;
+            return StepReturn::Continue;
         }
 
         // 5. The record's one defined output, by role: a request on
@@ -1672,15 +1656,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // saying how.
         if s.req_in_chan >= 0 && !s.answer && names_status(s, out_len) {
             emit_answer(s, sys, out_len, false);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.req_out_chan >= 0 {
             emit_request(s, sys, out_len, relay_req);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.answer {
             emit_answer(s, sys, out_len, true);
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Optional trailing encoder → a wire payload in `enc_out`, copied into
@@ -1695,7 +1679,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 None => {
                     record_failed(s, sys);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         } else {
@@ -1713,7 +1697,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 record_failed(s, sys);
             }
         }
-        0
+        StepReturn::Continue
     }
 }
 

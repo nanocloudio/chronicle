@@ -5,9 +5,9 @@
 name    = "chronicle"
 version = "0.0.1"
 
-# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs, the PIC
-# linker script) materialised by `fluxor sync` into
-# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary.
+# fluxor provides the module SDK as three crates materialised by `fluxor sync`
+# under target/fluxor/ (`fluxor-abi`, `fluxor-rt`, `fluxor-sdk`), plus the
+# `fluxor-linux` runtime binary.
 [dependencies]
 fluxor = "0.0.1"
 # These pins serve the conformance graphs in `examples/`, each of which composes
@@ -87,23 +87,19 @@ scripts = [
 forbid_inline_tests = ["modules"]
 mode                = "strict"
 
-# The engines relax `dead_code` / `unused_imports` / `unreachable_patterns`
-# at the crate root, which `lints.md` §3 otherwise forbids in favour of a
-# call-site `#[expect]`. Declared here with the reason rather than suppressed,
-# on the same grounds fluxor's own `modules/` prefix carries: a PIC module
-# `include!`s the whole of `target/fluxor/fluxor-abi/sdk/*` AND the shared
-# device cores in `modules/common/*`, so every engine's compile sees the entire
-# ABI surface and every core while using a subset of each. That is a property
-# of how a PIC module is assembled, not of any one engine, and a call-site
-# attribute cannot state it — the unused items are in textually mounted files
-# the engine does not own.
+# The engines relax `dead_code` at the crate root, which `lints.md` §3
+# otherwise forbids in favour of a call-site `#[expect]`. Declared here with
+# the reason rather than suppressed: a PIC module mounts the shared cores in
+# `modules/common/*` whole while using a subset of each. That is a property of
+# how a PIC module is assembled, not of any one engine, and a call-site
+# attribute cannot state it — the unused items are in mounted files the engine
+# does not own.
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/app/"
-reason = """Chronicle's engines mount the fluxor SDK and the shared cores in \
-modules/common/* via include!, so each engine's compile sees the whole ABI \
-surface and every core while consuming a subset. Same cause as fluxor's own \
-modules/ prefix; the unused items belong to mounted files, not to the engine, \
-so there is no call site to put an #[expect] on."""
+reason = """Chronicle's engines mount the shared cores in modules/common/* whole, \
+so each engine's compile sees every core while consuming a subset; the unused \
+items belong to mounted files, not to the engine, so there is no call site to \
+put an #[expect] on."""
 
 # Manifest roots for the telemetry id-table (names, histogram bounds,
 # dimension domains): chronicle graphs COMPOSE store-resolved modules from

@@ -39,24 +39,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Only the accounting taxonomy is mounted. This module deliberately does NOT
 // include `vm_core`/`pipeline_core`: they would bring the bounded CEL evaluator
@@ -66,7 +60,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // instead; the format is four bytes of header per field and is pinned by the
 // round-trip test in `tests/`.
 mod si {
-    use super::abi::SyscallTable;
+
     include!("../../common/accounting_core.rs");
 }
 use si::Accounting;
@@ -141,15 +135,10 @@ struct ModuleState {
     stalls: u32,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 // The same figure as data, so `pack` records this module's footprint and a
 // sensor graph's arena demand is summable at compose time.
-declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -200,7 +189,7 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -225,25 +214,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 s.stalls = s.stalls.wrapping_add(1);
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Admit one whole sample. A fixed-size record is read all-or-nothing:
         // there is no length prefix to recover a partial one from.
         let got = (sys.channel_read)(s.in_chan, s.in_buf.as_mut_ptr(), SAMPLE_SIZE);
         if got <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if (got as usize) < SAMPLE_SIZE {
             s.errors_short = s.errors_short.wrapping_add(1);
             s.acct.inputs_rejected = s.acct.inputs_rejected.wrapping_add(1);
-            return 0;
+            return StepReturn::Continue;
         }
 
         let Some(sample) = abi::contracts::sensor::decode(&s.in_buf[..SAMPLE_SIZE]) else {
             s.errors_short = s.errors_short.wrapping_add(1);
             s.acct.inputs_rejected = s.acct.inputs_rejected.wrapping_add(1);
-            return 0;
+            return StepReturn::Continue;
         };
 
         // Translate. Field numbers are the fixed layout in the module doc, so a
@@ -275,6 +264,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // than asserted: a panic in a PIC module has no unwinder.
             s.acct.inputs_failed = s.acct.inputs_failed.wrapping_add(1);
         }
-        0
+        StepReturn::Continue
     }
 }

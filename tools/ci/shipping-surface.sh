@@ -28,14 +28,15 @@ hits=$(msrc | xargs grep -hn 'include!' 2>/dev/null | grep -c 'crates/' || true)
   && ok "no module includes host code from a crate" \
   || no surface "$hits module include!(s) reach into crates/"
 
-# 2. Modules may only include from `modules/common` (the shared cores) or
-#    `target/fluxor` (the SDK). Anything else is a new, unreviewed path in. A
-#    bare sibling filename is a core including a core — the `common` root.
+# 2. Modules may only include from `modules/common` (the shared cores); the
+#    fluxor SDK is linked as crates, never included. Anything else is a new,
+#    unreviewed path in. A bare sibling filename is a core including a core —
+#    the `common` root.
 roots=$(msrc | xargs grep -hoE 'include!\("[^"]+"' 2>/dev/null \
   | sed 's/.*include!("//' | sed 's|^\(\.\./\)*||' | sed 's|^[^/]*\.rs"$|common|' \
   | cut -d/ -f1 | sort -u | tr '\n' ' ')
 case "$(printf '%s' "$roots" | tr -s ' ')" in
-  "common target "|"target common ") ok "modules include only shared cores and the fluxor SDK" ;;
+  "common ") ok "modules include only shared cores" ;;
   *) no surface "unexpected include roots: '$roots'" ;;
 esac
 

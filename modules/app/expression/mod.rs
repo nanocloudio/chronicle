@@ -15,24 +15,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other chronicle modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The shared cores, mounted together in one submodule so vm_core, the canonical
 // typed-frame codec (`pipeline_core`), the record lifecycle (`io_core`), the
@@ -52,8 +46,8 @@ mod expr {
     include!("../../common/expression_step_core.rs");
 }
 use expr::{
-    expr_step, lower_flat, scan_code, Accounting, BlobIn, Mode, Pending, StepResult, SysChan,
-    ACCT_IS_GAUGE, ACCT_METRIC_COUNT,
+    expr_step, lower_flat, scan_code, Accounting, BlobIn, Mode, Pending, SysChan, ACCT_IS_GAUGE,
+    ACCT_METRIC_COUNT,
 };
 
 // Telemetry emit helpers — crate root, after the SDK runtime, so the `dev_*`
@@ -123,9 +117,9 @@ struct ModuleState {
 
 // Module params: the bytecode `program` (a `blob`) and its static `max_cost`
 // ceiling, or a flat checked IR `ir` (a `blob`) whose cost bound is re-derived.
-// `define_params!` generates `parse_tlv`/`dispatch_param`; each blob arrives
+// `fluxor_rt::define_params!` generates `parse_tlv`/`dispatch_param`; each blob arrives
 // in chunks of at most 255, the first led by its whole length (blob_core).
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, program, blob, 0 => |s, d, len| {
@@ -143,16 +137,11 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 // The same figure as data, so `pack` records this engine's resident footprint
 // in its manifest and a graph's state-arena demand is summable at compose time
 // rather than discovered when the device fails to load it.
-declare_module_state_bytes!(ModuleState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -255,7 +244,7 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -289,7 +278,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if s.in_chan < 0 || s.code_len == 0 || s.faulted != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let inch = SysChan::new(sys, s.in_chan);
         let outch = SysChan::new(sys, s.out_chan);
@@ -311,6 +300,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             max_cost,
             &mut s.acct,
         );
-        0
+        StepReturn::Continue
     }
 }

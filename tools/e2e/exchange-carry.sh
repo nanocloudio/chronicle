@@ -79,9 +79,9 @@ OBSERVE='/^wiring:/i\  - name: observe\n    params:\n      interval_ms: 100'
 
 # carry_refused is pipeline metric id 29 (modules/app/pipeline/manifest.toml).
 # MON_METRIC names a module by its instance index, which the runtime's own
-# load log gives (`module N caps: …` then `loaded pipeline`) — read, not assumed.
+# load log gives (`module N grants: …` then `loaded pipeline`) — read, not assumed.
 mod_index() { # <stderr file> <module name>
-  awk -v m="$2" '/\[inst\] module [0-9]+ caps:/ { for (i = 1; i < NF; i++) if ($i == "module") n = $(i + 1) }
+  awk -v m="$2" '/\[inst\] module [0-9]+ grants:/ { for (i = 1; i < NF; i++) if ($i == "module") n = $(i + 1) }
                  $0 ~ ("loaded " m "$") { print n; exit }' "$1" 2>/dev/null
 }
 refused_count() { # <stderr file> -> the highest carry_refused value reported
