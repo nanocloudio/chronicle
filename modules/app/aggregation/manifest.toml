@@ -40,7 +40,8 @@ name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
 max_record   = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
-buffer_size  = { default = 4096, thumbv8m = 1024, thumbv6m = 512 }
+# The ring holds one whole record and its 2-byte length prefix.
+buffer_size  = { default = 4098, thumbv8m = 1026, thumbv6m = 514 }
 
 # Optional distributed activation barrier (in[1]): commit horizons from Clustor's
 # `consensus.committed_entries` (MSG_COMMITTED_ENTRY: [term:u64 LE][index:u64 LE]
@@ -69,7 +70,8 @@ content_type = "OctetStream"
 # Sized to the proven maximum AggState snapshot so a full state is checkpointable
 # as one retained record, not silently dropped when it exceeds a small ring.
 max_record   = { default = 40960, thumbv6m = 4096 }
-buffer_size  = { default = 40960, thumbv6m = 4096 }
+# The ring holds one whole record and its 2-byte length prefix.
+buffer_size  = { default = 40962, thumbv6m = 4098 }
 
 # Producer half of the Clustor binding (raft-propose mode). Wiring proposal_out
 # (out[2]) enables it: the module submits its checkpoint snapshot to
@@ -86,7 +88,8 @@ index        = 2
 direction    = "output"
 content_type = "OctetStream"
 max_record   = 512
-buffer_size  = 512
+# The ring holds one whole record and its 2-byte length prefix.
+buffer_size  = 514
 
 [[ports]]
 name         = "assigned_in"

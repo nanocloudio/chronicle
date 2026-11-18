@@ -11,7 +11,7 @@ emits the params.
 | Module | Role | Param(s) |
 |--------|------|----------|
 | `app/expression` | one checked-CEL Expression | `program`, `max_cost` |
-| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning + the exchange roles | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `decode_len`, `reply_decode`; exchange: `id_field`, `method_field`, `target_field`, `headers_field`, `status_field`, `content_type_field`, `method`, `content_type`, `answer`, `ack` |
+| `app/pipeline` | staged Transformations and Decisions + encode/decode + versioning + the exchange roles | `ir_stages` (or `versions`), `stage_kinds`, `encode`, `decode`, `decode_len`, `reply_decode`; exchange: `id_field`, `method_field`, `target_field`, `meta_field`, `status_field`, `content_type_field`, `op`, `method`, `content_type`, `answer`, `ack` |
 | `app/aggregation` | event-time stateful engine | `ir_def` |
 | `app/decision` | first-hit rule container | `decision` |
 | `app/sensor_intake` | `SensorSample` → typed record frame | — |
@@ -47,7 +47,7 @@ The engines reserve `240..=255`. Three of those numbers have fixed meanings;
 |---|---|---|
 | `255` | string or bytes | the [version selector](versioning.md) |
 | `254` | message | the **carry** (`CARRY_FIELD`): the record's carried context, a nested message that comes back unchanged on the record made from an effect's answer, so a request built before an effect and the answer handled after it share no state but the record. On the [exchange surface](connectors.md#the-exchange-surface) the requester keeps it beside the open exchange; it never reaches the provider |
-| `253` | int | the **exchange status** (`EXCHANGE_STATUS_FIELD`) on a record made from a provider's answer: the HTTP status code it answered with. A body's own field 253 is replaced by it |
+| `253` | int | the **exchange status** (`EXCHANGE_STATUS_FIELD`) on a record made from a provider's answer: the HTTP status code it answered with (its detail, or its outcome's canonical status when it carries none). A body's own field 253 is replaced by it |
 
 A field with one of these numbers has its reserved meaning whatever the schema
 calls it, so the schema compiler accepts a reserved number only as its fixed type

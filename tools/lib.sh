@@ -98,7 +98,7 @@ s.close()'
 }
 
 # build_graph <yaml> [sed-expr…]: copy the example to a run-unique name, apply
-# any substitutions (ports), build its bundle, export CFG/MODS for run_*.
+# any substitutions (ports), build its image, export IMG for run_*.
 # The copy is what makes the bundle path unique — `fluxor run` keys the output
 # dir on the yaml's basename.
 build_graph() {
@@ -111,26 +111,25 @@ build_graph() {
   local e
   for e in "$@"; do sed -i "$e" "$yaml"; done
 
-  CFG=target/linux/$base-$E2E_RUN/config.bin
-  MODS=target/linux/$base-$E2E_RUN/modules.bin
-  rm -f "$CFG" "$MODS"
+  IMG=target/linux/$base-$E2E_RUN/graph.img
+  rm -f "$IMG"
   "$FLX" run "$yaml" </dev/null >/dev/null 2>&1 &
   local pid=$!
   E2E_PIDS="$E2E_PIDS $pid"
   for _ in $(seq 1 240); do
-    [ -s "$CFG" ] && [ -s "$MODS" ] && break
+    [ -s "$IMG" ] && break
     sleep 0.5
   done
   sleep 0.3
   reap_graph "$pid"
-  [ -s "$CFG" ] && [ -s "$MODS" ]
+  [ -s "$IMG" ]
 }
 
 # start_graph <yaml> [sed-expr…]: build, then leave the graph RUNNING (a server
 # case). Exports GRAPH_PID; the caller stops it with reap_graph.
 start_graph() {
   build_graph "$@" || return 1
-  "$FL_BIN" --config "$CFG" --modules "$MODS" </dev/null >/dev/null 2>&1 &
+  "$FL_BIN" --image "$IMG" </dev/null >/dev/null 2>&1 &
   GRAPH_PID=$!
   E2E_PIDS="$E2E_PIDS $GRAPH_PID"
 }
@@ -141,7 +140,7 @@ run_hex() {
   local hex=$1 secs=$2
   shift 2
   printf '%s' "$hex" | xxd -r -p \
-    | timeout -k 2 "$secs" "$FL_BIN" --config "$CFG" --modules "$MODS" "$@" 2>/dev/null \
+    | timeout -k 2 "$secs" "$FL_BIN" --image "$IMG" "$@" 2>/dev/null \
     | xxd -p | tr -d '\n'
 }
 
@@ -150,7 +149,7 @@ run_text() {
   local hex=$1 secs=$2
   shift 2
   printf '%s' "$hex" | xxd -r -p \
-    | timeout -k 2 "$secs" "$FL_BIN" --config "$CFG" --modules "$MODS" "$@" 2>/dev/null
+    | timeout -k 2 "$secs" "$FL_BIN" --image "$IMG" "$@" 2>/dev/null
 }
 
 # `chronicle <args…>` against the built CLI applet graph (argv after `--`,

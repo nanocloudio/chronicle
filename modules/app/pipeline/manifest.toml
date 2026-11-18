@@ -40,7 +40,8 @@ name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
 max_record   = { default = 4096, thumbv6m = 512 }
-buffer_size  = { default = 4096, thumbv6m = 512 }
+# The ring holds one whole record and its 2-byte length prefix.
+buffer_size  = { default = 4098, thumbv6m = 514 }
 
 # ── Exchange ports ──────────────────────────────────────────────────────
 #
@@ -87,6 +88,9 @@ direction    = "input"
 content_type = "ExchangeRequest"
 max_record   = { default = 8192, thumbv6m = 1024 }
 buffer_size  = { default = 16384, thumbv6m = 2048 }
+# The requests are HTTP's: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name         = "response_out"

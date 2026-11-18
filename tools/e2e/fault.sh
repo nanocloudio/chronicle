@@ -19,7 +19,7 @@ check_fault() { # <name> <graph> <sed-expr> <fault-substring>
   local err out
   err=$(mktemp)
   out=$(printf '%s' "$REC" | xxd -r -p \
-    | timeout -k 2 4 "$FL_BIN" --config "$CFG" --modules "$MODS" 2>"$err" | xxd -p | tr -d '\n')
+    | timeout -k 2 4 "$FL_BIN" --image "$IMG" 2>"$err" | xxd -p | tr -d '\n')
   if ! grep -qF "$want" "$err"; then
     no "$name fault-log" "expected '$want' in stderr"; rm -f "$err"; return
   fi

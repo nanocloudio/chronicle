@@ -1155,6 +1155,7 @@ fn cmd_graph(
             kind: b"",
             provider: b"",
             version: b"",
+            op: 0,
             method: 0,
             params: &[],
         },

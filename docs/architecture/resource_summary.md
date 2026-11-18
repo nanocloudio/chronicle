@@ -17,21 +17,21 @@ buffer behind it are one number on every target rather than two that can disagre
 | Module | Target | Port | Dir | max_record (B) | buffer (B) | Instruments |
 |---|---|---|---|---|---|---|
 | aggregation | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 27 |
-| aggregation | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv8m 1024, thumbv6m 512) | 4096 (thumbv8m 1024, thumbv6m 512) | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv8m 1024, thumbv6m 512) | 4098 (thumbv8m 1026, thumbv6m 514) | 27 |
 | aggregation | bcm2712,rp2350,rp2040,linux | barrier_in | input | 64 | 256 | 27 |
-| aggregation | bcm2712,rp2350,rp2040,linux | checkpoint_out | output | 40960 (thumbv6m 4096) | 40960 (thumbv6m 4096) | 27 |
-| aggregation | bcm2712,rp2350,rp2040,linux | proposal_out | output | 512 | 512 | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | checkpoint_out | output | 40960 (thumbv6m 4096) | 40962 (thumbv6m 4098) | 27 |
+| aggregation | bcm2712,rp2350,rp2040,linux | proposal_out | output | 512 | 514 | 27 |
 | aggregation | bcm2712,rp2350,rp2040,linux | assigned_in | input | 64 | 256 | 27 |
 | aggregation | bcm2712,rp2350,rp2040,linux | leader_in | input | 64 | 256 | 27 |
 | chronicle_cli | bcm2712,linux | args | input |  | 131328 |  |
 | chronicle_cli | bcm2712,linux | stdout | output |  | 40960 |  |
 | chronicle_cli | bcm2712,linux | exit | output |  | 16 |  |
 | decision | bcm2712,rp2040,rp2350,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 22 |
-| decision | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 22 |
+| decision | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4098 (thumbv6m 514) | 22 |
 | expression | bcm2712,rp2040,rp2350,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 17 |
-| expression | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 17 |
+| expression | bcm2712,rp2040,rp2350,linux | result_out | output | 4096 (thumbv6m 512) | 4098 (thumbv6m 514) | 17 |
 | pipeline | bcm2712,rp2350,rp2040,linux | record_in | input | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 32 |
-| pipeline | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv6m 512) | 4096 (thumbv6m 512) | 32 |
+| pipeline | bcm2712,rp2350,rp2040,linux | result_out | output | 4096 (thumbv6m 512) | 4098 (thumbv6m 514) | 32 |
 | pipeline | bcm2712,rp2350,rp2040,linux | request_out | output | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 32 |
 | pipeline | bcm2712,rp2350,rp2040,linux | response_in | input | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 32 |
 | pipeline | bcm2712,rp2350,rp2040,linux | request_in | input | 8192 (thumbv6m 1024) | 16384 (thumbv6m 2048) | 32 |

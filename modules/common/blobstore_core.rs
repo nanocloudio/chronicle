@@ -44,7 +44,9 @@ pub const OBJ_GET: u32 = crate::abi::registry::storage_object::GET;
 pub const OBJ_RANGE_GET: u32 = crate::abi::registry::storage_object::RANGE_GET;
 pub const OBJ_CLOSE: u32 = crate::abi::registry::storage_object::CLOSE;
 
-use crate::abi::contracts::storage::object::{write_answer, Kept, WriteAnswer};
+use crate::abi::contracts::storage::object::{
+    key as okey, precondition, put, range_get, write_answer, Kept, WriteAnswer,
+};
 use crate::abi::kernel_abi::errno::{EAGAIN, ENOENT, ENXIO};
 
 /// Longest key this core builds: the prefix plus 64 hex characters.
@@ -85,6 +87,21 @@ pub fn read_refusal(rc: i32) -> BlobError {
     } else {
         BlobError::ReadFailed(rc)
     }
+}
+
+/// Close a `GET`-opened handle. `CLOSE` takes no `arg` and no `data`.
+///
+/// # Safety
+/// `sys` must be the module's live syscall table.
+unsafe fn close(sys: &SyscallTable, h: i32) {
+    (sys.provider_call)(
+        h,
+        OBJ_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
 }
 
 /// Write `blobs/sha256/<hex>` into `out`, returning its length. The layout an
@@ -151,8 +168,7 @@ impl ReadHold {
     /// `sys` must be the module's live syscall table.
     pub unsafe fn release(&mut self, sys: &SyscallTable) {
         if self.handle >= 0 {
-            let mut carg = [0u8; 4];
-            (sys.provider_call)(self.handle, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+            close(sys, self.handle);
         }
         *self = Self::new();
     }
@@ -222,37 +238,29 @@ unsafe fn put_raw(
     klen: usize,
     body: &[u8],
 ) -> Result<(), BlobError> {
-    // storage.object PUT argument layout:
-    //   [key_len:u16][key][content_type_len:u8]
-    //   [body_ptr:u64][body_len:u64][precondition:u8][etag_len:u8]
-    //   [Kept block][fence_ptr:u64][fence_cap:u16]
-    let mut fence = [0u8; 62];
-    let mut arg = [0u8; BLOB_KEY_MAX + 64];
-    let mut p = 0usize;
-    arg[p..p + 2].copy_from_slice(&(klen as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + klen].copy_from_slice(&key[..klen]);
-    p += klen;
-    arg[p] = 0; // no content type
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(body.as_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(body.len() as u64).to_le_bytes());
-    p += 8;
-    arg[p] = 0; // precondition = ANY
-    arg[p + 1] = 0; // etag_len
-    p += 2;
-    // A blob's name is its content: no key reference, no retention, no hold.
-    p += match Kept::none().encode(&mut arg[p..]) {
-        Some(n) => n,
-        None => return Err(BlobError::PutFailed),
+    // The record names the key alone (no content type, precondition ANY);
+    // the body travels in `data`. A blob's name is its content: no key
+    // reference, no retention, no hold.
+    let mut arg = [0u8; put::arg_len(BLOB_KEY_MAX, 0, 0, 0)];
+    let req = put::Request {
+        key: &key[..klen],
+        content_type: &[],
+        precondition: precondition::ANY,
+        etag: &[],
+        kept: Kept::none(),
     };
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
+    let Some(p) = put::encode(&mut arg, &req) else {
+        return Err(BlobError::PutFailed);
+    };
 
-    match write_answer((sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p)) {
+    match write_answer((sys.provider_call)(
+        -1,
+        OBJ_PUT,
+        arg.as_mut_ptr(),
+        p,
+        body.as_ptr() as *mut u8,
+        body.len(),
+    )) {
         WriteAnswer::Decided(0) => Ok(()),
         WriteAnswer::Decided(_) => Err(BlobError::PutFailed),
         WriteAnswer::Pending => Err(BlobError::Pending),
@@ -341,7 +349,11 @@ unsafe fn get_range(
     } else {
         // A different request supersedes whatever was parked.
         hold.release(sys);
-        let h = (sys.provider_call)(-1, OBJ_GET, key.as_mut_ptr(), klen);
+        let mut karg = [0u8; okey::arg_len(BLOB_KEY_MAX)];
+        let Some(kn) = okey::encode(&mut karg, &key[..klen]) else {
+            return Err(BlobError::TooLarge);
+        };
+        let h = (sys.provider_call)(-1, OBJ_GET, karg.as_mut_ptr(), kn, core::ptr::null_mut(), 0);
         if h == EAGAIN {
             return Err(BlobError::WouldBlock);
         }
@@ -350,12 +362,15 @@ unsafe fn get_range(
         }
         h
     };
-    // RANGE_GET argument: [offset:u64][cap:u32][dst_ptr:u64]
-    let mut rarg = [0u8; 20];
-    rarg[0..8].copy_from_slice(&offset.to_le_bytes());
-    rarg[8..12].copy_from_slice(&(cap as u32).to_le_bytes());
-    rarg[12..20].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
-    let n = (sys.provider_call)(h, OBJ_RANGE_GET, rarg.as_mut_ptr(), 20);
+    let mut rarg = range_get::encode(offset);
+    let n = (sys.provider_call)(
+        h,
+        OBJ_RANGE_GET,
+        rarg.as_mut_ptr(),
+        rarg.len(),
+        dst.as_mut_ptr(),
+        cap,
+    );
     if n == EAGAIN {
         // Nothing copied; the handle stays valid and is the request's.
         hold.handle = h;
@@ -365,8 +380,7 @@ unsafe fn get_range(
         hold.cap = cap;
         return Err(BlobError::WouldBlock);
     }
-    let mut carg = [0u8; 4];
-    (sys.provider_call)(h, OBJ_CLOSE, carg.as_mut_ptr(), 0);
+    close(sys, h);
     *hold = ReadHold::new();
 
     if n < 0 {

@@ -22,17 +22,25 @@
 //              through its single `response_in`.
 //
 // The parts of an exchange that are not its body — the id, method, target,
-// headers, status and content type — map to DATA fields of the record, chosen
+// meta, status and content type — map to DATA fields of the record, chosen
 // per graph by a `FieldMap`. Stages read and write them like any other field,
 // and a codec only ever sees a body: no program frames a transport record.
 //
+// The pipeline speaks the exchange's HTTP binding (the SDK's
+// `contracts/exchange_http.rs`): a method is the binding's verb, a status its
+// detail, and the outcome every requester branches on is the class the binding
+// gives that status. The meta field carries the exchange's meta run as it is
+// on the wire; the content type travels as its `content-type` field.
+//
 // Pure: no syscalls and no SDK runtime, so the harness drives the same code.
 // Mounted after vm_core and pipeline_core, beside the SDK's exchange contract
-// as `exchange`.
+// as `exchange` and its HTTP binding as `exchange_http`.
 
 use exchange::{
-    write_request_head, write_response_head, ExchangeId, RequestHead, ResponseHead, ID_LEN,
+    meta_valid, seal_response_in_place, write_request_head, ExchangeId, MetaWriter, RequestHead,
+    HDR, ID_LEN, META_CONTENT_TYPE, RESP_HEAD_FIXED,
 };
+use exchange_http::Http;
 
 /// Which data fields carry the parts of an exchange that are not its body.
 /// `0` leaves a part unmapped: it is neither delivered into a record nor read
@@ -41,9 +49,12 @@ use exchange::{
 pub struct FieldMap {
     /// The exchange id, as 14 bytes.
     pub id: u8,
+    /// The request's method: the HTTP binding's verb.
     pub method: u8,
     pub target: u8,
-    pub headers: u8,
+    /// The exchange's meta run, as on the wire.
+    pub meta: u8,
+    /// The response's status: the HTTP binding's detail.
     pub status: u8,
     pub content_type: u8,
 }
@@ -92,14 +103,14 @@ pub fn request_fields<'a>(
     id: &'a [u8; ID_LEN],
     method: u8,
     target: &'a [u8],
-    headers: &'a [u8],
+    meta: &'a [u8],
     fields: &mut [Field<'a>],
     mut n: usize,
 ) -> Result<usize, ExchangeFault> {
     push(fields, &mut n, map.id, Value::Bytes(id))?;
     push(fields, &mut n, map.method, Value::Int(method as i64))?;
     push(fields, &mut n, map.target, Value::Bytes(target))?;
-    push(fields, &mut n, map.headers, Value::Bytes(headers))?;
+    push(fields, &mut n, map.meta, Value::Bytes(meta))?;
     Ok(n)
 }
 
@@ -108,13 +119,13 @@ pub fn response_fields<'a>(
     map: &FieldMap,
     status: u16,
     content_type: &'a [u8],
-    headers: &'a [u8],
+    meta: &'a [u8],
     fields: &mut [Field<'a>],
     mut n: usize,
 ) -> Result<usize, ExchangeFault> {
     push(fields, &mut n, map.status, Value::Int(status as i64))?;
     push(fields, &mut n, map.content_type, Value::Bytes(content_type))?;
-    push(fields, &mut n, map.headers, Value::Bytes(headers))?;
+    push(fields, &mut n, map.meta, Value::Bytes(meta))?;
     Ok(n)
 }
 
@@ -162,9 +173,22 @@ pub fn record_id(map: &FieldMap, fields: &[Field<'_>]) -> Result<ExchangeId, Exc
     Ok(ExchangeId(arr))
 }
 
-/// Write the request HEAD a record asks: method, target and headers from the
-/// mapped fields (`default_method` when the method is unmapped or absent), the
-/// body inline. `flags` carries MORE for a relayed HEAD whose body continues.
+/// The meta run in mapped field `number`: absent (or unmapped) is empty, and
+/// bytes that are not a whole run of well-formed fields are a bad field.
+fn meta_of<'a>(fields: &[Field<'a>], number: u8) -> Result<&'a [u8], ExchangeFault> {
+    let meta = bytes_of(fields, number)?;
+    if meta_valid(meta) {
+        Ok(meta)
+    } else {
+        Err(ExchangeFault::BadField)
+    }
+}
+
+/// Write the request HEAD a record asks: `op`, then method, target and meta
+/// from the mapped fields (`default_method` when the method is unmapped or
+/// absent), the body inline. `flags` carries MORE for a relayed HEAD whose
+/// body continues. A method the binding does not admit under `op` is a bad
+/// field.
 #[allow(
     clippy::too_many_arguments,
     reason = "every part of a request HEAD, passed explicitly so the core stays a pure function"
@@ -174,29 +198,36 @@ pub fn request_head(
     fields: &[Field<'_>],
     id: ExchangeId,
     flags: u8,
+    op: u8,
     default_method: u8,
     resp_credit: u32,
     body: &[u8],
     out: &mut [u8],
 ) -> Result<usize, ExchangeFault> {
     let method = int_of(fields, map.method, default_method as i64)?;
-    let method = u8::try_from(method).map_err(|_| ExchangeFault::BadField)?;
+    let verb = u8::try_from(method).map_err(|_| ExchangeFault::BadField)?;
+    if !exchange::request_admitted::<Http>(op, verb) {
+        return Err(ExchangeFault::BadField);
+    }
     let head = RequestHead {
         id,
         flags,
-        method,
+        op,
+        verb,
         target: bytes_of(fields, map.target)?,
-        headers: bytes_of(fields, map.headers)?,
+        meta: meta_of(fields, map.meta)?,
         peer: &[],
         resp_credit,
         body,
     };
-    write_request_head(&head, out).ok_or(ExchangeFault::TooLarge)
+    write_request_head::<Http>(&head, out).ok_or(ExchangeFault::TooLarge)
 }
 
 /// Write the response HEAD a record answers with: one HEAD carrying the whole
-/// body, the status from the mapped field (`default_status` when absent), the
-/// content type from its field or `default_content_type`.
+/// body, the status from the mapped field (`default_status` when absent) and
+/// its outcome, and a meta run of the content type (from its field or
+/// `default_content_type`; none when both are empty) followed by the mapped
+/// meta field's run. A status the HTTP binding does not carry is a bad field.
 pub fn response_head(
     map: &FieldMap,
     fields: &[Field<'_>],
@@ -208,20 +239,33 @@ pub fn response_head(
 ) -> Result<usize, ExchangeFault> {
     let status = int_of(fields, map.status, default_status as i64)?;
     let status = u16::try_from(status).map_err(|_| ExchangeFault::BadField)?;
+    let outcome = exchange_http::outcome_of(status).ok_or(ExchangeFault::BadField)?;
     let ct = bytes_of(fields, map.content_type)?;
-    let head = ResponseHead {
-        id,
-        flags: 0,
-        status,
-        content_type: if ct.is_empty() {
-            default_content_type
-        } else {
-            ct
-        },
-        headers: bytes_of(fields, map.headers)?,
-        body,
+    let ct = if ct.is_empty() {
+        default_content_type
+    } else {
+        ct
     };
-    write_response_head(&head, out).ok_or(ExchangeFault::TooLarge)
+    let extra = meta_of(fields, map.meta)?;
+    // The meta and the body are rendered in place, then the HEAD sealed round
+    // them: no second buffer holds the run while it is assembled.
+    let at = HDR + RESP_HEAD_FIXED;
+    let region = out.get_mut(at..).ok_or(ExchangeFault::TooLarge)?;
+    let mut w = MetaWriter::new(region);
+    if !ct.is_empty() {
+        w.put(META_CONTENT_TYPE, ct);
+    }
+    let ct_len = w.finish().ok_or(ExchangeFault::TooLarge)?;
+    let meta_len = ct_len + extra.len();
+    let body_at = at + meta_len;
+    out.get_mut(at + ct_len..body_at)
+        .ok_or(ExchangeFault::TooLarge)?
+        .copy_from_slice(extra);
+    out.get_mut(body_at..body_at + body.len())
+        .ok_or(ExchangeFault::TooLarge)?
+        .copy_from_slice(body);
+    seal_response_in_place::<Http>(&id, 0, outcome, status, meta_len, body.len(), out)
+        .ok_or(ExchangeFault::TooLarge)
 }
 
 // ── The requester's exchanges in flight ──────────────────────────────────
@@ -239,7 +283,8 @@ struct Slot<const CARRY: usize, const REQ: usize, const RESP: usize> {
     /// The request as sent, kept for a replay.
     req: [u8; REQ],
     req_len: u16,
-    /// The response so far: its HEAD's status and content type, and the body
+    /// The response so far: its HEAD's status (the detail, or its outcome's
+    /// canonical status) and content type, and the body
     /// collected across BODY records.
     head_seen: bool,
     status: u16,
@@ -423,7 +468,7 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
 
     /// Take one response-direction record.
     pub fn accept(&mut self, record: &[u8]) -> Answer {
-        let Some(rec) = exchange::parse_response(record) else {
+        let Ok(rec) = exchange::parse_response::<Http>(record) else {
             return Answer::Unknown;
         };
         match rec {
@@ -454,8 +499,8 @@ impl<const SLOTS: usize, const CARRY: usize, const REQ: usize, const RESP: usize
                 };
                 let s = &mut self.slots[at];
                 s.head_seen = true;
-                s.status = h.status;
-                let ct = h.content_type;
+                s.status = exchange_http::status_of(&h);
+                let ct = h.content_type();
                 if ct.len() > s.content_type.len() {
                     *s = Slot::EMPTY;
                     return Answer::TooLarge;

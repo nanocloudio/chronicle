@@ -100,26 +100,30 @@ binding, lowering with one — through the real `.fmod`.
 ## The exchange surface
 
 Every provider in the workspace speaks ONE contract, defined in the Fluxor SDK
-at [`modules/sdk/contracts/exchange.rs`][exchange]: an HTTP server and its
+at [`contracts/exchange.rs`][exchange]: an HTTP server and its
 application routes, an HTTP or S3 client, a database client, a broker sink, a
 pipeline. A requester opens an exchange under a 14-byte id it chooses; the
 provider echoes that id on every record of its answer.
 
 ```text
 record          [kind:u8][flags:u8][id:14] payload           one channel record
-request HEAD    [method:u8][target_len:u16][hdr_len:u16][peer_len:u16][resp_credit:u32]
-                target | headers | peer | body…
-response HEAD   [status:u16][ct_len:u8][hdr_len:u16] content_type | headers | body…
+request HEAD    [op:u8][verb:u8][target_len:u16][meta_len:u16][peer_len:u16][resp_credit:u32]
+                target | meta | peer | body…
+response HEAD   [outcome:u8][detail:u16][meta_len:u16] meta | body…
 BODY            body bytes, MORE set while more follow
 ABORT · CREDIT · DATAGRAM · LINK (response direction, zero id: DOWN / UP)
 ```
 
 A HEAD carries the first body bytes inline; a body longer than one record
 follows in BODY records, past the inline bytes only on the receiver's credit.
-Statuses are HTTP codes for every provider: 200 answers (for a durable
-destination: accepted, with an empty body), and a provider's own refusals are
-400, 413, 500, 502, 503 and 504. `METHOD_PUBLISH` asks a durable destination to
-accept the body as one record, its target the ordering key.
+`op` says what a request asks: a CALL for an answer, a PUBLISH asking a durable
+destination to accept the body as one record (its target the ordering key), an
+OPEN for a session. `meta` is a run of key/value fields with lower-case keys;
+a body's content type is the field `content-type`. Every answer carries an
+`outcome` class (OK, REFUSED, NOT_FOUND, BUSY, FAILED, …) that any requester
+can act on. `verb` and `detail` belong to a binding: under HTTP's
+([`exchange_http.rs`][exchange_http]) the verb is the request method and the
+detail the response status, whose class is the outcome.
 
 A provider declares the delivery terms it offers as a capability:
 
@@ -161,12 +165,15 @@ never declares one.
 ### The pipeline on the surface
 
 `app/pipeline` meets the contract in the role its wired ports choose
-([`exchange_core.rs`](../../modules/common/exchange_core.rs)). The parts of an
-exchange other than its body — id, method, target, headers, status, content
-type — map to data fields named by the `id_field`, `method_field`,
-`target_field`, `headers_field`, `status_field` and `content_type_field`
-params, so stages read and write them like any other field and a codec only
-ever reads or writes a body.
+([`exchange_core.rs`](../../modules/common/exchange_core.rs)), speaking the
+HTTP binding: a method is the binding's verb and a status its detail. Its
+`request_in` declares the binding, so an HTTP server's requests reach it. The
+parts of an exchange other than its body — id, method, target, meta, status,
+content type — map to data fields named by the `id_field`, `method_field`,
+`target_field`, `meta_field`, `status_field` and `content_type_field` params,
+so stages read and write them like any other field and a codec only ever
+reads or writes a body. The meta field holds the meta run as it is on the
+wire; an answer's meta is its content type followed by that run.
 
 - **Provider** (`request_in` + `response_out`). Each request is collected
   whole — credit granted as it arrives, refused with 413 or 503 past a bound,
@@ -188,8 +195,9 @@ ever reads or writes a body.
   written is answered 500 under that id (`requests_refused`), and its
   requester is never left waiting.
 - **Requester** (`request_out` + `response_in`). The result record is a request
-  this node opens under an id of its own, asking `method` unless a mapped field
-  names one. The id is a counter tagged with the handle of the node's own
+  this node opens under an id of its own: an `op` (1, a CALL, by default; 2, a
+  PUBLISH), asking `method` unless a mapped field names one (a publish names
+  none). The id is a counter tagged with the handle of the node's own
   `request_out` (bytes 8..12, as Kagi's requesters tag theirs),
   so several requesters may be fanned into one provider and its
   `response_out` fanned back to all of them: each takes only its own
@@ -260,7 +268,8 @@ other's as `Foreign` (`tests/harness/tests/exchange_suites/exchange.rs`).
 `ExchangeResponse` records. `status_out` is a human-readable line for an
 operator, never an answer.
 
-[exchange]: ../../../fluxor/modules/sdk/contracts/exchange.rs
+[exchange]: ../../../fluxor/crates/fluxor-abi/src/contracts/exchange.rs
+[exchange_http]: ../../../fluxor/crates/fluxor-abi/src/contracts/exchange_http.rs
 
 ## Related documentation
 

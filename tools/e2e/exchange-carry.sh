@@ -96,7 +96,7 @@ refused_count() { # <stderr file> -> the highest carry_refused value reported
 # telemetry publish (5 s), stdout as hex.
 run_carry() {
   printf '%s' "$1" | xxd -r -p \
-    | timeout -k 2 8 "$FL_BIN" --config "$CFG" --modules "$MODS" 2>"$2" \
+    | timeout -k 2 8 "$FL_BIN" --image "$IMG" 2>"$2" \
     | xxd -p | tr -d '\n'
 }
 

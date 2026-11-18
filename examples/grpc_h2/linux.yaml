@@ -6,7 +6,7 @@
 # recv-window flow control (WINDOW_UPDATE) — that the stateless codec path fakes.
 #
 # The client auto-issues a GET / on stream 1 at startup; the response body is
-# forwarded on the module's out[1] (file_ctrl) channel, which we pipe to stdout.
+# forwarded on the module's out[1] (body_out) channel, which we pipe to stdout.
 #
 # `authority` is where the client dials and the `Host:` it sends: one value,
 # written as `host[:port]`.
@@ -34,5 +34,5 @@ wiring:
     to: linux_net.net_in
   - from: linux_net.net_out
     to: http.net_in
-  - from: http.file_ctrl
+  - from: http.body_out
     to: cli_out.bytes_in

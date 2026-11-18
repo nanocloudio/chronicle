@@ -36,7 +36,8 @@ name         = "result_out"
 direction    = "output"
 content_type = "OctetStream"
 max_record   = { default = 4096, thumbv6m = 512 }
-buffer_size  = { default = 4096, thumbv6m = 512 }
+# The ring holds one whole record and its 2-byte length prefix.
+buffer_size  = { default = 4098, thumbv6m = 514 }
 
 [observability]
 # The common accounting taxonomy is front-loaded (ids 0..13, canonical field

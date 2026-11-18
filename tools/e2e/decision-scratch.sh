@@ -25,9 +25,9 @@ grep -q '^target:' "$yaml" || { no scratch "the plan did not lower: $(head -1 "$
 # The container the node is handed, exactly as the graph carries it.
 DEC=$(sed -n 's/^ *decision: {hex: "\([0-9a-f]*\)"}.*/\1/p' "$yaml")
 [ -n "$DEC" ] || { no scratch "no decision param in the lowered graph"; finish; exit; }
-CLIYAML_CFG=$CFG CLIYAML_MODS=$MODS
+CLIYAML_IMG=$IMG
 build_graph "$yaml" || { no scratch "scratch graph build"; finish; exit; }
-GRAPH_CFG=$CFG GRAPH_MODS=$MODS
+GRAPH_IMG=$IMG
 
 # A t.Req frame: {1: id, 2: name, 3: body}; a name or body written
 # `<char>*<n>` is that character n times, anything else is itself.
@@ -45,8 +45,8 @@ f += bytes([3, 0]) + struct.pack("<H", len(body)) + body
 print(f.hex())
 PY
 }
-on_graph() { CFG=$GRAPH_CFG MODS=$GRAPH_MODS run_hex "$1" 6; }
-decide() { CFG=$CLIYAML_CFG MODS=$CLIYAML_MODS run_text "" 10 -- decide "$DEC" "$1" 2>&1; }
+on_graph() { IMG=$GRAPH_IMG run_hex "$1" 6; }
+decide() { IMG=$CLIYAML_IMG run_text "" 10 -- decide "$DEC" "$1" 2>&1; }
 
 # agree <record> <arm decide must name> <case>: the node emits a frame, and the
 # dry run names the arm and prints that frame.
@@ -105,7 +105,7 @@ src = src.replace('t.Req { id: 3, name: r.name }', 't.Req { id: 3, name: %s }' %
 open(sys.argv[2], "w").write(src)
 PY
 BIG=$(hex_of "$big")
-CFG=$CLIYAML_CFG MODS=$CLIYAML_MODS
+IMG=$CLIYAML_IMG
 got=$(run_text "" 10 -- graph "$BIG" process linux 2>&1)
 if want "$got" "error: route: a branch builds at least 12800 B of strings on any record; a stage's scratch arena (STAGE_SCRATCH_CAP) holds 12288 B"; then
   ok "chronicle graph refuses a branch whose literals pass STAGE_SCRATCH_CAP"

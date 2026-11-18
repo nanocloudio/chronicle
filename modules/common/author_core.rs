@@ -2335,16 +2335,18 @@ fn split_on<'a>(src: &'a [u8], sep: u8, out: &mut [&'a [u8]]) -> usize {
 /// Two passes, deliberately: the params are filled first, and only then are
 /// the bindings built pointing INTO them. One pass cannot borrow the buffer
 /// it is still writing to.
-/// The exchange method code a binding names: an HTTP method token or
-/// `PUBLISH`, resolved by the exchange contract's own table. `None` for any
-/// other word.
-fn binding_method(tok: &[u8]) -> Option<u8> {
-    use crate::abi::contracts::exchange::{method_from_token, METHOD_NONE, METHOD_PUBLISH};
+/// The `(op, method)` a binding's method word names: `PUBLISH` is the
+/// exchange contract's PUBLISH with no method, an HTTP method token a CALL
+/// with the HTTP binding's verb for it. `None` for any other word, and for
+/// `CONNECT`, which opens a session rather than asking a call.
+fn binding_method(tok: &[u8]) -> Option<(u8, u8)> {
+    use crate::abi::contracts::exchange::op;
+    use crate::abi::contracts::exchange_http::{method, method_from_token};
     if tok == b"PUBLISH" {
-        return Some(METHOD_PUBLISH);
+        return Some((op::PUBLISH, 0));
     }
     let m = method_from_token(tok);
-    (m != METHOD_NONE).then_some(m)
+    (m != 0 && !method::opens(m)).then_some((op::CALL, m))
 }
 
 pub fn parse_bindings<'a>(
@@ -2363,7 +2365,7 @@ pub fn parse_bindings<'a>(
 
     // Fields per binding, held until the params are in place.
     let mut fields = [[b"".as_slice(); 6]; MAX_BINDINGS];
-    let mut methods = [0u8; MAX_BINDINGS];
+    let mut methods = [(0u8, 0u8); MAX_BINDINGS];
     let mut lens = [0usize; MAX_BINDINGS];
 
     for (b, spec) in specs.iter().take(n).enumerate() {
@@ -2409,7 +2411,8 @@ pub fn parse_bindings<'a>(
                 kind: fields[b][1],
                 provider: fields[b][2],
                 version: fields[b][3],
-                method: methods[b],
+                op: methods[b].0,
+                method: methods[b].1,
                 params: &params[b][..lens[b]],
             },
         };

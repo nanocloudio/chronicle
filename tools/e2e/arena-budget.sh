@@ -31,7 +31,7 @@ run_one() {
   local g=$1
   build_graph "examples/arena_budget/$g.yaml" >/dev/null 2>&1 || return 1
   printf '%s' "$(sample 23500)" | xxd -r -p \
-    | timeout -k 2 8 "$FL_BIN" --config "$CFG" --modules "$MODS" 2>"$E2E_GEN/$g.err" \
+    | timeout -k 2 8 "$FL_BIN" --image "$IMG" 2>"$E2E_GEN/$g.err" \
     | xxd -p | tr -d '\n'
 }
 

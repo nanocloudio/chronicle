@@ -60,10 +60,12 @@ pub struct Connector<'a> {
     /// siblings release independently and one shared constant mispins the
     /// moment two of them diverge.
     pub version: &'a [u8],
-    /// The exchange method each request asks the provider: the exchange
-    /// contract's code (`METHOD_PUBLISH` for a durable destination). Every
-    /// provider takes requests on `request_in` and answers on `response_out`,
-    /// so the method is the one thing about the call a binding chooses.
+    /// What each request asks the provider, as the exchange contract's `op`
+    /// (a CALL, or a PUBLISH for a durable destination) and the HTTP
+    /// binding's method (`0` for a publish). Every provider takes requests on
+    /// `request_in` and answers on `response_out`, so these are the one thing
+    /// about the call a binding chooses.
+    pub op: u8,
     pub method: u8,
     /// The node's params, in the provider manifest's order: `(name, value,
     /// quoted)`. `quoted = false` emits the value bare, which a numeric param
@@ -569,7 +571,9 @@ pub fn lower_pipeline_with(
                 }
                 if let Some(e) = requester_of[k] {
                     let c = effects[e].ok_or(GraphError::EffectUnbound)?;
-                    p = gput(out, p, b"      method: ")?;
+                    p = gput(out, p, b"      op: ")?;
+                    p = gput_u32(out, p, c.op as u32)?;
+                    p = gput(out, p, b"\n      method: ")?;
                     p = gput_u32(out, p, c.method as u32)?;
                     p = gput(out, p, b"\n")?;
                 }

@@ -32,7 +32,7 @@ modules:
     params:
       # One stage: {1: id, 2: amount * 2}, as `chronicle compile-stages` emits it.
       ir_stages: {hex: "01ff23000500010100000012010000000500010200000001020000000000000011120200000013"}
-      method: 9            # PUBLISH
+      op: 2                # PUBLISH
   - name: mqtt_sink
     params:
       authority: "127.0.0.1:11883"

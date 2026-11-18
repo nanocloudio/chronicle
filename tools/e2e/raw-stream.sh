@@ -18,7 +18,7 @@ feed() {
       printf '%s' "$c" | xxd -r -p
       sleep 1
     done
-  } | timeout -k 2 "$secs" "$FL_BIN" --config "$CFG" --modules "$MODS" 2>/dev/null
+  } | timeout -k 2 "$secs" "$FL_BIN" --image "$IMG" 2>/dev/null
 }
 
 # ── decode_len: fixed-width records (u32 LE amount + 4 bytes padding) ───────

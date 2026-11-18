@@ -39,5 +39,5 @@ wiring:
     to: linux_net.net_in
   - from: linux_net.net_out
     to: http.net_in
-  - from: http.file_ctrl
+  - from: http.body_out
     to: cli_out.bytes_in

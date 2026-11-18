@@ -27,7 +27,7 @@ build_graph examples/telemetry_probe/linux.yaml || { no telemetry "build"; finis
 err=$(mktemp)
 # One record; run past the 5 s publish interval so the post-processing tick lands.
 echo -n "0101010800d007000000000000" | xxd -r -p \
-  | timeout 8 "$FL_BIN" --config "$CFG" --modules "$MODS" 2>"$err" >/dev/null
+  | timeout 8 "$FL_BIN" --image "$IMG" 2>"$err" >/dev/null
 
 nmetric=$(grep -c "MON_METRIC" "$err")
 

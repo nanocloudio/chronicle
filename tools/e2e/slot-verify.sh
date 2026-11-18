@@ -36,10 +36,10 @@ mkslot() { # <epoch> <modules> <config> <abi_byte_hex>
   python3 "$(dirname "$0")/mkslot.py" "$@"
 }
 
-IMG=$(mkslot 7 "MODULES-BLOB-CONTENTS" "config: yes" ab)
+SLOT=$(mkslot 7 "MODULES-BLOB-CONTENTS" "config: yes" ab)
 
 # `put` stores a blob under its own sha256 and prints that digest.
-dg=$(cli put "$IMG" 2>/dev/null | head -1)
+dg=$(cli put "$SLOT" 2>/dev/null | head -1)
 case "$dg" in
   [0-9a-f]*) ok "a slot image is stored under its content address" ;;
   *) no slot "put failed: '$dg'" ;;
@@ -70,7 +70,7 @@ esac
 # This is the device's own activate gate, applied before the write instead of
 # after — which is the whole point of checking here.
 OTHER=$(mkslot 7 "MODULES-BLOB-CONTENTS" "config: NO!" ab)
-BAD="${IMG:0:512}${OTHER:512}"
+BAD="${SLOT:0:512}${OTHER:512}"
 bdg=$(cli put "$BAD" 2>/dev/null | head -1)
 out=$(cli slot-verify "$bdg" 2>/dev/null)
 case "$out" in

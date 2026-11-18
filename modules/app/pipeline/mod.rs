@@ -38,7 +38,8 @@ use fluxor_rt::*;
 // The exchange contract: one definition shared with every requester and
 // provider in the workspace.
 use exchange::{kind, record_kind, Collector, ExchangeId, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
-use fluxor_abi::contracts::exchange;
+use exchange_http::{status, Http};
+use fluxor_abi::contracts::{exchange, exchange_http};
 
 /// A decode program's scratch arena (values it builds rather than borrows):
 /// room for three whole-record documents at the full tier, so a decoder can
@@ -53,7 +54,7 @@ const SMALL: bool = abi::config::TARGET_CLASS <= abi::config::target_class::SMAL
 const XREC: usize = if TINY { 1024 } else { RECORD_MAX };
 /// Requests collected at once as a provider.
 const XSLOTS: usize = if SMALL { 1 } else { 4 };
-/// A collected request's header block.
+/// A collected request's meta run.
 const XHDRS: usize = if TINY { 256 } else { 2048 };
 /// The largest carry (field 254) a request keeps across its exchange, and the
 /// largest request target collected.
@@ -102,7 +103,7 @@ unsafe fn resolve_request(s: &mut ModuleState, sys: &SyscallTable, ok: bool) {
         if !ok {
             s.requests_refused = s.requests_refused.wrapping_add(1);
             let id = s.owed_id;
-            respond_status(s, sys, &id, exchange::status::FAILED);
+            respond_status(s, sys, &id, status::INTERNAL_SERVER_ERROR);
         }
     }
     if s.relay_open {
@@ -110,7 +111,7 @@ unsafe fn resolve_request(s: &mut ModuleState, sys: &SyscallTable, ok: bool) {
         if !ok {
             s.requests_refused = s.requests_refused.wrapping_add(1);
             let id = s.relay_id;
-            respond_status(s, sys, &id, exchange::status::FAILED);
+            respond_status(s, sys, &id, status::INTERNAL_SERVER_ERROR);
         }
     }
     if s.in_slot < 0 {
@@ -119,11 +120,11 @@ unsafe fn resolve_request(s: &mut ModuleState, sys: &SyscallTable, ok: bool) {
     if !ok {
         s.requests_refused = s.requests_refused.wrapping_add(1);
         let id = s.in_id;
-        respond_status(s, sys, &id, exchange::status::FAILED);
+        respond_status(s, sys, &id, status::INTERNAL_SERVER_ERROR);
     } else if s.ack && !s.in_answered {
         s.answered = s.answered.wrapping_add(1);
         let id = s.in_id;
-        respond_status(s, sys, &id, exchange::status::OK);
+        respond_status(s, sys, &id, status::OK);
     }
     s.in_answered = false;
     s.collector.release(s.in_slot as usize);
@@ -131,8 +132,8 @@ unsafe fn resolve_request(s: &mut ModuleState, sys: &SyscallTable, ok: bool) {
 }
 
 /// Answer an exchange with a status and no body, on `response_out`.
-unsafe fn respond_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
-    if let Some(n) = exchange::write_response(id, status, b"", b"", &mut s.resp_buf) {
+unsafe fn respond_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, code: u16) {
+    if let Some(n) = exchange_http::write_response(id, code, b"", b"", &mut s.resp_buf) {
         s.resp_box.send(sys, s.resp_out_chan, &s.resp_buf, n);
     }
 }
@@ -353,9 +354,9 @@ unsafe fn deliver_answer(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             value: Value::Int(ans.status as i64),
         },
     );
-    // An answer keeps its status and content type, not its header block: the
-    // headers field is the request's alone.
-    let answer_map = FieldMap { headers: 0, ..map };
+    // An answer keeps its status and content type, not its meta: the meta
+    // field is the request's alone.
+    let answer_map = FieldMap { meta: 0, ..map };
     if ok {
         match response_fields(
             &answer_map,
@@ -420,7 +421,7 @@ unsafe fn provider_intake(s: &mut ModuleState, sys: &SyscallTable) -> Option<usi
     if let Some((id, why)) = s.collector.take_refusal() {
         s.requests_refused = s.requests_refused.wrapping_add(1);
         s.acct.reject_input(0);
-        respond_status(s, sys, &id, why.status());
+        respond_status(s, sys, &id, exchange_http::canonical_status(why.outcome()));
         return None;
     }
     if let Some((id, bytes)) = s.collector.take_grant() {
@@ -446,7 +447,7 @@ unsafe fn provider_intake(s: &mut ModuleState, sys: &SyscallTable) -> Option<usi
 
 /// Build the record a whole collected request becomes, into `xframe`: its body
 /// through `decode` (or itself one record frame, or no fields when empty), and
-/// its id, method, target and headers at the mapped fields.
+/// its id, method, target and meta at the mapped fields.
 #[inline(never)]
 unsafe fn request_record(s: &mut ModuleState, at: usize) -> Option<usize> {
     // Read through a raw place: the request borrows the collector while the
@@ -481,15 +482,7 @@ unsafe fn request_record(s: &mut ModuleState, at: usize) -> Option<usize> {
     };
     let id = req.id.0;
     let map = s.map;
-    let Ok(n) = request_fields(
-        &map,
-        &id,
-        req.method,
-        req.target,
-        req.headers,
-        &mut fields,
-        nf,
-    ) else {
+    let Ok(n) = request_fields(&map, &id, req.verb, req.target, req.meta, &mut fields, nf) else {
         s.over_bound = s.over_bound.wrapping_add(1);
         return None;
     };
@@ -522,20 +515,21 @@ unsafe fn relay_intake(s: &mut ModuleState, sys: &SyscallTable) -> Option<usize>
         return None;
     }
     s.acct.admit_input(n as u64);
-    let Some(exchange::Record::Head(h)) = exchange::parse_request(rec) else {
+    let Ok(exchange::Record::Head(h)) = exchange::parse_request::<Http>(rec) else {
         // A HEAD that does not parse is still an exchange its requester
         // waits on.
         s.acct.input_failed();
         s.requests_refused = s.requests_refused.wrapping_add(1);
         if let Some(id) = exchange::record_id(rec) {
-            respond_status(s, sys, &id, exchange::status::BAD_REQUEST);
+            respond_status(s, sys, &id, status::BAD_REQUEST);
         }
         return None;
     };
     s.relay_id = h.id;
     s.relay_open = true;
     s.relay_flags = h.flags;
-    s.relay_method = h.method;
+    s.relay_op = h.op;
+    s.relay_method = h.verb;
     s.relay_credit = h.resp_credit;
     // The inline body stays where it is in `xrec` until the HEAD is rewritten.
     s.relay_body_at = (n - h.body.len()) as u16;
@@ -545,7 +539,7 @@ unsafe fn relay_intake(s: &mut ModuleState, sys: &SyscallTable) -> Option<usize>
         value: Value::Null,
     }; MAX_PIPE_FIELDS];
     let id = h.id.0;
-    let built = request_fields(&s.map, &id, h.method, h.target, h.headers, &mut fields, 0)
+    let built = request_fields(&s.map, &id, h.verb, h.target, h.meta, &mut fields, 0)
         .ok()
         .and_then(|k| {
             let out = core::slice::from_raw_parts_mut(s.xframe.as_mut_ptr(), REC_BUF);
@@ -615,7 +609,7 @@ mod pipe {
     include!("../../common/syschan_core.rs");
     include!("../../common/pipeline_reload_core.rs");
     // Exchange records ↔ records, beside the contract it maps.
-    use super::exchange;
+    use super::{exchange, exchange_http};
     include!("../../common/exchange_core.rs");
 }
 
@@ -818,11 +812,13 @@ struct ModuleState {
     req_out_chan: i32,
     req_in_chan: i32,
     resp_out_chan: i32,
-    /// Which data fields carry an exchange's id, method, target, headers,
+    /// Which data fields carry an exchange's id, method, target, meta,
     /// status and content type.
     map: FieldMap,
     /// The method a request asks when its record names none.
     method: u8,
+    /// What each request this node opens asks for (`exchange::op`).
+    op: u8,
     /// The content type an answer carries when its record names none.
     content_type: [u8; CT_BUF],
     content_type_len: u8,
@@ -833,7 +829,7 @@ struct ModuleState {
     ack: bool,
     /// Requests collected as a provider, and the one whose record is in flight
     /// (`in_slot` `-1` when none).
-    collector: Collector<XSLOTS, KEY_BUF, XHDRS, XBODY>,
+    collector: Collector<Http, XSLOTS, KEY_BUF, XHDRS, XBODY>,
     in_slot: i8,
     in_id: ExchangeId,
     /// The collected request's own record answered it (`answer`, or a
@@ -859,6 +855,7 @@ struct ModuleState {
     relay_id: ExchangeId,
     relay_open: bool,
     relay_flags: u8,
+    relay_op: u8,
     relay_method: u8,
     relay_credit: u32,
     relay_body_at: u16,
@@ -1007,11 +1004,11 @@ fluxor_rt::define_params! {
     8, id_field, u8, 0 => |s, d, len| { s.map.id = p_u8(d, len, 0, 0); };
     9, method_field, u8, 0 => |s, d, len| { s.map.method = p_u8(d, len, 0, 0); };
     10, target_field, u8, 0 => |s, d, len| { s.map.target = p_u8(d, len, 0, 0); };
-    11, headers_field, u8, 0 => |s, d, len| { s.map.headers = p_u8(d, len, 0, 0); };
+    11, meta_field, u8, 0 => |s, d, len| { s.map.meta = p_u8(d, len, 0, 0); };
     12, status_field, u8, 0 => |s, d, len| { s.map.status = p_u8(d, len, 0, 0); };
     13, content_type_field, u8, 0 => |s, d, len| { s.map.content_type = p_u8(d, len, 0, 0); };
-    // The method a request asks when its record names none: the exchange
-    // contract's codes (`METHOD_PUBLISH` for a durable destination).
+    // The method a request asks when its record names none: the HTTP
+    // binding's verb codes, 0 for none (a publish names none).
     14, method, u8, 0 => |s, d, len| { s.method = p_u8(d, len, 0, 0); };
     // The content type an answer carries when its record names none.
     15, content_type, str, 0 => |s, d, len| {
@@ -1032,6 +1029,9 @@ fluxor_rt::define_params! {
     // producer; absent, the `decode` program frames each record by what it
     // reads. Past the record buffer, or without `decode`: a FAULT.
     18, decode_len, u32, 0 => |s, d, len| { s.dec_fixed = p_u32(d, len, 0, 0); };
+    // What each request this node opens asks for: the exchange contract's
+    // `op` codes, 1 a CALL and 2 a PUBLISH to a durable destination.
+    19, op, u8, 1 => |s, d, len| { s.op = p_u8(d, len, 0, exchange::op::CALL); };
 }
 
 fluxor_rt::module_facts! { state: ModuleState }
@@ -1101,6 +1101,7 @@ pub extern "C" fn module_new(
         s.resp_out_chan = dev_channel_port(sys, 1, 2);
         s.map = FieldMap::default();
         s.method = 0;
+        s.op = exchange::op::CALL;
         s.content_type = [0u8; CT_BUF];
         s.content_type_len = 0;
         s.answer = false;
@@ -1121,6 +1122,7 @@ pub extern "C" fn module_new(
         s.owed_id = ExchangeId::NONE;
         s.owed_open = false;
         s.relay_flags = 0;
+        s.relay_op = 0;
         s.relay_method = 0;
         s.relay_credit = 0;
         s.relay_body_at = 0;
@@ -1268,16 +1270,9 @@ pub extern "C" fn module_new(
         // grants and refusals on `response_out`, a requester its answers come
         // back on `response_in`, and every mapped field is a data field.
         let m = s.map;
-        let mapped_ok = [
-            m.id,
-            m.method,
-            m.target,
-            m.headers,
-            m.status,
-            m.content_type,
-        ]
-        .iter()
-        .all(|n| *n == 0 || is_data_field(*n));
+        let mapped_ok = [m.id, m.method, m.target, m.meta, m.status, m.content_type]
+            .iter()
+            .all(|n| *n == 0 || is_data_field(*n));
         if !mapped_ok {
             fault = b"[pipeline] FAULT: an exchange field map names a reserved field";
         }
@@ -1734,6 +1729,7 @@ unsafe fn emit_request(s: &mut ModuleState, sys: &SyscallTable, out_len: usize, 
             fields,
             id,
             s.relay_flags,
+            s.relay_op,
             s.relay_method,
             s.relay_credit,
             body,
@@ -1777,6 +1773,7 @@ unsafe fn emit_request(s: &mut ModuleState, sys: &SyscallTable, out_len: usize, 
         fields,
         id,
         0,
+        s.op,
         method,
         resp_credit,
         body,
@@ -1849,15 +1846,7 @@ unsafe fn emit_answer(s: &mut ModuleState, sys: &SyscallTable, out_len: usize, r
         &[]
     };
     let ct = core::slice::from_raw_parts(s.content_type.as_ptr(), s.content_type_len as usize);
-    match response_head(
-        &map,
-        fields,
-        id,
-        exchange::status::OK,
-        ct,
-        body,
-        &mut s.resp_buf,
-    ) {
+    match response_head(&map, fields, id, status::OK, ct, body, &mut s.resp_buf) {
         Ok(n) => {
             s.acct.output_delivered_now(n as u32);
             s.resp_box.send(sys, s.resp_out_chan, &s.resp_buf, n);

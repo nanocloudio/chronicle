@@ -58,7 +58,7 @@ median_of() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print a[int((NR
 rates=""; worst_loss_ok=1
 for r in $(seq 1 "$REPS"); do
   err=$(mktemp)
-  timeout -k 2 "$WINDOW" "$FL_BIN" --config "$CFG" --modules "$MODS" <"$feed" 2>"$err" >/dev/null
+  timeout -k 2 "$WINDOW" "$FL_BIN" --image "$IMG" <"$feed" 2>"$err" >/dev/null
   # Read the LAST value of each accounting instrument the observer emitted.
   last() { grep -oE "MON_METRIC mod=[0-9]+ id=$1 kind=[12] val=[0-9]+" "$err" | tail -1 | grep -oE "val=[0-9]+" | cut -d= -f2; }
   obs=$(last 2); adm=$(last 3); rej=$(last 4); suc=$(last 5); drp=$(last 6); fal=$(last 7); inf=$(last 8); dlv=$(last 10)
